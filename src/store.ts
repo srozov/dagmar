@@ -24,6 +24,11 @@ CREATE INDEX IF NOT EXISTS task_runs_by_workflow ON task_runs(workflow_run_id,ta
 
 type Row = Record<string, unknown>;
 
+// SQLite extended result code for a UNIQUE-constraint violation. The only such
+// index that can fire on insertRun is one_active_run_per_workflow (run ids are
+// fresh UUIDs, so the primary key never collides), so this maps to active_run_exists.
+const SQLITE_CONSTRAINT_UNIQUE = 2067;
+
 export class Store {
   private readonly db: DatabaseSync;
   constructor(readonly path: string) { if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true }); this.db = new DatabaseSync(path); this.db.exec(SQL); }
@@ -32,7 +37,7 @@ export class Store {
 
   insertRun(run: RunRow): void {
     try { this.db.prepare("INSERT INTO workflow_runs VALUES(?,?,?,?,?,?,?)").run(run.id, run.workflowId, JSON.stringify(run.input), run.status, run.startedAt, run.updatedAt, run.endedAt); }
-    catch (error) { if (String(error).includes("workflow_runs.workflow_id")) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run`); throw error; }
+    catch (error) { if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run`); throw error; }
   }
   insertAttempt(a: AttemptRow): void { this.db.prepare("INSERT INTO task_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(a.id, a.workflowRunId, a.taskId, a.attempt, a.executorProfile, a.executorType, a.status, encode(a.result), encode(a.error), a.acpSessionId, a.startedAt, a.updatedAt, a.endedAt); }
   run(id: string): RunRow | undefined { const row = this.db.prepare("SELECT * FROM workflow_runs WHERE id=?").get(id) as Row | undefined; return row && run(row); }

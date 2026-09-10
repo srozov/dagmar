@@ -18,27 +18,41 @@ export class WorkflowRepository {
   }
 
   async get(id: string): Promise<Workflow> {
-    const found = await this.discover();
-    const value = found.valid.get(id);
-    if (!value) throw new DagmarError("workflow_not_found", `Workflow ${id} was not found`);
-    return value.workflow;
+    // Resolve only the requested workflow instead of validating the whole directory:
+    // this runs on every scheduler advancement, so it must stay cheap.
+    let names: string[];
+    try { names = await this.files(); }
+    catch { throw new DagmarError("workflow_not_found", `Workflow ${id} was not found`); }
+    const matches: unknown[] = [];
+    for (const file of names) {
+      let raw: unknown;
+      try { raw = yaml(await readFile(join(this.dir, file), "utf8")); } catch { continue; }
+      if (idOf(raw) === id) matches.push(raw);
+    }
+    // A duplicated id is excluded from the valid set by discover(), so it is not resolvable here either.
+    if (matches.length !== 1) throw new DagmarError("workflow_not_found", `Workflow ${id} was not found`);
+    return validateWorkflow(matches[0], this.profiles);
+  }
+
+  private async files(): Promise<string[]> {
+    return (await readdir(this.dir, { withFileTypes: true })).filter((x) => x.isFile() && /\.ya?ml$/.test(x.name)).map((x) => x.name).sort();
   }
 
   private async discover(): Promise<{ valid: Map<string, { file: string; workflow: Workflow }>; errors: WorkflowErrorView[] }> {
     let names: string[];
-    try { names = (await readdir(this.dir, { withFileTypes: true })).filter((x) => x.isFile() && /\.ya?ml$/.test(x.name)).map((x) => x.name).sort(); }
+    try { names = await this.files(); }
     catch { return { valid: new Map(), errors: [{ file: this.dir, code: "workflow_directory_unreadable", message: "Workflow directory cannot be read" }] }; }
     const rows: Array<{ file: string; id?: string; workflow?: Workflow; error?: WorkflowErrorView }> = [];
     for (const file of names) {
       try {
         const text = await readFile(join(this.dir, file), "utf8");
         const raw = yaml(text);
-        const id = typeof raw === "object" && raw && !Array.isArray(raw) && typeof (raw as Record<string, unknown>).id === "string" ? (raw as { id: string }).id : undefined;
+        const id = idOf(raw);
         rows.push({ file, ...(id ? { id } : {}), workflow: validateWorkflow(raw, this.profiles) });
       } catch (error) {
         const e = error instanceof DagmarError ? error : new DagmarError("workflow_invalid", "Workflow is invalid");
         let id: string | undefined;
-        try { const raw = yaml(await readFile(join(this.dir, file), "utf8")); id = typeof raw === "object" && raw && typeof (raw as Record<string, unknown>).id === "string" ? (raw as { id: string }).id : undefined; } catch {}
+        try { id = idOf(yaml(await readFile(join(this.dir, file), "utf8"))); } catch {}
         rows.push({ file, ...(id ? { id } : {}), error: { file, code: e.code, message: e.message } });
       }
     }
@@ -105,6 +119,9 @@ export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<R
   return result;
 }
 
+function idOf(raw: unknown): string | undefined {
+  return typeof raw === "object" && raw !== null && !Array.isArray(raw) && typeof (raw as Record<string, unknown>).id === "string" ? (raw as { id: string }).id : undefined;
+}
 function yaml(text: string): unknown {
   const doc = parseDocument(text, { uniqueKeys: true });
   if (doc.errors.length) throw new DagmarError("invalid_yaml", "Workflow is not valid YAML");
