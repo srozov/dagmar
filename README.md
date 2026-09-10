@@ -1,6 +1,20 @@
 # Dagmar
 
-Dagmar is a small headless TypeScript runtime for static YAML DAG workflows. It runs dependency-ready tasks concurrently through local processes or [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) profiles, stores run state in SQLite, and exposes a loopback WebSocket JSON-RPC API with a thin CLI.
+Light agentic workflow orchestration for the command line. Dagmar speaks YAML for workflow definitions and ACP for agent execution.
+
+Define an explicit task graph in YAML. Dagmar starts dependency-ready tasks through ACP agents or local processes, then gives you a CLI to start, inspect, watch, resume, and cancel runs. It records run state in SQLite and streams control-plane events over loopback WebSocket JSON-RPC.
+
+Dagmar coordinates work; agents retain their own models, tools, skills, sessions, and reasoning. You can run a complex internal loop inside one agent task, then use Dagmar to record that turn in a larger graph and pass declared JSON outputs across dependency edges.
+
+Use Dagmar when you need durable task state, explicit handoffs, and operator control around a small set of agent or process steps.
+
+## What Dagmar provides
+
+- A small YAML language for static dependency graphs.
+- ACP and local-process executors behind named profiles.
+- Concurrent execution of independent ready tasks.
+- A CLI and loopback API for run control, live observation, and ACP interactions.
+- A SQLite run ledger and an append-only JSONL transcript for each task attempt.
 
 ## Requirements
 
