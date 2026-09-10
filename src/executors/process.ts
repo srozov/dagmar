@@ -16,6 +16,10 @@ export class ProcessExecutor implements Executor<ProcessRequest> {
 function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hooks: Hooks): Execution {
   let stdout = "", cancelled = false, cancelPromise: Promise<void> | undefined, records = Promise.resolve();
   const record = (value: Parameters<Hooks["transcript"]>[0]): void => { records = records.then(() => hooks.transcript(value)).then(() => undefined); };
+  // A task that never reads stdin (or exits first) makes our write fail with EPIPE.
+  // Without a listener that is an unhandled 'error' that crashes the daemon; record it
+  // and let the attempt settle on exit code / missing output instead.
+  child.stdin.on("error", (error: Error) => record({ type: "lifecycle", direction: "internal", event: "process.stdin_error", data: { message: error.message } }));
   child.stdout.setEncoding("utf8"); child.stdout.on("data", (chunk: string) => { stdout += chunk; });
   child.stderr.setEncoding("utf8"); child.stderr.on("data", (chunk: string) => record({ type: "stdio", direction: "from_executor", stream: "stderr", data: chunk }));
   const spawned = new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
