@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -14,6 +14,7 @@ import { Scheduler } from "../src/scheduler.js";
 import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
 import type { Config, Json, RunView, TaskResult } from "../src/types.js";
+import { DagmarError } from "../src/types.js";
 import { WorkflowRepository } from "../src/workflow.js";
 
 test("process DAG runs a diamond concurrently and persists transcripts", async () => {
@@ -152,6 +153,80 @@ test("graceful shutdown fails active attempts and waits for their process", asyn
   assert.equal(app.store.run(started.workflowRunId)!.status, "blocked");
   assert.equal(app.store.attempts(started.workflowRunId)[0]!.error!.code, "daemon_shutdown");
   app.store.close();
+});
+
+// Regression: store.insertRun must map the active-run partial-index violation to the
+// active_run_exists DagmarError (via SQLite's extended result code), not leak a raw error.
+test("a second active run of the same workflow is rejected", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-active-")), wait = join(root, "wait.mjs");
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "solo", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, wait] } } });
+  try {
+    const first = await app.scheduler.start("solo", {});
+    await waitFor(app.scheduler, first.workflowRunId, "running", true);
+    await assert.rejects(app.scheduler.start("solo", {}), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+  } finally { await app.scheduler.shutdown(); app.store.close(); }
+});
+
+// Regression: a process task that never reads stdin (and exits first) makes our large
+// stdin write fail with EPIPE. Without a stdin 'error' listener that is an unhandled
+// exception that crashes the runtime; the attempt must instead settle as failed.
+test("a process task that ignores stdin and exits does not crash the runtime", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-epipe-")), script = join(root, "exit.mjs");
+  await writeFile(script, `process.exit(0);`);
+  const app = await fixture(root, { id: "epipe", tasks: { task: { executor: "local", inputs: { blob: "$run.input" }, run: [process.execPath, script] } } });
+  // A payload larger than the OS pipe buffer guarantees the write cannot flush before the
+  // child's read end closes, so the EPIPE path is exercised deterministically.
+  const started = await app.scheduler.start("epipe", { blob: "x".repeat(200_000) });
+  const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.task!.state, "failed");
+  app.store.close();
+});
+
+// Regression: transcript.read must drop an incomplete final line left by a crash (the
+// collapsed pop), returning only the complete records.
+test("transcript.read drops an incomplete final line", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-transcript-"));
+  const transcripts = new Transcripts(join(root, "state"));
+  await transcripts.append("wr_read", "tr_read", { type: "lifecycle", direction: "internal", event: "a" });
+  await transcripts.append("wr_read", "tr_read", { type: "lifecycle", direction: "internal", event: "b" });
+  await appendFile(transcripts.path("wr_read", "tr_read"), '{"type":"lifecycle","direction":"internal","event":"c"');
+  const read = await transcripts.read("wr_read", "tr_read");
+  assert.equal(read.records.length, 2);
+  assert.equal(read.nextLine, 2);
+  assert.deepEqual(read.records.map((x) => (x as { event: string }).event), ["a", "b"]);
+});
+
+// Regression: once a transcript path goes idle its cached line count is evicted; the next
+// append must re-derive the count from disk rather than restarting numbering at 1.
+test("transcript line numbering survives idle eviction of cached counts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-evict-"));
+  const transcripts = new Transcripts(join(root, "state"));
+  const n1 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "a" });
+  const n2 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "b" });
+  assert.deepEqual([n1, n2], [1, 2]);
+  await new Promise((resolve) => setTimeout(resolve, 20)); // let idle eviction run
+  const n3 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "c" });
+  assert.equal(n3, 3);
+  const read = await transcripts.read("wr_evict", "tr_evict");
+  assert.equal(read.records.length, 3);
+});
+
+// Regression: WorkflowRepository.get resolves only the requested workflow, so an invalid
+// sibling does not break it, and a duplicated id is not resolvable.
+test("workflow.get resolves the requested workflow without being broken by invalid siblings", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-get-")), dir = join(root, "workflows");
+  await mkdir(dir, { recursive: true });
+  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} } };
+  await writeFile(join(dir, "alpha.yaml"), stringify({ id: "alpha", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await writeFile(join(dir, "beta.yaml"), stringify({ id: "beta", tasks: { t: { executor: "ghost", inputs: {} } } }));
+  const repo = new WorkflowRepository(dir, profiles);
+  assert.equal((await repo.get("alpha")).id, "alpha");
+  await assert.rejects(repo.get("beta"), (error) => error instanceof DagmarError);
+  await assert.rejects(repo.get("missing"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
+  await writeFile(join(dir, "dup-a.yaml"), stringify({ id: "gamma", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await writeFile(join(dir, "dup-b.yaml"), stringify({ id: "gamma", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await assert.rejects(repo.get("gamma"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
 });
 
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
