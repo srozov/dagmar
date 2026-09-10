@@ -1,5 +1,7 @@
 # Dagmar
 
+**DAGMAR** stands for **Directed Acyclic Graph Manager And Runner**.
+
 Light agentic workflow orchestration for the command line. Dagmar speaks YAML for workflow definitions and ACP for agent execution.
 
 Define an explicit task graph in YAML. Dagmar starts dependency-ready tasks through ACP agents or local processes, then gives you a CLI to start, inspect, watch, resume, and cancel runs. It records run state in SQLite and streams control-plane events over loopback WebSocket JSON-RPC.
