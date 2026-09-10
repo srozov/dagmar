@@ -1,0 +1,13 @@
+id: process-example
+tasks:
+  first:
+    executor: local-process
+    inputs:
+      request: $run.input
+    run: [node, examples/process-result.mjs]
+  second:
+    executor: local-process
+    dependsOn: [first]
+    inputs:
+      previous: $tasks.first.output
+    run: [node, examples/process-result.mjs]
