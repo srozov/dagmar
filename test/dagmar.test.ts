@@ -67,6 +67,21 @@ test("blocked runs resume only the blocker and cancellation is terminal", async 
   app.store.close();
 });
 
+test("a failed branch does not stop its sibling and task cancellation blocks dependants", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-branches-")), bad = join(root, "bad.mjs"), good = join(root, "good.mjs"), wait = join(root, "wait.mjs");
+  await writeFile(bad, `for await(const _ of process.stdin){};console.log('noise');console.log(JSON.stringify({outcome:'completed',message:'bad',output:{}}));`);
+  await writeFile(good, `for await(const _ of process.stdin){};await new Promise(r=>setTimeout(r,50));console.log(JSON.stringify({outcome:'completed',message:'good',output:{}}));`);
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "branches", tasks: { bad: { executor: "local", inputs: {}, run: [process.execPath, bad] }, good: { executor: "local", inputs: {}, run: [process.execPath, good] } } });
+  const started = await app.scheduler.start("branches", {}), blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.bad!.state, "failed"); assert.equal(blocked.tasks.good!.state, "completed");
+  await writeFile(join(root, "workflows", "branches.yaml"), stringify({ id: "branches", tasks: { wait: { executor: "local", inputs: {}, run: [process.execPath, wait] }, after: { executor: "local", dependsOn: ["wait"], inputs: {}, run: [process.execPath, good] } } }));
+  const second = await app.scheduler.start("branches", {}); let running = await waitFor(app.scheduler, second.workflowRunId, "running", true);
+  const taskRunId = running.tasks.wait!.attempts[0]!.id; running = await app.scheduler.cancelTask(taskRunId);
+  assert.equal(running.status, "blocked"); assert.equal(running.tasks.after!.state, "blocked_by_dependency");
+  app.store.close();
+});
+
 test("ACP interactions suspend and resume an attempt", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-interaction-"));
   const app = await fixture(root, { id: "acp", tasks: { ask: { executor: "agent", inputs: {}, prompt: "ask" } } }, new InteractiveExecutor());
