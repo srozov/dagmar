@@ -26,6 +26,7 @@ class Attempt {
   private cancelled = false;
   private cancelPromise?: Promise<void>;
   private cleanupPromise?: Promise<void>;
+  private stderrDone: Promise<void> = Promise.resolve();
   private readonly closed: Promise<void>;
   private readonly done: Promise<Settlement>;
   constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly request: AcpRequest, private readonly hooks: Hooks) {
@@ -38,7 +39,7 @@ class Attempt {
     try {
       await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_process_started", data: { pid: this.child.pid ?? null } });
       this.child.stderr.setEncoding("utf8");
-      const stderr = (async () => { for await (const chunk of this.child.stderr) await this.hooks.transcript({ type: "stdio", direction: "from_executor", stream: "stderr", data: String(chunk) }); })();
+      this.stderrDone = (async () => { for await (const chunk of this.child.stderr) await this.hooks.transcript({ type: "stdio", direction: "from_executor", stream: "stderr", data: String(chunk) }); })();
       const outgoing = tap("to_executor", this.hooks), incoming = tap("from_executor", this.hooks);
       const pipe = outgoing.readable.pipeTo(Writable.toWeb(this.child.stdin) as WritableStream<Uint8Array>);
       const stream = ndJsonStream(outgoing.writable, (Readable.toWeb(this.child.stdout) as ReadableStream<Uint8Array>).pipeThrough(incoming));
@@ -92,7 +93,7 @@ class Attempt {
       if (!cancelling && this.supportsClose && this.sessionId && this.agent && !this.connection?.signal.aborted) {
         await Promise.race([this.agent.request(methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined), delay(500, undefined, { ref: false })]);
       }
-      this.connection?.close(); this.child.stdin.end(); await terminate(this.child, this.closed);
+      this.connection?.close(); this.child.stdin.end(); await terminate(this.child, this.closed); await this.stderrDone.catch(() => undefined);
       try { await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_process_exited", data: { code: this.child.exitCode, signal: this.child.signalCode } }); } catch {}
     })();
   }
