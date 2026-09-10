@@ -1,0 +1,166 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createServer } from "node:net";
+import test from "node:test";
+import { stringify } from "yaml";
+import { startDaemon } from "../src/daemon.js";
+import { AcpExecutor } from "../src/executors/acp.js";
+import { ProcessExecutor } from "../src/executors/process.js";
+import type { AcpRequest, Execution, Executor, Hooks } from "../src/executors/types.js";
+import { EventBus, RpcClient } from "../src/rpc.js";
+import { Scheduler } from "../src/scheduler.js";
+import { Store } from "../src/store.js";
+import { Transcripts } from "../src/transcript.js";
+import type { Config, Json, RunView, TaskResult } from "../src/types.js";
+import { WorkflowRepository } from "../src/workflow.js";
+
+test("process DAG runs a diamond concurrently and persists transcripts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-diamond-"));
+  const script = join(root, "task.mjs");
+  await writeFile(script, `
+import {existsSync,writeFileSync} from 'node:fs';
+const input=[]; for await (const c of process.stdin) input.push(c); const data=JSON.parse(input.join(''));
+const lane=process.argv[2], peer=process.argv[3], dir=process.argv[4];
+if (peer) { writeFileSync(dir+'/'+lane,''); while(!existsSync(dir+'/'+peer)) await new Promise(r=>setTimeout(r,10)); }
+console.log(JSON.stringify({outcome:'completed',message:lane,output:{lane,input:data}}));
+`);
+  const workflow = {
+    id: "diamond",
+    tasks: {
+      a: { executor: "local", inputs: { request: "$run.input" }, run: [process.execPath, script, "a", "", root] },
+      b: { executor: "local", dependsOn: ["a"], inputs: { fromA: "$tasks.a.output.lane" }, run: [process.execPath, script, "b", "c", root] },
+      c: { executor: "local", dependsOn: ["a"], inputs: { fromA: "$tasks.a.output.lane" }, run: [process.execPath, script, "c", "b", root] },
+      d: { executor: "local", dependsOn: ["b", "c"], inputs: { b: "$tasks.b.output.lane", c: "$tasks.c.output.lane" }, run: [process.execPath, script, "d", "", root] },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("diamond", { hello: "world" });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.deepEqual(Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])), { a: "completed", b: "completed", c: "completed", d: "completed" });
+  assert.equal(view.tasks.b!.attempts.length, 1);
+  const transcript = await app.transcripts.read(view.id, view.tasks.b!.attempts[0]!.id);
+  assert.ok(transcript.records.some((x) => x.type === "stdio" && x.stream === "stdout"));
+  app.store.close();
+});
+
+test("blocked runs resume only the blocker and cancellation is terminal", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-resume-")), marker = join(root, "marker");
+  const block = join(root, "block.mjs"), wait = join(root, "wait.mjs");
+  await writeFile(block, `import{existsSync,writeFileSync}from'node:fs';for await(const _ of process.stdin){};const first=!existsSync(${JSON.stringify(marker)});if(first)writeFileSync(${JSON.stringify(marker)},'');console.log(JSON.stringify({outcome:first?'blocked':'completed',message:'x',output:{}}));`);
+  await writeFile(wait, `for await(const _ of process.stdin){};setTimeout(()=>{},10000);`);
+  const app = await fixture(root, { id: "resume", tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, block] } } });
+  const started = await app.scheduler.start("resume", {});
+  const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.step!.attempts.length, 1);
+  const completed = await app.scheduler.resume(started.workflowRunId);
+  const resumed = completed.status === "completed" ? completed : await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(resumed.tasks.step!.attempts.length, 2);
+
+  await writeFile(join(root, "workflows", "resume.yaml"), stringify({ id: "resume", tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, wait] } } }));
+  const second = await app.scheduler.start("resume", {});
+  await waitFor(app.scheduler, second.workflowRunId, "running", true);
+  const cancelled = await app.scheduler.cancelRun(second.workflowRunId);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.tasks.step!.state, "cancelled");
+  app.store.close();
+});
+
+test("ACP interactions suspend and resume an attempt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-interaction-"));
+  const app = await fixture(root, { id: "acp", tasks: { ask: { executor: "agent", inputs: {}, prompt: "ask" } } }, new InteractiveExecutor());
+  const started = await app.scheduler.start("acp", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "permission");
+  await app.scheduler.answer(interaction.id, { outcome: { outcome: "selected", optionId: "yes" } });
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(completed.tasks.ask!.state, "completed");
+  app.store.close();
+});
+
+test("ACP executor speaks one fresh stdio session and validates its result", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{sessionCapabilities:{close:{}}}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'fresh-1'}});
+if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'fresh-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'{"outcome":"completed","message":"ok","output":{}}'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
+});
+`);
+  const records: unknown[] = []; let session = "";
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_x", taskRunId: "tr_x", taskId: "x", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const settled = await execution.done;
+  assert.equal(session, "fresh-1");
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.ok(records.some((x) => (x as { type?: string }).type === "acp"));
+});
+
+test("daemon exposes the process runtime through JSON-RPC", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-daemon-")), workflows = join(root, "workflows"), state = join(root, "state"), script = join(root, "done.mjs");
+  await import("node:fs/promises").then((fs) => fs.mkdir(workflows, { recursive: true }));
+  await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'done',output:{}}));`);
+  await writeFile(join(workflows, "one.yaml"), stringify({ id: "one", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, script] } } }));
+  const port = await freePort(), config = join(root, "config.yaml");
+  await writeFile(config, stringify({ workflowDir: workflows, storageDir: state, listen: { host: "127.0.0.1", port }, executors: { local: { type: "process", cwd: root, env: {} } } }));
+  const daemon = await startDaemon(config), client = new RpcClient(`ws://127.0.0.1:${port}`); await client.connect();
+  try {
+    const ping = await client.request("system.ping") as JsonObject; assert.equal(ping.ok, true);
+    const started = await client.request("run.start", { workflowId: "one", input: {} }) as JsonObject;
+    let view: JsonObject = {}; for (let i = 0; i < 200; i++) { view = await client.request("run.get", { workflowRunId: started.workflowRunId! }) as JsonObject; if (view.status === "completed") break; await new Promise((resolve) => setTimeout(resolve, 10)); }
+    assert.equal(view.status, "completed");
+  } finally { client.close(); await daemon.stop(); }
+});
+
+test("startup recovery blocks persisted active attempts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-recovery-"));
+  const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
+  const now = new Date().toISOString();
+  app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  await app.scheduler.recover();
+  assert.equal(app.store.run("wr_recovery")!.status, "blocked");
+  assert.equal(app.store.attempt("tr_recovery")!.error!.code, "executor_lost");
+  app.store.close();
+});
+
+async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
+  const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
+  await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
+  await writeFile(join(workflowDir, `${(workflow as { id: string }).id}.yaml`), stringify(workflow));
+  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} }, agent: { type: "acp", cwd: root, env: {}, run: ["unused"] } };
+  const store = new Store(":memory:"), transcripts = new Transcripts(storageDir), events = new EventBus();
+  const scheduler = new Scheduler(store, transcripts, new WorkflowRepository(workflowDir, profiles), events, profiles, { process: new ProcessExecutor(), acp });
+  return { store, transcripts, events, scheduler };
+}
+
+class InteractiveExecutor implements Executor<AcpRequest> {
+  async start(_request: AcpRequest, hooks: Hooks): Promise<Execution> {
+    let cancelled = false;
+    const done = (async () => {
+      const response = await hooks.interact({ kind: "permission", method: "session/request_permission", request: { options: [{ optionId: "yes" }] }, validate: (value: Json) => value });
+      const result: TaskResult = { outcome: "completed", message: "answered", output: response };
+      return cancelled ? { error: { code: "cancelled", message: "cancelled" } } : { result };
+    })();
+    return { done, cancel: async () => { cancelled = true; } };
+  }
+}
+
+async function waitFor(scheduler: Scheduler, id: string, status: RunView["status"], allowInitial = false): Promise<RunView> {
+  for (let i = 0; i < 500; i++) {
+    const view = await scheduler.get(id);
+    if (view.status === status && (allowInitial || Object.values(view.tasks).some((x) => x.attempts.length))) return view;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Run did not reach ${status}`);
+}
+
+async function freePort(): Promise<number> {
+  const server = createServer(); await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address(); if (!address || typeof address === "string") throw new Error("No port");
+  await new Promise<void>((resolve) => server.close(() => resolve())); return address.port;
+}
