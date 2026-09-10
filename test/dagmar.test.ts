@@ -143,6 +143,17 @@ test("startup recovery blocks persisted active attempts", async () => {
   app.store.close();
 });
 
+test("graceful shutdown fails active attempts and waits for their process", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-shutdown-")), script = join(root, "wait.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "shutdown", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, script] } } });
+  const started = await app.scheduler.start("shutdown", {}); await waitFor(app.scheduler, started.workflowRunId, "running", true);
+  await app.scheduler.shutdown();
+  assert.equal(app.store.run(started.workflowRunId)!.status, "blocked");
+  assert.equal(app.store.attempts(started.workflowRunId)[0]!.error!.code, "daemon_shutdown");
+  app.store.close();
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
