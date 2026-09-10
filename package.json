@@ -1,0 +1,29 @@
+{
+  "name": "dagmar",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.3.4",
+  "engines": { "node": ">=24 <25" },
+  "bin": { "dagmar": "./dist/cli.js", "dagmard": "./dist/daemon.js" },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "dev:daemon": "tsx src/daemon.ts",
+    "dev:cli": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "ajv": "8.20.0",
+    "ws": "8.21.3",
+    "yaml": "2.9.0",
+    "zod": "4.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.4",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.13",
+    "typescript": "7.0.2"
+  }
+}
