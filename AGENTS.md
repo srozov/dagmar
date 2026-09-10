@@ -33,6 +33,17 @@ This repository lives on the remote host **agi01**. Its local SSHFS mount is:
 - Use the normal local editing workflow (for example, `apply_patch`) against that path.
 - Do not write repository files through an SSH shell unless the user explicitly asks for that.
 
+## Package management
+
+- Use `pnpm` for dagmar dependency management and project scripts.
+- Commit and maintain `pnpm-lock.yaml`; do not create or update `package-lock.json` or use Yarn.
+- Run project dependency and test commands on `agi01` through Tailscale SSH.
+- Use `pnpm install` when intentionally changing dependencies; use
+  `pnpm install --frozen-lockfile` for verification after the lockfile exists.
+- Do not install dagmar dependencies globally. Host-provided executables such
+  as `openclaw` and `claude-agent-acp` are configured by absolute path in
+  dagmar’s machine-local config.
+
 ## Commands
 
 - Run project commands on the remote host, not on the Mac.
