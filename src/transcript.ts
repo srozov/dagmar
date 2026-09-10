@@ -20,14 +20,20 @@ export class Transcripts {
       try { await handle.appendFile(`${JSON.stringify(record)}\n`); await handle.sync(); } finally { await handle.close(); }
       count += 1; this.counts.set(path, count); this.appended?.(runId, taskRunId, count); return count;
     });
-    this.tails.set(path, job.catch(() => undefined));
+    const guarded = job.catch(() => undefined);
+    this.tails.set(path, guarded);
+    // Evict per-path state once this file's writes are idle (a later append re-derives the
+    // count from disk) so tails/counts do not grow one entry per attempt forever.
+    void guarded.then(() => { if (this.tails.get(path) === guarded) { this.tails.delete(path); this.counts.delete(path); } });
     return job;
   }
 
   async read(runId: string, taskRunId: string, afterLine = 0): Promise<{ records: TranscriptRecord[]; nextLine: number }> {
     if (!Number.isSafeInteger(afterLine) || afterLine < 0) throw new DagmarError("invalid_params", "afterLine must be a non-negative integer");
     let text = ""; try { text = await readFile(this.path(runId, taskRunId), "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const lines = text.split("\n"); if (lines.at(-1) === "") lines.pop(); else lines.pop();
+    // Drop the final split element: the empty string after a complete file's trailing
+    // newline, or an incomplete final line left by a crash. Either way it is not a record.
+    const lines = text.split("\n"); lines.pop();
     const records = lines.slice(afterLine).map((line) => { try { return JSON.parse(line) as TranscriptRecord; } catch { throw new DagmarError("transcript_corrupt", "Transcript contains invalid JSON"); } });
     return { records, nextLine: lines.length };
   }
