@@ -229,6 +229,27 @@ test("workflow.get resolves the requested workflow without being broken by inval
   await assert.rejects(repo.get("gamma"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
 });
 
+// Regression: an ACP agent that requires authentication (auth_required, JSON-RPC -32000 on
+// session/new) must settle the attempt as failed with a clear code, never crash the runtime.
+test("an unauthenticated ACP agent fails the attempt with acp_authentication_required", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acpauth-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,error:{code:-32000,message:'Authentication required'}});
+});
+`);
+  const execution = await new AcpExecutor().start(
+    { type: "acp", runId: "wr_a", taskRunId: "tr_a", taskId: "a", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    { transcript: async () => 1, session: async () => {}, interact: async () => { throw new Error("unexpected"); } },
+  );
+  const settled = await execution.done;
+  assert.ok("error" in settled, "expected a failed settlement, not a crash");
+  assert.equal("error" in settled && settled.error.code, "acp_authentication_required");
+});
+
 // Regression: in a cancelled run, an unstarted task must be exposed as `cancelled` in
 // RunView, not left `undefined` because taskStates returned without memoizing it.
 test("a cancelled run exposes unstarted tasks as cancelled", async () => {
