@@ -1,0 +1,36 @@
+# Example dagmar daemon configuration.
+#
+# Copy to ~/.config/dagmar/config.yaml (or pass `dagmard --config <path>`) and
+# edit the absolute paths for your machine. workflowDir, storageDir, every
+# executor `cwd`, and each ACP `run` argv must be ABSOLUTE.
+#
+# The ACP adapters (claude-agent-acp, openclaw) are host-provided executables,
+# NOT dagmar dependencies — install/authenticate them out-of-band and point
+# `run` at them here.
+
+workflowDir: /absolute/path/to/workflows
+storageDir: /absolute/path/to/dagmar-state
+
+listen:
+  host: 127.0.0.1
+  port: 7331
+
+executors:
+  local-process:
+    type: process
+    cwd: /absolute/path/to/working/dir
+    env: {}
+
+  claude-acp:
+    type: acp
+    cwd: /absolute/path/to/working/dir
+    # Point at the claude-agent-acp adapter installed on this host, e.g.
+    #   run: [node, /abs/path/to/@agentclientprotocol/claude-agent-acp/dist/index.js]
+    run: [node, /absolute/path/to/claude-agent-acp/dist/index.js]
+    env: {}
+
+  openclaw-acp:
+    type: acp
+    cwd: /absolute/path/to/working/dir
+    run: [/absolute/path/to/openclaw, acp]
+    env: {}
