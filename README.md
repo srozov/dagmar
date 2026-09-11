@@ -1,13 +1,5 @@
 # Dagmar
 
-```
-    ╱ ▲ ╲
-   ◇  ║  ◇
-    ╲ ║ ╱
-     ╱╲
-    ╱  ╲
-```
-
 **Dagmar** /ˈdɑːɡ.mɑːr/ — from Old Norse *dag* (day) and *mær* (maiden): the orchestrator of purposeful flow.
 
 **D A G M A R** stands for **Directed Acyclic Graph Manager And Runner**.
