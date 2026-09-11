@@ -250,6 +250,25 @@ if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,error:{code:-32000,messa
   assert.equal("error" in settled && settled.error.code, "acp_authentication_required");
 });
 
+// Regression: in a cancelled run, an unstarted task must be exposed as `cancelled` in
+// RunView, not left `undefined` because taskStates returned without memoizing it.
+test("a cancelled run exposes unstarted tasks as cancelled", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cancelstate-")), wait = join(root, "wait.mjs");
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "cancelstate", tasks: {
+    first: { executor: "local", inputs: {}, run: [process.execPath, wait] },
+    second: { executor: "local", dependsOn: ["first"], inputs: {}, run: [process.execPath, wait] },
+  } });
+  const started = await app.scheduler.start("cancelstate", {});
+  await waitFor(app.scheduler, started.workflowRunId, "running");
+  const cancelled = await app.scheduler.cancelRun(started.workflowRunId);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.tasks.first!.state, "cancelled");
+  assert.equal(cancelled.tasks.second!.state, "cancelled"); // was undefined before the fix
+  assert.equal(cancelled.tasks.second!.attempts.length, 0);
+  app.store.close();
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));

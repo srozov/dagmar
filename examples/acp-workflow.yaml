@@ -1,0 +1,13 @@
+id: acp-example
+
+tasks:
+  identify:
+    executor: claude-acp
+    inputs:
+      request: $run.input
+    prompt: |
+      This is a harmless ACP connectivity check. Using the supplied inputs,
+      put a short identifier for yourself (your model or agent name) in the
+      result output. Do not use any tools.
+    session:
+      mode: fresh
