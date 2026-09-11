@@ -92,11 +92,15 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
     }
   }
-  const visiting = new Set<string>(), done = new Set<string>();
+  const visiting = new Set<string>();
+  const done = new Set<string>();
   const visit = (id: string): void => {
     if (visiting.has(id)) throw new DagmarError("dependency_cycle", "Workflow contains a dependency cycle");
     if (done.has(id)) return;
-    visiting.add(id); for (const dep of tasks[id]!.dependsOn) visit(dep); visiting.delete(id); done.add(id);
+    visiting.add(id);
+    for (const dep of tasks[id]!.dependsOn) visit(dep);
+    visiting.delete(id);
+    done.add(id);
   };
   for (const id of Object.keys(tasks)) visit(id);
   return { id: raw.id, tasks };
