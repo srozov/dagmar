@@ -20,26 +20,51 @@ import { WorkflowRepository } from "../src/workflow.js";
 test("process DAG runs a diamond concurrently and persists transcripts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-diamond-"));
   const script = join(root, "task.mjs");
-  await writeFile(script, `
+  await writeFile(
+    script,
+    `
 import {existsSync,writeFileSync} from 'node:fs';
 const input=[]; for await (const c of process.stdin) input.push(c); const data=JSON.parse(input.join(''));
 const lane=process.argv[2], peer=process.argv[3], dir=process.argv[4];
 if (peer) { writeFileSync(dir+'/'+lane,''); while(!existsSync(dir+'/'+peer)) await new Promise(r=>setTimeout(r,10)); }
 console.log(JSON.stringify({outcome:'completed',message:lane,output:{lane,input:data}}));
-`);
+`,
+  );
   const workflow = {
     id: "diamond",
     tasks: {
-      a: { executor: "local", inputs: { request: "$run.input" }, run: [process.execPath, script, "a", "", root] },
-      b: { executor: "local", dependsOn: ["a"], inputs: { fromA: "$tasks.a.output.lane" }, run: [process.execPath, script, "b", "c", root] },
-      c: { executor: "local", dependsOn: ["a"], inputs: { fromA: "$tasks.a.output.lane" }, run: [process.execPath, script, "c", "b", root] },
-      d: { executor: "local", dependsOn: ["b", "c"], inputs: { b: "$tasks.b.output.lane", c: "$tasks.c.output.lane" }, run: [process.execPath, script, "d", "", root] },
+      a: {
+        executor: "local",
+        inputs: { request: "$run.input" },
+        run: [process.execPath, script, "a", "", root],
+      },
+      b: {
+        executor: "local",
+        dependsOn: ["a"],
+        inputs: { fromA: "$tasks.a.output.lane" },
+        run: [process.execPath, script, "b", "c", root],
+      },
+      c: {
+        executor: "local",
+        dependsOn: ["a"],
+        inputs: { fromA: "$tasks.a.output.lane" },
+        run: [process.execPath, script, "c", "b", root],
+      },
+      d: {
+        executor: "local",
+        dependsOn: ["b", "c"],
+        inputs: { b: "$tasks.b.output.lane", c: "$tasks.c.output.lane" },
+        run: [process.execPath, script, "d", "", root],
+      },
     },
   };
   const app = await fixture(root, workflow);
   const started = await app.scheduler.start("diamond", { hello: "world" });
   const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
-  assert.deepEqual(Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])), { a: "completed", b: "completed", c: "completed", d: "completed" });
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])),
+    { a: "completed", b: "completed", c: "completed", d: "completed" },
+  );
   assert.equal(view.tasks.b!.attempts.length, 1);
   const transcript = await app.transcripts.read(view.id, view.tasks.b!.attempts[0]!.id);
   assert.ok(transcript.records.some((x) => x.type === "stdio" && x.stream === "stdout"));
@@ -47,19 +72,36 @@ console.log(JSON.stringify({outcome:'completed',message:lane,output:{lane,input:
 });
 
 test("blocked runs resume only the blocker and cancellation is terminal", async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-resume-")), marker = join(root, "marker");
-  const block = join(root, "block.mjs"), wait = join(root, "wait.mjs");
-  await writeFile(block, `import{existsSync,writeFileSync}from'node:fs';for await(const _ of process.stdin){};const first=!existsSync(${JSON.stringify(marker)});if(first)writeFileSync(${JSON.stringify(marker)},'');console.log(JSON.stringify({outcome:first?'blocked':'completed',message:'x',output:{}}));`);
+  const root = await mkdtemp(join(tmpdir(), "dagmar-resume-"));
+  const marker = join(root, "marker");
+  const block = join(root, "block.mjs");
+  const wait = join(root, "wait.mjs");
+  await writeFile(
+    block,
+    `import{existsSync,writeFileSync}from'node:fs';for await(const _ of process.stdin){};const first=!existsSync(${JSON.stringify(marker)});if(first)writeFileSync(${JSON.stringify(marker)},'');console.log(JSON.stringify({outcome:first?'blocked':'completed',message:'x',output:{}}));`,
+  );
   await writeFile(wait, `for await(const _ of process.stdin){};setTimeout(()=>{},10000);`);
-  const app = await fixture(root, { id: "resume", tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, block] } } });
+  const app = await fixture(root, {
+    id: "resume",
+    tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, block] } },
+  });
   const started = await app.scheduler.start("resume", {});
   const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
   assert.equal(blocked.tasks.step!.attempts.length, 1);
   const completed = await app.scheduler.resume(started.workflowRunId);
-  const resumed = completed.status === "completed" ? completed : await waitFor(app.scheduler, started.workflowRunId, "completed");
+  const resumed =
+    completed.status === "completed"
+      ? completed
+      : await waitFor(app.scheduler, started.workflowRunId, "completed");
   assert.equal(resumed.tasks.step!.attempts.length, 2);
 
-  await writeFile(join(root, "workflows", "resume.yaml"), stringify({ id: "resume", tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, wait] } } }));
+  await writeFile(
+    join(root, "workflows", "resume.yaml"),
+    stringify({
+      id: "resume",
+      tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, wait] } },
+    }),
+  );
   const second = await app.scheduler.start("resume", {});
   await waitFor(app.scheduler, second.workflowRunId, "running", true);
   const cancelled = await app.scheduler.cancelRun(second.workflowRunId);
@@ -69,17 +111,51 @@ test("blocked runs resume only the blocker and cancellation is terminal", async 
 });
 
 test("a failed branch does not stop its sibling and task cancellation blocks dependants", async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-branches-")), bad = join(root, "bad.mjs"), good = join(root, "good.mjs"), wait = join(root, "wait.mjs");
-  await writeFile(bad, `for await(const _ of process.stdin){};console.log('noise');console.log(JSON.stringify({outcome:'completed',message:'bad',output:{}}));`);
-  await writeFile(good, `for await(const _ of process.stdin){};await new Promise(r=>setTimeout(r,50));console.log(JSON.stringify({outcome:'completed',message:'good',output:{}}));`);
+  const root = await mkdtemp(join(tmpdir(), "dagmar-branches-"));
+  const bad = join(root, "bad.mjs");
+  const good = join(root, "good.mjs");
+  const wait = join(root, "wait.mjs");
+  await writeFile(
+    bad,
+    `for await(const _ of process.stdin){};console.log('noise');console.log(JSON.stringify({outcome:'completed',message:'bad',output:{}}));`,
+  );
+  await writeFile(
+    good,
+    `for await(const _ of process.stdin){};await new Promise(r=>setTimeout(r,50));console.log(JSON.stringify({outcome:'completed',message:'good',output:{}}));`,
+  );
   await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
-  const app = await fixture(root, { id: "branches", tasks: { bad: { executor: "local", inputs: {}, run: [process.execPath, bad] }, good: { executor: "local", inputs: {}, run: [process.execPath, good] } } });
-  const started = await app.scheduler.start("branches", {}), blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
-  assert.equal(blocked.tasks.bad!.state, "failed"); assert.equal(blocked.tasks.good!.state, "completed");
-  await writeFile(join(root, "workflows", "branches.yaml"), stringify({ id: "branches", tasks: { wait: { executor: "local", inputs: {}, run: [process.execPath, wait] }, after: { executor: "local", dependsOn: ["wait"], inputs: {}, run: [process.execPath, good] } } }));
-  const second = await app.scheduler.start("branches", {}); let running = await waitFor(app.scheduler, second.workflowRunId, "running", true);
-  const taskRunId = running.tasks.wait!.attempts[0]!.id; running = await app.scheduler.cancelTask(taskRunId);
-  assert.equal(running.status, "blocked"); assert.equal(running.tasks.after!.state, "blocked_by_dependency");
+  const app = await fixture(root, {
+    id: "branches",
+    tasks: {
+      bad: { executor: "local", inputs: {}, run: [process.execPath, bad] },
+      good: { executor: "local", inputs: {}, run: [process.execPath, good] },
+    },
+  });
+  const started = await app.scheduler.start("branches", {});
+  const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.bad!.state, "failed");
+  assert.equal(blocked.tasks.good!.state, "completed");
+  await writeFile(
+    join(root, "workflows", "branches.yaml"),
+    stringify({
+      id: "branches",
+      tasks: {
+        wait: { executor: "local", inputs: {}, run: [process.execPath, wait] },
+        after: {
+          executor: "local",
+          dependsOn: ["wait"],
+          inputs: {},
+          run: [process.execPath, good],
+        },
+      },
+    }),
+  );
+  const second = await app.scheduler.start("branches", {});
+  let running = await waitFor(app.scheduler, second.workflowRunId, "running", true);
+  const taskRunId = running.tasks.wait!.attempts[0]!.id;
+  running = await app.scheduler.cancelTask(taskRunId);
+  assert.equal(running.status, "blocked");
+  assert.equal(running.tasks.after!.state, "blocked_by_dependency");
   app.store.close();
 });
 
