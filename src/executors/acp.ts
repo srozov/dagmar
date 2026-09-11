@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
-import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, type ClientConnection, type ClientContext, type CreateElicitationResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionNotification } from "@agentclientprotocol/sdk";
+import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionNotification } from "@agentclientprotocol/sdk";
 import { validateResult } from "../result.js";
 import type { Json, JsonObject, TaskError } from "../types.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "./types.js";
@@ -31,7 +31,7 @@ class Attempt {
   private readonly done: Promise<Settlement>;
   constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly request: AcpRequest, private readonly hooks: Hooks) {
     this.closed = new Promise((resolve) => child.once("close", resolve));
-    this.done = this.run().catch((error) => errorValue(this.cancelled ? "acp_cancelled" : "acp_failed", error));
+    this.done = this.run().catch((error) => this.cancelled ? errorValue("acp_cancelled", error) : { error: classifyFailure(error) });
   }
   execution(): Execution { return { done: this.done, cancel: () => this.cancel() }; }
 
@@ -122,4 +122,14 @@ async function terminate(child: ChildProcessWithoutNullStreams, closed: Promise<
 }
 function signal(pid: number, value: NodeJS.Signals): void { try { process.kill(-pid, value); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } }
 function errorValue(code: string, error: unknown): { error: TaskError } { return { error: { code, message: error instanceof Error ? error.message : "ACP execution failed" } }; }
+// JSON-RPC error code the ACP agent returns from session/new when it requires authentication.
+const AUTH_REQUIRED = -32000;
+// dagmar performs no ACP `authenticate` handshake, so an agent that gates session creation on
+// authentication surfaces here. Map it to a clear, actionable code instead of a generic failure;
+// the daemon keeps running and the attempt simply settles as failed.
+function classifyFailure(error: unknown): TaskError {
+  const code = error instanceof RequestError ? error.code : (typeof error === "object" && error !== null && "code" in error ? (error as { code: unknown }).code : undefined);
+  if (code === AUTH_REQUIRED) return { code: "acp_authentication_required", message: "ACP agent requires authentication; authenticate the configured adapter out-of-band before running (dagmar performs no ACP authentication)." };
+  return { code: "acp_failed", message: error instanceof Error ? error.message : "ACP execution failed" };
+}
 function finished(value: Settlement): Execution { return { done: Promise.resolve(value), cancel: async () => undefined }; }
