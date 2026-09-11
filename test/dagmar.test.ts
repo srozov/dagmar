@@ -229,6 +229,25 @@ test("workflow.get resolves the requested workflow without being broken by inval
   await assert.rejects(repo.get("gamma"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
 });
 
+// Regression: in a cancelled run, an unstarted task must be exposed as `cancelled` in
+// RunView, not left `undefined` because taskStates returned without memoizing it.
+test("a cancelled run exposes unstarted tasks as cancelled", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cancelstate-")), wait = join(root, "wait.mjs");
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "cancelstate", tasks: {
+    first: { executor: "local", inputs: {}, run: [process.execPath, wait] },
+    second: { executor: "local", dependsOn: ["first"], inputs: {}, run: [process.execPath, wait] },
+  } });
+  const started = await app.scheduler.start("cancelstate", {});
+  await waitFor(app.scheduler, started.workflowRunId, "running");
+  const cancelled = await app.scheduler.cancelRun(started.workflowRunId);
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.tasks.first!.state, "cancelled");
+  assert.equal(cancelled.tasks.second!.state, "cancelled"); // was undefined before the fix
+  assert.equal(cancelled.tasks.second!.attempts.length, 0);
+  app.store.close();
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
