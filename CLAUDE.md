@@ -29,7 +29,7 @@ These are implementation constraints, not slogans. Apply them by default.
   dagmar’s machine-local config.
 
 ### Commit strategy
-
+- Use "Conventional Commits" style for commit messages. Each commit should have a clear, imperative subject line and a body that explains the reasoning behind the change.
 - Work in small, cohesive commits. Each commit should implement one logical change and have an imperative, descriptive subject.
 - Stage only files relevant to the current task. Do not commit credentials, local configuration, generated artifacts, or unrelated changes.
 - Commit completed feature work only to its `claude/<feature>` branch. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.

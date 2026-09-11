@@ -72,7 +72,7 @@ This repository lives on the remote host **agi01**. Its local SSHFS mount is:
 - Avoid assigning separate agents to overlapping files. Agree on shared interfaces before implementing dependent features.
 
 ### Commit strategy
-
+- Use "Conventional Commits" style for commit messages. Each commit should have a clear, imperative subject line and a body that explains the reasoning behind the change.
 - Work in small, cohesive commits. Each commit should implement one logical change and have an imperative, descriptive subject.
 - Stage only files relevant to the current task. Do not commit credentials, local configuration, generated artifacts, or unrelated changes.
 - Commit completed feature work only to its `codex/<feature>` branch. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.
