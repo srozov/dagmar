@@ -239,7 +239,7 @@ function taskStates(workflow: Workflow, latest: Map<string, AttemptRow>, runStat
     if (states.has(id)) return states.get(id)!;
     const row = latest.get(id);
     if (row) { states.set(id, row.status); return row.status; }
-    if (runStatus === "cancelled") return "cancelled";
+    if (runStatus === "cancelled") { states.set(id, "cancelled"); return "cancelled"; }
     const deps = workflow.tasks[id]!.dependsOn.map(state);
     const value = deps.some((x) => ["blocked", "failed", "cancelled", "blocked_by_dependency"].includes(x)) ? "blocked_by_dependency"
       : deps.every((x) => x === "completed") ? "ready"
