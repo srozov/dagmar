@@ -141,9 +141,20 @@ export class Scheduler {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       const inputs = resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
       const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
-      const request = profile.type === "process" ? { ...common, type: "process" as const, run: task.run! } : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt! };
+      let loadSessionId: string | undefined;
+      if (task.session?.mode === "continue") {
+        // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
+        // completed attempt. A null acpSessionId is a real source-side failure (e.g. the source
+        // task errored before persisting an id) — surface it explicitly, never fall back to fresh.
+        const sid = latest.get(task.session.from)?.acpSessionId;
+        if (!sid) throw new DagmarError("continuation_unavailable", `Source session id for ${task.session.from} is unavailable`);
+        loadSessionId = sid;
+      }
+      const request = profile.type === "process" ? { ...common, type: "process" as const, run: task.run! } : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}) };
       return { row: { ...base, executorType: profile.type, status: "running", error: null, endedAt: null }, request };
     } catch (error) {
+      // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, executor_unavailable),
+      // so validation/scheduling failures surface with their semantic code instead of a generic one.
       return { row: { ...base, status: "failed", error: taskError("input_resolution_failed", error), endedAt: now } };
     }
   }
