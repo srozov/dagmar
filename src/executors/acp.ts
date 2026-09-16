@@ -100,15 +100,37 @@ class Attempt {
         throw new Error("ACP protocol version is unsupported");
       }
       this.supportsClose = initialized.agentCapabilities?.sessionCapabilities?.close != null;
-      const session = await this.agent.request(methods.agent.session.new, {
-        cwd: this.request.cwd,
-        mcpServers: [],
-      });
-      this.sessionId = session.sessionId;
-      await this.hooks.session(session.sessionId);
+      if (this.request.loadSessionId) {
+        // The capability is top-level (not under sessionCapabilities), contrast with close.
+        const supportsLoad = initialized.agentCapabilities?.loadSession === true;
+        if (!supportsLoad) {
+          await this.hooks.transcript({
+            type: "lifecycle",
+            direction: "internal",
+            event: "acp_load_unsupported",
+            data: { sessionId: this.request.loadSessionId },
+          });
+          // The `finally` below still cleans up the connection/process; returning a Settlement
+          // is the contract for non-throwing executor failures.
+          return { error: { code: "acp_load_unsupported", message: "ACP agent does not advertise loadSession" } };
+        }
+        await this.agent.request(methods.agent.session.load, {
+          sessionId: this.request.loadSessionId,
+          cwd: this.request.cwd,
+          mcpServers: [],
+        });
+        this.sessionId = this.request.loadSessionId;
+      } else {
+        const session = await this.agent.request(methods.agent.session.new, {
+          cwd: this.request.cwd,
+          mcpServers: [],
+        });
+        this.sessionId = session.sessionId;
+      }
+      await this.hooks.session(this.sessionId);
       const prompt = `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${RESULT_INSTRUCTION}`;
       const response = await this.agent.request(methods.agent.session.prompt, {
-        sessionId: session.sessionId,
+        sessionId: this.sessionId,
         prompt: [{ type: "text", text: prompt }],
       });
       if (this.cancelled) throw new Error("ACP attempt was cancelled");
