@@ -8,14 +8,14 @@ import { stringify } from "yaml";
 import { startDaemon } from "../src/daemon.js";
 import { AcpExecutor } from "../src/executors/acp.js";
 import { ProcessExecutor } from "../src/executors/process.js";
-import type { AcpRequest, Execution, Executor, Hooks } from "../src/executors/types.js";
+import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "../src/executors/types.js";
 import { EventBus, RpcClient } from "../src/rpc.js";
 import { Scheduler } from "../src/scheduler.js";
 import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
 import type { Config, Json, RunView, TaskResult } from "../src/types.js";
 import { DagmarError } from "../src/types.js";
-import { WorkflowRepository } from "../src/workflow.js";
+import { WorkflowRepository, validateWorkflow } from "../src/workflow.js";
 
 test("process DAG runs a diamond concurrently and persists transcripts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-diamond-"));
@@ -345,6 +345,192 @@ test("a cancelled run exposes unstarted tasks as cancelled", async () => {
   app.store.close();
 });
 
+// T1 (session continuation): validateWorkflow accepts a continue task whose 'from' is a
+// same-agent ACP dependency, and rejects every variant the plan enumerates. Profiles are
+// passed in directly so each rejection can pin a specific failure mode without disk I/O.
+test("validateWorkflow accepts continue with a same-agent ACP dependency and rejects variants", () => {
+  const profiles: Config["executors"] = {
+    acpA: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] },
+    acpB: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] }, // same agent as acpA
+    acpOther: { type: "acp", cwd: "/tmp", env: {}, run: ["other"] }, // different agent
+    proc: { type: "process", cwd: "/tmp", env: {} },
+  };
+  // Accept: same-agent acp dependency.
+  const ok = validateWorkflow({
+    id: "ok",
+    tasks: {
+      A: { executor: "acpA", inputs: {}, prompt: "a" },
+      B: { executor: "acpB", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "A" } },
+    },
+  }, profiles);
+  assert.equal(ok.tasks.B!.session?.mode, "continue");
+  assert.equal((ok.tasks.B!.session as { from?: string }).from, "A");
+
+  // Reject: missing `from` for continue.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        A: { executor: "acpA", inputs: {}, prompt: "a" },
+        B: { executor: "acpA", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue" } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /continue requires from/.test(error.message),
+  );
+
+  // Reject: `from` not in dependsOn.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        A: { executor: "acpA", inputs: {}, prompt: "a" },
+        C: { executor: "acpA", inputs: {}, prompt: "c" },
+        B: { executor: "acpA", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "C" } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_dependency",
+  );
+
+  // Reject: `from` is a process task (can't continue a process session).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        P: { executor: "proc", inputs: {}, run: ["true"] },
+        B: { executor: "acpA", dependsOn: ["P"], inputs: {}, prompt: "b", session: { mode: "continue", from: "P" } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /ACP task/.test(error.message),
+  );
+
+  // Reject: `from` uses a different agent (different run argv).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        A: { executor: "acpA", inputs: {}, prompt: "a" },
+        B: { executor: "acpOther", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "A" } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /same agent/.test(error.message),
+  );
+
+  // Reject: mode: fork (still unsupported).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { A: { executor: "acpA", inputs: {}, prompt: "a", session: { mode: "fork" } } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "unsupported_session_mode",
+  );
+});
+
+// T1 (scheduler resolution): the scheduler forwards the source task's persisted
+// acp_session_id on the continuing task's request as loadSessionId. The fake ACP executor
+// captures B's request after A completes with hooks.session("sid-A"); assert the forwarded
+// id matches and the run completes.
+test("scheduler resolves loadSessionId from a completed dependency's persisted acp_session_id", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-resolve-"));
+  const workflow = {
+    id: "resolve",
+    tasks: {
+      A: { executor: "agent", inputs: {}, prompt: "a" },
+      B: { executor: "agent", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "A" } },
+    },
+  };
+  // fixture()'s default `agent` profile has run:["unused"] so A and B share the same agent argv.
+  const captured = { request: undefined as AcpRequest | undefined };
+  const stub = new StubAcpExecutor(async (request, hooks) => {
+    if (request.taskId === "A") {
+      // Mirrors AcpExecutor: the executor persists its session id via this hook so the
+      // scheduler can hand it to a later continuing task.
+      await hooks.session("sid-A");
+      return { result: { outcome: "completed", message: "a", output: {} } };
+    }
+    captured.request = request;
+    return { result: { outcome: "completed", message: "b", output: {} } };
+  });
+  const app = await fixture(root, workflow, stub);
+  const started = await app.scheduler.start("resolve", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.tasks.A!.state, "completed");
+  assert.equal(view.tasks.B!.state, "completed");
+  assert.equal(captured.request?.loadSessionId, "sid-A");
+  app.store.close();
+});
+
+// T1 (ACP load branch): when loadSessionId is set and the agent advertises loadSession,
+// AcpExecutor calls session/load (not session/new) and then one session/prompt, settling
+// with the parsed TaskResult. Inspect the captured transcript for both the load method
+// (and the absence of session/new) and the resulting completion.
+test("AcpExecutor uses session/load when loadSessionId is set and the agent advertises loadSession", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-load-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});
+if(m.method==='session/load'){send({jsonrpc:'2.0',id:m.id,result:{}})}
+if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',params:{sessionId:m.params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'{"outcome":"completed","message":"loaded","output":{}}'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  const records: unknown[] = []; let session = "";
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_y", taskRunId: "tr_y", taskId: "y", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const settled = await execution.done;
+  assert.equal(session, "sid-X");
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = records.filter((r) => (r as { type?: string }).type === "acp").map((r) => (r as { message?: { method?: string } }).message?.method);
+  assert.ok(methods.includes("session/load"), "expected session/load to be issued");
+  assert.ok(!methods.includes("session/new"), "session/new must not be issued on a load path");
+});
+
+// T1 (acp_load_unsupported): when loadSessionId is set but the agent does not advertise
+// loadSession, AcpExecutor must fail fast with a clear code rather than calling
+// session/load and crashing the runtime.
+test("AcpExecutor fails with acp_load_unsupported when loadSessionId is set but the agent does not advertise loadSession", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-noload-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+});
+`);
+  const records: unknown[] = [];
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_z", taskRunId: "tr_z", taskId: "z", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => { throw new Error("hooks.session must not be called when the agent lacks loadSession"); }, interact: async () => { throw new Error("unexpected"); } });
+  const settled = await execution.done;
+  assert.ok("error" in settled, "expected a failed settlement, not a crash");
+  assert.equal("error" in settled && settled.error.code, "acp_load_unsupported");
+  assert.ok(records.some((r) => (r as { type?: string; event?: string }).type === "lifecycle" && (r as { event?: string }).event === "acp_load_unsupported"));
+});
+
+// T1 (continuation_unavailable): when the source task completes without persisting an
+// acp_session_id (e.g. an interactive executor that doesn't call hooks.session), the
+// continuing task's attempt must fail-fast with continuation_unavailable — never silently
+// fall back to a fresh session.
+test("scheduler fails the continuing task with continuation_unavailable when the source has no acp_session_id", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-continuation-unavail-"));
+  const workflow = {
+    id: "unavail",
+    tasks: {
+      A: { executor: "agent", inputs: {}, prompt: "a" },
+      B: { executor: "agent", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "A" } },
+    },
+  };
+  // The default InteractiveExecutor does NOT call hooks.session, so A's acp_session_id
+  // stays null in the store — exactly the source-side failure this test exercises.
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("unavail", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const interaction = app.scheduler.interactions()[0]!;
+  await app.scheduler.answer(interaction.id, { outcome: { outcome: "selected", optionId: "yes" } });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(view.tasks.A!.state, "completed");
+  assert.equal(view.tasks.B!.state, "failed");
+  assert.equal(view.tasks.B!.attempts[0]?.error?.code, "continuation_unavailable");
+  app.store.close();
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
@@ -363,6 +549,18 @@ class InteractiveExecutor implements Executor<AcpRequest> {
       const result: TaskResult = { outcome: "completed", message: "answered", output: response };
       return cancelled ? { error: { code: "cancelled", message: "cancelled" } } : { result };
     })();
+    return { done, cancel: async () => { cancelled = true; } };
+  }
+}
+
+// Stub ACP executor used by the scheduler-resolution test: dispatches per taskId via the
+// caller-supplied behavior. The behavior may call hooks.session (to simulate a successful
+// executor that persisted its session id) and must return a Settlement.
+class StubAcpExecutor implements Executor<AcpRequest> {
+  constructor(private readonly behavior: (request: AcpRequest, hooks: Hooks) => Promise<Settlement>) {}
+  async start(request: AcpRequest, hooks: Hooks): Promise<Execution> {
+    let cancelled = false;
+    const done = this.behavior(request, hooks).then((value) => cancelled ? { error: { code: "cancelled", message: "cancelled" } } : value);
     return { done, cancel: async () => { cancelled = true; } };
   }
 }
