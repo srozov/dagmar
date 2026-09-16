@@ -29,7 +29,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["mode"],
-          "properties": { "mode": { "enum": ["fresh", "continue", "fork"] } }
+          "properties": { "mode": { "enum": ["fresh", "continue", "fork"] }, "from": { "$ref": "#/$defs/id" } }
         }
       }
     }
