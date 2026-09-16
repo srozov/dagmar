@@ -71,16 +71,25 @@ export class WorkflowRepository {
 
 export function validateWorkflow(value: unknown, profiles: Readonly<Record<string, ExecutorProfile>>): Workflow {
   if (!shape(value)) throw new DagmarError("workflow_invalid", "Workflow does not match workflow.schema.json");
-  const raw = value as { id: string; tasks: Record<string, Omit<TaskDef, "dependsOn"> & { dependsOn?: string[]; session?: { mode: string } }> };
+  const raw = value as { id: string; tasks: Record<string, Omit<TaskDef, "dependsOn" | "session"> & { dependsOn?: string[]; session?: { mode: string; from?: unknown } }> };
   const tasks: Record<string, TaskDef> = {};
   for (const [id, item] of Object.entries(raw.tasks)) {
     const profile = profiles[item.executor];
     if (!profile) throw new DagmarError("unknown_executor", `Task ${id} references unknown executor ${item.executor}`);
-    if (item.session && item.session.mode !== "fresh") throw new DagmarError("unsupported_session_mode", `Task ${id} session mode is unsupported`);
+    let session: TaskDef["session"] | undefined;
+    if (item.session) {
+      if (item.session.mode === "fork") throw new DagmarError("unsupported_session_mode", `Task ${id} session mode is unsupported`);
+      if (item.session.mode === "continue") {
+        if (typeof item.session.from !== "string" || !item.session.from) throw new DagmarError("invalid_task", `Task ${id} continue requires from`);
+        session = { mode: "continue", from: item.session.from };
+      } else if (item.session.mode === "fresh") {
+        session = { mode: "fresh" };
+      }
+    }
     if (profile.type === "process" && (!item.run?.[0] || item.prompt !== undefined || item.session !== undefined)) throw new DagmarError("invalid_task", `Process task ${id} requires run only`);
     if (profile.type === "acp" && (!item.prompt?.trim() || item.run !== undefined)) throw new DagmarError("invalid_task", `ACP task ${id} requires prompt only`);
     if (item.outputSchema !== undefined) validateOutputSchema(item.outputSchema);
-    tasks[id] = { ...item, dependsOn: item.dependsOn ?? [], session: item.session ? { mode: "fresh" } : undefined } as TaskDef;
+    tasks[id] = { ...item, dependsOn: item.dependsOn ?? [], session } as TaskDef;
   }
   for (const [id, task] of Object.entries(tasks)) {
     for (const dep of task.dependsOn) {
@@ -90,6 +99,15 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
       if (typeof value !== "string") continue;
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
+    }
+    if (task.session?.mode === "continue") {
+      const from = task.session.from;
+      if (!task.dependsOn.includes(from)) throw new DagmarError("invalid_dependency", `Task ${id} continue from ${from} must be a dependency`);
+      const source = tasks[from]!;
+      const sourceProfile = profiles[source.executor];
+      if (!sourceProfile || sourceProfile.type !== "acp") throw new DagmarError("invalid_task", `Task ${id} continue from ${from} must target an ACP task`);
+      const thisProfile = profiles[task.executor]!;
+      if (!sameAgent(thisProfile.run, sourceProfile.run)) throw new DagmarError("invalid_task", `Task ${id} continue must target the same agent`);
     }
   }
   const visiting = new Set<string>();
@@ -138,4 +156,11 @@ function reference(value: string): { task?: string; path: string[] } | undefined
   if (match) return { task: match[1]!, path: match[2]?.split(".") ?? [] };
   if (value.startsWith("$run.") || value.startsWith("$tasks.")) throw new DagmarError("invalid_input_reference", `Invalid input reference ${value}`);
   return undefined;
+}
+// "Same agent" means the executor profile's `run` argv is byte-identical. A different model/env
+// (e.g. sonnet vs opus under claude-agent-acp) is allowed because the model is per-process, not
+// per-session — this is what makes a different-model reviewer able to continue a builder's session.
+function sameAgent(a?: readonly string[], b?: readonly string[]): boolean {
+  if (!a || !b || a.length !== b.length) return false;
+  return a.every((value, i) => value === b[i]);
 }
