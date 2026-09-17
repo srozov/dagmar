@@ -107,7 +107,40 @@ export class Scheduler {
   }
 
   async recover(): Promise<void> {
-    for (const runId of new Set(this.store.activeAttempts().map((x) => x.workflowRunId))) await this.serial(runId, () => this.failActiveLocked(runId, "executor_lost", "Executor was lost on daemon restart", false));
+    const allActive = this.store.activeAttempts();
+    if (!allActive.length) return;
+    // Group active attempts by run so each run is processed once under its serial() lock.
+    const byRun = new Map<string, AttemptRow[]>();
+    for (const a of allActive) { const arr = byRun.get(a.workflowRunId) ?? []; arr.push(a); byRun.set(a.workflowRunId, arr); }
+    for (const [runId, attempts] of byRun) {
+      await this.serial(runId, async () => {
+        const now = timestamp();
+        const gates: AttemptRow[] = [], nonGates: AttemptRow[] = [];
+        for (const a of attempts) (a.executorType === "gate" ? gates : nonGates).push(a);
+        // Non-gates: every active attempt was running on a now-dead executor. Fail them all.
+        if (nonGates.length) {
+          this.store.transaction(() => { for (const a of nonGates) this.store.updateAttempt(a.id, { status: "failed", error: { code: "executor_lost", message: "Executor was lost on daemon restart" }, updatedAt: now, endedAt: now }); });
+          for (const a of nonGates) this.emitTask(a, "failed");
+          for (const a of nonGates) this.background(this.cancelLive(a.id));
+        }
+        // Gates: survive restart. Reconstruct the in-memory Pending entry from the persisted
+        // attempt row + the workflow definition; the answer is still in flight, just in a fresh
+        // process. A gate that isn't actually awaiting_input (e.g. mid-prompt on a previous life)
+        // is a real state error and fails with executor_lost.
+        for (const a of gates) {
+          if (a.status !== "awaiting_input") { this.store.updateAttempt(a.id, { status: "failed", error: { code: "executor_lost", message: "Gate in unexpected state on recovery" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); continue; }
+          try { const wf = await this.definition(runId); const task = wf.tasks[a.taskId]; if (!task?.gate) throw new Error("not a gate"); this.registerGate(a, task.gate); }
+          catch { this.store.updateAttempt(a.id, { status: "failed", error: { code: "gate_definition_unavailable", message: "Gate definition unavailable after restart" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); }
+        }
+        // Recompute the run status from the (possibly corrected) attempts. failActiveLocked above
+        // may have set the run to blocked; a surviving gate rewrites it to waiting.
+        let status: RunStatus;
+        try { status = aggregate(await this.definition(runId), this.store.attempts(runId)); }
+        catch { status = "blocked"; }
+        this.store.updateRun(runId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : {}) });
+        this.emitRun(runId, status);
+      });
+    }
   }
   shutdown(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
@@ -116,7 +149,7 @@ export class Scheduler {
       const runIds = new Set(this.store.activeAttempts().map((x) => x.workflowRunId));
       const running = [...this.live.values()];
       const taskIds: string[] = [];
-      for (const id of runIds) taskIds.push(...await this.serial(id, () => this.failActiveLocked(id, "daemon_shutdown", "Executor stopped during daemon shutdown", true)));
+      for (const id of runIds) taskIds.push(...await this.serial(id, () => this.failActiveLocked(id, "daemon_shutdown", "Executor stopped during daemon shutdown", true, true)));
       await Promise.all(taskIds.map((id) => this.cancelLive(id)));
       await Promise.all(running.map((x) => x.finished));
       await Promise.all([...this.tails.values()]);
@@ -244,9 +277,10 @@ export class Scheduler {
     this.events.publish({ type: "interaction.changed", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { interactionId: id, state: "pending" } });
   }
 
-  private async failActiveLocked(id: string, code: string, message: string, collect: boolean): Promise<string[]> {
+  private async failActiveLocked(id: string, code: string, message: string, collect: boolean, skipGates = false): Promise<string[]> {
       const run = this.store.run(id); if (!run) return [];
-      const attempts = this.store.attempts(id).filter((x) => active.has(x.status)), now = timestamp();
+      const attempts = this.store.attempts(id).filter((x) => active.has(x.status) && !(skipGates && x.executorType === "gate")), now = timestamp();
+      if (!attempts.length) return [];
       this.store.transaction(() => { for (const a of attempts) this.store.updateAttempt(a.id, { status: "failed", error: { code, message }, updatedAt: now, endedAt: now }); this.store.updateRun(id, { status: "blocked", updatedAt: now, endedAt: now }); });
       for (const a of attempts) { this.emitTask(a, "failed"); this.dropInteraction(a.id); } this.emitRun(id, "blocked");
       const taskIds = attempts.map((x) => x.id);
