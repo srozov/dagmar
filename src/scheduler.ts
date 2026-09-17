@@ -298,7 +298,7 @@ export class Scheduler {
     const states = taskStates(workflow, latest, run.status);
     const tasks = Object.fromEntries(Object.entries(workflow.tasks).map(([taskId, task]) => [taskId, {
       dependsOn: task.dependsOn,
-      executor: task.executor,
+      executor: task.executor ?? "gate",
       state: states.get(taskId)!,
       attempts: attempts.filter((x) => x.taskId === taskId).map(({ workflowRunId: _, taskId: _t, executorProfile: _p, executorType: _e, ...a }) => a),
     }]));
