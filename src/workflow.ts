@@ -74,6 +74,17 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
   const raw = value as { id: string; tasks: Record<string, Omit<TaskDef, "dependsOn" | "session"> & { dependsOn?: string[]; session?: { mode: string; from?: unknown } }> };
   const tasks: Record<string, TaskDef> = {};
   for (const [id, item] of Object.entries(raw.tasks)) {
+    if (item.gate) {
+      if (item.executor) throw new DagmarError("invalid_task", `Task ${id} cannot have both executor and gate`);
+      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined)
+        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, or outputSchema`);
+      if (typeof item.gate.prompt !== "string" || !item.gate.prompt.trim())
+        throw new DagmarError("invalid_task", `Gate task ${id} requires a non-empty prompt`);
+      if (item.gate.schema !== undefined) validateOutputSchema(item.gate.schema);
+      tasks[id] = { ...item, dependsOn: item.dependsOn ?? [], gate: { prompt: item.gate.prompt, ...(item.gate.schema !== undefined ? { schema: item.gate.schema } : {}) } } as TaskDef;
+      continue;
+    }
+    if (!item.executor) throw new DagmarError("invalid_task", `Task ${id} requires executor or gate`);
     const profile = profiles[item.executor];
     if (!profile) throw new DagmarError("unknown_executor", `Task ${id} references unknown executor ${item.executor}`);
     let session: TaskDef["session"] | undefined;
@@ -104,9 +115,9 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
       const from = task.session.from;
       if (!task.dependsOn.includes(from)) throw new DagmarError("invalid_dependency", `Task ${id} continue from ${from} must be a dependency`);
       const source = tasks[from]!;
-      const sourceProfile = profiles[source.executor];
+      const sourceProfile = source.executor ? profiles[source.executor] : undefined;
       if (!sourceProfile || sourceProfile.type !== "acp") throw new DagmarError("invalid_task", `Task ${id} continue from ${from} must target an ACP task`);
-      const thisProfile = profiles[task.executor]!;
+      const thisProfile = profiles[task.executor!]!;
       if (!sameAgent(thisProfile.run, sourceProfile.run)) throw new DagmarError("invalid_task", `Task ${id} continue must target the same agent`);
     }
   }

@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskState, Workflow } from "./types.js";
+import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, resolveInputs } from "./workflow.js";
+import { gateValidator } from "./result.js";
 
 type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
 type Executors = { process: Executor<ProcessRequest>; acp: Executor<AcpRequest> };
@@ -79,6 +80,24 @@ export class Scheduler {
       let value: Json; try { value = item.request.validate(response); } catch { throw new DagmarError("invalid_interaction_response", "Interaction response is invalid"); }
       const a = this.store.attempt(item.view.taskRunId); if (!a || !active.has(a.status)) throw new DagmarError("interaction_not_found", "Interaction is no longer pending");
       const workflow = await this.definition(a.workflowRunId), now = timestamp();
+      // Gate: settle the attempt directly (no executor to resume). result.message is the gate's
+      // prompt (a human-readable summary); result.output is the human's validated answer.
+      if (item.request.kind === "gate") {
+        const result: TaskResult = { outcome: "completed", message: String((item.request.request as { prompt?: string })?.prompt ?? "gate"), output: value };
+        const changed = { ...a, status: "completed" as const, result, updatedAt: now, endedAt: now };
+        const runStatus = aggregate(workflow, replace(this.store.attempts(a.workflowRunId), changed));
+        this.store.transaction(() => {
+          this.store.updateAttempt(a.id, { status: "completed", result, updatedAt: now, endedAt: now });
+          this.store.updateRun(a.workflowRunId, { status: runStatus, updatedAt: now, ...(terminal(runStatus) ? { endedAt: now } : {}) });
+        });
+        this.pending.delete(id);
+        this.emitTask(a, "completed");
+        this.events.publish({ type: "interaction.changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { interactionId: id, state: "answered" } });
+        this.emitRun(a.workflowRunId, runStatus);
+        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId, false, false);
+        return this.view(a.workflowRunId, workflow);
+      }
+      // Non-gate: resume the executor by flipping the attempt back to running and resolving its Promise.
       const changed = { ...a, status: "running" as const, updatedAt: now };
       const status = aggregate(workflow, replace(this.store.attempts(a.workflowRunId), changed));
       this.store.transaction(() => { this.store.updateAttempt(a.id, { status: "running", updatedAt: now }); this.store.updateRun(a.workflowRunId, { status, updatedAt: now }); });
@@ -88,7 +107,46 @@ export class Scheduler {
   }
 
   async recover(): Promise<void> {
-    for (const runId of new Set(this.store.activeAttempts().map((x) => x.workflowRunId))) await this.serial(runId, () => this.failActiveLocked(runId, "executor_lost", "Executor was lost on daemon restart", false));
+    const allActive = this.store.activeAttempts();
+    if (!allActive.length) return;
+    // Group active attempts by run so each run is processed once under its serial() lock.
+    const byRun = new Map<string, AttemptRow[]>();
+    for (const a of allActive) { const arr = byRun.get(a.workflowRunId) ?? []; arr.push(a); byRun.set(a.workflowRunId, arr); }
+    for (const [runId, attempts] of byRun) {
+      await this.serial(runId, async () => {
+        const now = timestamp();
+        // Hoist the workflow definition: gates below and the run-status recompute after both need
+        // it, and loading once instead of N+1 times keeps recovery cheap for gate-heavy runs.
+        let workflow: Workflow | undefined;
+        const loadDefinition = async (): Promise<Workflow> => workflow ??= await this.definition(runId);
+        const gates: AttemptRow[] = [], nonGates: AttemptRow[] = [];
+        for (const a of attempts) (a.executorType === "gate" ? gates : nonGates).push(a);
+        // Non-gates: every active attempt was running on a now-dead executor. Fail them all.
+        if (nonGates.length) {
+          this.store.transaction(() => { for (const a of nonGates) this.store.updateAttempt(a.id, { status: "failed", error: { code: "executor_lost", message: "Executor was lost on daemon restart" }, updatedAt: now, endedAt: now }); });
+          for (const a of nonGates) this.emitTask(a, "failed");
+          for (const a of nonGates) this.background(this.cancelLive(a.id));
+        }
+        // Gates: survive restart. Reconstruct the in-memory Pending entry from the persisted
+        // attempt row + the workflow definition; the answer is still in flight, just in a fresh
+        // process. A gate that isn't actually awaiting_input (e.g. mid-prompt on a previous life)
+        // is a real state error and fails with executor_lost.
+        for (const a of gates) {
+          if (a.status !== "awaiting_input") { this.store.updateAttempt(a.id, { status: "failed", error: { code: "executor_lost", message: "Gate in unexpected state on recovery" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); continue; }
+          try { const wf = await loadDefinition(); const task = wf.tasks[a.taskId]; if (!task?.gate) throw new Error("not a gate"); this.registerGate(a, task.gate); }
+          catch { this.store.updateAttempt(a.id, { status: "failed", error: { code: "gate_definition_unavailable", message: "Gate definition unavailable after restart" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); }
+        }
+        // Recompute the run status from the (possibly corrected) attempts. A non-terminal status
+        // also clears any endedAt the run may have carried on arrival (e.g. a prior shutdown()
+        // that failed only the non-gate attempts), so run.list/run.get never surface a stale
+        // (status='waiting', endedAt!=null) view.
+        let status: RunStatus;
+        try { status = aggregate(await loadDefinition(), this.store.attempts(runId)); }
+        catch { status = "blocked"; }
+        this.store.updateRun(runId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : { endedAt: null }) });
+        this.emitRun(runId, status);
+      });
+    }
   }
   shutdown(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
@@ -97,7 +155,7 @@ export class Scheduler {
       const runIds = new Set(this.store.activeAttempts().map((x) => x.workflowRunId));
       const running = [...this.live.values()];
       const taskIds: string[] = [];
-      for (const id of runIds) taskIds.push(...await this.serial(id, () => this.failActiveLocked(id, "daemon_shutdown", "Executor stopped during daemon shutdown", true)));
+      for (const id of runIds) taskIds.push(...await this.serial(id, () => this.failActiveLocked(id, "daemon_shutdown", "Executor stopped during daemon shutdown", true, true)));
       await Promise.all(taskIds.map((id) => this.cancelLive(id)));
       await Promise.all(running.map((x) => x.finished));
       await Promise.all([...this.tails.values()]);
@@ -132,15 +190,31 @@ export class Scheduler {
       catch (error) { await this.settle(item.row.id, { error: taskError("transcript_write_failed", error) }); }
     }
     for (const item of launchable) this.launch(item.row, item.request!);
+    for (const item of prepared) {
+      if (item.row.executorType !== "gate" || item.row.status !== "awaiting_input") continue;
+      try {
+        await this.append(item.row, { type: "lifecycle", direction: "internal", event: "gate_parked" });
+        this.registerGate(item.row, workflow.tasks[item.row.taskId]!.gate!);
+      } catch (error) { await this.settle(item.row.id, { error: taskError("transcript_write_failed", error) }); }
+    }
   }
 
   private prepare(run: RunRow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
-    const profile = this.profiles[task.executor];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+    if (task.gate) {
+      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+      try {
+        resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
+        return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
+      } catch (error) {
+        return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
+      }
+    }
+    const profile = this.profiles[task.executor!];
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       const inputs = resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -188,6 +262,9 @@ export class Scheduler {
   private requestInteraction(row: AttemptRow, request: InteractionRequest): Promise<Json> {
     let answer!: Promise<Json>;
     return this.serial(row.workflowRunId, async () => {
+      // Gate attempts never reach this path: their interactions are registered by registerGate(),
+      // not requested by an executor. The `awaiting_input` branch below only fires for executor
+      // requests whose kind is something other than permission (e.g. "input", "turn").
       const old = this.store.attempt(row.id); if (!old || old.status !== "running") throw new DagmarError("invalid_task_state", "Task cannot request interaction");
       const id = `ix_${randomUUID()}`, now = timestamp(), status = request.kind === "permission" ? "awaiting_permission" : "awaiting_input";
       let resolve!: (value: Json) => void, reject!: (error: Error) => void; answer = new Promise<Json>((a, b) => { resolve = a; reject = b; }); answer.catch(() => undefined);
@@ -198,9 +275,21 @@ export class Scheduler {
     }).then(() => answer);
   }
 
-  private async failActiveLocked(id: string, code: string, message: string, collect: boolean): Promise<string[]> {
+  // Register a Pending entry for a gate attempt. Gate Pending entries do not await an executor's
+  // Promise: answer() detects kind:"gate" and settles the attempt directly, so resolve/reject are
+  // never called. The fresh ix_ id is fine — the user re-queries dagmar pending after a restart.
+  private registerGate(row: AttemptRow, gate: NonNullable<TaskDef["gate"]>): void {
+    const id = `ix_${randomUUID()}`, now = timestamp();
+    const validate = gateValidator(gate.schema);
+    const view: Interaction = { id, workflowRunId: row.workflowRunId, taskRunId: row.id, kind: "gate", method: "gate/answer", request: { prompt: gate.prompt, ...(gate.schema !== undefined ? { schema: gate.schema } : {}) } as Json, createdAt: now };
+    this.pending.set(id, { view, request: { kind: "gate", method: "gate/answer", request: view.request, validate }, resolve: () => {}, reject: () => {} });
+    this.events.publish({ type: "interaction.changed", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { interactionId: id, state: "pending" } });
+  }
+
+  private async failActiveLocked(id: string, code: string, message: string, collect: boolean, skipGates = false): Promise<string[]> {
       const run = this.store.run(id); if (!run) return [];
-      const attempts = this.store.attempts(id).filter((x) => active.has(x.status)), now = timestamp();
+      const attempts = this.store.attempts(id).filter((x) => active.has(x.status) && !(skipGates && x.executorType === "gate")), now = timestamp();
+      if (!attempts.length) return [];
       this.store.transaction(() => { for (const a of attempts) this.store.updateAttempt(a.id, { status: "failed", error: { code, message }, updatedAt: now, endedAt: now }); this.store.updateRun(id, { status: "blocked", updatedAt: now, endedAt: now }); });
       for (const a of attempts) { this.emitTask(a, "failed"); this.dropInteraction(a.id); } this.emitRun(id, "blocked");
       const taskIds = attempts.map((x) => x.id);
@@ -218,7 +307,7 @@ export class Scheduler {
     const states = taskStates(workflow, latest, run.status);
     const tasks = Object.fromEntries(Object.entries(workflow.tasks).map(([taskId, task]) => [taskId, {
       dependsOn: task.dependsOn,
-      executor: task.executor,
+      executor: task.executor ?? "gate",
       state: states.get(taskId)!,
       attempts: attempts.filter((x) => x.taskId === taskId).map(({ workflowRunId: _, taskId: _t, executorProfile: _p, executorType: _e, ...a }) => a),
     }]));
