@@ -667,6 +667,321 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.equal(interactCalls, 0);
 });
 
+// T3 (workflow validation): gate tasks are accepted (with normalized gate block) and every reject
+// variant the plan enumerates is surfaced as a clear invalid_task. Mirrors the T1 validateWorkflow
+// test (lines 348-426): profiles are passed in directly so each case pins a specific failure mode
+// without disk I/O.
+test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
+  const profiles: Config["executors"] = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
+
+  // Accept: a gate task with no executor and a prompt.
+  const ok1 = validateWorkflow({ id: "g1", tasks: { g: { inputs: {}, gate: { prompt: "Approve?" } } } }, profiles);
+  assert.equal(ok1.tasks.g!.gate?.prompt, "Approve?");
+  assert.equal(ok1.tasks.g!.gate?.schema, undefined);
+  assert.equal(ok1.tasks.g!.executor, undefined);
+
+  // Accept: a gate task with a schema; the schema flows through.
+  const ok2 = validateWorkflow({
+    id: "g2",
+    tasks: { g: { inputs: {}, gate: { prompt: "Review", schema: { type: "string" } } } },
+  }, profiles);
+  assert.deepEqual(ok2.tasks.g!.gate?.schema, { type: "string" });
+
+  // Accept: a gate task with deps + inputs (references will resolve during prepare()).
+  const ok3 = validateWorkflow({
+    id: "g3",
+    tasks: {
+      dep: { executor: "agent", inputs: {}, prompt: "a" },
+      g: { dependsOn: ["dep"], inputs: { x: "$tasks.dep.output" }, gate: { prompt: "?" } },
+    },
+  }, profiles);
+  assert.deepEqual(ok3.tasks.g!.dependsOn, ["dep"]);
+
+  // Reject: task with both executor and gate.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { executor: "agent", inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /cannot have both/.test(error.message),
+  );
+
+  // Reject: task with neither executor nor gate.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {} } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /requires executor or gate/.test(error.message),
+  );
+
+  // Reject: gate task with prompt (the task-level field, not gate.prompt).
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
+  );
+
+  // Reject: gate task with run.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, run: ["x"], gate: { prompt: "?" } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
+  );
+
+  // Reject: gate task with session.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, session: { mode: "fresh" } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
+  );
+
+  // Reject: gate task with interactive.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, interactive: true } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
+  );
+
+  // Reject: gate task with outputSchema.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, outputSchema: { type: "object" } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
+  );
+
+  // Reject: empty gate prompt.
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "   " } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /non-empty prompt/.test(error.message),
+  );
+
+  // Reject: invalid gate schema (JSON Schema that fails ajv.compile).
+  assert.throws(
+    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?", schema: { type: 123 } } } } }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_output_schema",
+  );
+});
+
+// T3 (gate park/answer/complete): a gate task after a dependency parks the attempt as
+// awaiting_input with kind:"gate", surfaces the interaction, and completes when the human
+// answers via interaction.answer. Mirrors the ACP interaction park/answer test at lines 162-173
+// but with a `gate` interaction instead of `permission`.
+test("scheduler parks a gate task awaiting input and completes on answer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-park-"));
+  const workflow = {
+    id: "gatepark",
+    tasks: {
+      dep: { executor: "agent", inputs: {}, prompt: "do" },
+      gate: { dependsOn: ["dep"], inputs: {}, gate: { prompt: "Approve?" } },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("gatepark", {});
+  // Answer the dep's permission interaction first; the dep then completes and the gate parks.
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const permissionInteraction = app.scheduler.interactions().find((x) => x.kind === "permission")!;
+  await app.scheduler.answer(permissionInteraction.id, { outcome: { outcome: "selected", optionId: "yes" } });
+  // Now the gate should park.
+  for (let i = 0; i < 500; i++) {
+    const v = await app.scheduler.get(started.workflowRunId);
+    if (v.tasks.gate!.state === "awaiting_input") break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const depView = (await app.scheduler.get(started.workflowRunId)).tasks.dep!;
+  assert.equal(depView.state, "completed");
+  const gateInteraction = app.scheduler.interactions().find((x) => x.kind === "gate")!;
+  assert.ok(gateInteraction, "expected a gate interaction");
+  assert.equal(gateInteraction.method, "gate/answer");
+  // Answer the gate.
+  await app.scheduler.answer(gateInteraction.id, "approved");
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(completed.tasks.gate!.state, "completed");
+  assert.equal(completed.tasks.gate!.attempts[0]!.result!.output, "approved");
+  assert.equal(completed.tasks.gate!.attempts[0]!.result!.message, "Approve?");
+  app.store.close();
+});
+
+// T3 (gate with schema): a gate with a JSON Schema validates the answer. A valid answer
+// completes the gate, an invalid one raises invalid_interaction_response (same shape as other
+// interactions). Mirrors the ACP-interaction park/answer pattern.
+test("scheduler validates a gate answer against its schema", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-schema-"));
+  const workflow = {
+    id: "gateschema",
+    tasks: {
+      gate: { inputs: {}, gate: { prompt: "Decide", schema: { type: "object", required: ["decision"], properties: { decision: { type: "string" } } } } },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("gateschema", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "gate");
+  // Valid answer.
+  await app.scheduler.answer(interaction.id, { decision: "approve" });
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.deepEqual(completed.tasks.gate!.attempts[0]!.result!.output, { decision: "approve" });
+  app.store.close();
+
+  // Invalid answer: a second run with the same workflow, gate answer that fails schema.
+  const root2 = await mkdtemp(join(tmpdir(), "dagmar-gate-schema-bad-"));
+  const app2 = await fixture(root2, workflow);
+  const started2 = await app2.scheduler.start("gateschema", {});
+  await waitFor(app2.scheduler, started2.workflowRunId, "waiting");
+  const interaction2 = app2.scheduler.interactions()[0]!;
+  await assert.rejects(
+    app2.scheduler.answer(interaction2.id, 42),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_interaction_response",
+  );
+  // The gate is still parked (no settlement on bad answer).
+  const still = await app2.scheduler.get(started2.workflowRunId);
+  assert.equal(still.tasks.gate!.state, "awaiting_input");
+  assert.equal(still.status, "waiting");
+  app2.store.close();
+});
+
+// T3 (root gate): a gate task with no dependencies parks immediately on run start, then
+// completes when answered. Validates that the gate branch fires for the first ready task too.
+test("a root gate with no dependencies parks immediately on run start", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-root-"));
+  const workflow = { id: "gateroot", tasks: { gate: { inputs: {}, gate: { prompt: "Start?" } } } };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("gateroot", {});
+  const waiting = await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  assert.equal(waiting.tasks.gate!.state, "awaiting_input");
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "gate");
+  await app.scheduler.answer(interaction.id, "go");
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(completed.tasks.gate!.state, "completed");
+  assert.equal(completed.tasks.gate!.attempts[0]!.result!.output, "go");
+  app.store.close();
+});
+
+// T3 (recovery carve-out): a gate attempt inserted into the store with awaiting_input +
+// executorType:"gate" must survive a daemon restart. recover() does NOT mark it executor_lost —
+// it reconstructs the Pending entry from the persisted row + workflow definition. The answer
+// remains valid (the gate is answerable after recovery). Mirrors the recovery test at 211-217.
+test("recover() preserves a gate attempt and reconstructs its interaction", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-recover-"));
+  const workflow = { id: "gaterecover", tasks: { gate: { inputs: {}, gate: { prompt: "Approve?" } } } };
+  const app = await fixture(root, workflow);
+  const now = new Date().toISOString();
+  app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  await app.scheduler.recover();
+  // Gate survives.
+  const attempt = app.store.attempt("tr_g")!;
+  assert.equal(attempt.status, "awaiting_input");
+  assert.equal(attempt.error, null);
+  // Run status recomputed (waiting, not blocked).
+  assert.equal(app.store.run("wr_g")!.status, "waiting");
+  // Interaction reconstructed.
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "gate");
+  assert.equal(interaction.method, "gate/answer");
+  // Answer still works.
+  await app.scheduler.answer(interaction.id, "yes");
+  const completed = await waitFor(app.scheduler, "wr_g", "completed");
+  assert.equal(completed.tasks.gate!.state, "completed");
+  app.store.close();
+});
+
+// T3 (mixed recovery): a run with both a gate attempt (awaiting_input, executorType:"gate") and
+// a non-gate attempt (running, executorType:"process") recovers the gate and fails the non-gate.
+// The run's final state is waiting because the surviving gate is still active.
+test("recover() fails non-gate attempts but preserves gate attempts in the same run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-mixed-recover-"));
+  const workflow = {
+    id: "gatemix",
+    tasks: {
+      dep: { executor: "agent", inputs: {}, prompt: "do" },
+      gate: { dependsOn: ["dep"], inputs: {}, gate: { prompt: "Approve?" } },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const now = new Date().toISOString();
+  app.store.insertRun({ id: "wr_m", workflowId: "gatemix", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  // Non-gate (process) attempt in 'running'.
+  app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  // Gate attempt in 'awaiting_input'.
+  app.store.insertAttempt({ id: "tr_m_gate", workflowRunId: "wr_m", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  await app.scheduler.recover();
+  // Non-gate: failed with executor_lost.
+  const dep = app.store.attempt("tr_m_dep")!;
+  assert.equal(dep.status, "failed");
+  assert.equal(dep.error?.code, "executor_lost");
+  // Gate: preserved.
+  const gate = app.store.attempt("tr_m_gate")!;
+  assert.equal(gate.status, "awaiting_input");
+  assert.equal(gate.error, null);
+  // Run status is still waiting (gate survived).
+  assert.equal(app.store.run("wr_m")!.status, "waiting");
+  app.store.close();
+});
+
+// T3 (shutdown preserves gates): shutdown() does NOT mark gate attempts as daemon_shutdown —
+// the skipGates:true flag keeps them alive across a graceful shutdown. A fresh scheduler on
+// the same store recovers them and the human can still answer.
+test("shutdown() preserves gate attempts across restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-shutdown-"));
+  const workflow = { id: "gateshutdown", tasks: { gate: { inputs: {}, gate: { prompt: "Approve?" } } } };
+  const storePath = join(root, "state", "dagmar.sqlite");
+  // First scheduler — start a run that parks the gate, then shut down.
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(root, "workflows"), { recursive: true });
+  await mkdir(join(root, "state"), { recursive: true });
+  await writeFile(join(root, "workflows", `${workflow.id}.yaml`), stringify(workflow));
+  const profiles1: Config["executors"] = { local: { type: "process", cwd: root, env: {} }, agent: { type: "acp", cwd: root, env: {}, run: ["unused"] } };
+  const store1 = new Store(storePath), transcripts1 = new Transcripts(join(root, "state")), events1 = new EventBus();
+  const scheduler1 = new Scheduler(store1, transcripts1, new WorkflowRepository(join(root, "workflows"), profiles1), events1, profiles1, { process: new ProcessExecutor(), acp: new AcpExecutor() });
+  const started = await scheduler1.start("gateshutdown", {});
+  await waitFor(scheduler1, started.workflowRunId, "waiting");
+  await scheduler1.shutdown();
+  // Gate attempt is still awaiting_input (not daemon_shutdown).
+  const attempts1 = store1.attempts(started.workflowRunId);
+  assert.equal(attempts1.length, 1);
+  assert.equal(attempts1[0]!.executorType, "gate");
+  assert.equal(attempts1[0]!.status, "awaiting_input");
+  store1.close();
+
+  // Second scheduler on the same store — recover() reconstructs the gate.
+  const store2 = new Store(storePath), transcripts2 = new Transcripts(join(root, "state")), events2 = new EventBus();
+  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows"), profiles1), events2, profiles1, { process: new ProcessExecutor(), acp: new AcpExecutor() });
+  await scheduler2.recover();
+  const after = await scheduler2.get(started.workflowRunId);
+  assert.equal(after.tasks.gate!.state, "awaiting_input");
+  assert.equal(after.status, "waiting");
+  const interaction = scheduler2.interactions()[0]!;
+  assert.equal(interaction.kind, "gate");
+  await scheduler2.answer(interaction.id, "yes");
+  const completed = await waitFor(scheduler2, started.workflowRunId, "completed");
+  assert.equal(completed.tasks.gate!.state, "completed");
+  assert.equal(completed.tasks.gate!.attempts[0]!.result!.output, "yes");
+  store2.close();
+});
+
+// T3 (gate output feeds downstream tasks): $tasks.<gate>.output resolves to the human's answer
+// in a downstream task. Mirrors the diamond test's input-reference wiring but with a gate source.
+test("gate output is available as $tasks.<gate>.output to downstream tasks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-output-"));
+  const captured = { output: undefined as Json | undefined };
+  const stub = new StubAcpExecutor(async (request) => {
+    captured.output = request.inputs.value;
+    return { result: { outcome: "completed", message: "got it", output: {} } };
+  });
+  const workflow = {
+    id: "gateout",
+    tasks: {
+      gate: { inputs: {}, gate: { prompt: "Answer?" } },
+      task: { executor: "agent", dependsOn: ["gate"], inputs: { value: "$tasks.gate.output" }, prompt: "use value" },
+    },
+  };
+  const app = await fixture(root, workflow, stub);
+  const started = await app.scheduler.start("gateout", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "gate");
+  await app.scheduler.answer(interaction.id, { answer: "yes" });
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.tasks.gate!.state, "completed");
+  assert.equal(completed.tasks.task!.state, "completed");
+  assert.deepEqual(captured.output, { answer: "yes" });
+  app.store.close();
+});
+
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
