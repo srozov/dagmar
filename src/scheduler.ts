@@ -150,7 +150,9 @@ export class Scheduler {
         if (!sid) throw new DagmarError("continuation_unavailable", `Source session id for ${task.session.from} is unavailable`);
         loadSessionId = sid;
       }
-      const request = profile.type === "process" ? { ...common, type: "process" as const, run: task.run! } : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}) };
+      const request = profile.type === "process"
+        ? { ...common, type: "process" as const, run: task.run! }
+        : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}), ...(task.interactive ? { interactive: true } : {}) };
       return { row: { ...base, executorType: profile.type, status: "running", error: null, endedAt: null }, request };
     } catch (error) {
       // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, executor_unavailable),
