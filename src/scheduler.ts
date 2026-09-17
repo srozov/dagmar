@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskState, Workflow } from "./types.js";
+import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, resolveInputs } from "./workflow.js";
 import { gateValidator } from "./result.js";
@@ -80,6 +80,24 @@ export class Scheduler {
       let value: Json; try { value = item.request.validate(response); } catch { throw new DagmarError("invalid_interaction_response", "Interaction response is invalid"); }
       const a = this.store.attempt(item.view.taskRunId); if (!a || !active.has(a.status)) throw new DagmarError("interaction_not_found", "Interaction is no longer pending");
       const workflow = await this.definition(a.workflowRunId), now = timestamp();
+      // Gate: settle the attempt directly (no executor to resume). result.message is the gate's
+      // prompt (a human-readable summary); result.output is the human's validated answer.
+      if (item.request.kind === "gate") {
+        const result: TaskResult = { outcome: "completed", message: String((item.request.request as { prompt?: string })?.prompt ?? "gate"), output: value };
+        const changed = { ...a, status: "completed" as const, result, updatedAt: now, endedAt: now };
+        const runStatus = aggregate(workflow, replace(this.store.attempts(a.workflowRunId), changed));
+        this.store.transaction(() => {
+          this.store.updateAttempt(a.id, { status: "completed", result, updatedAt: now, endedAt: now });
+          this.store.updateRun(a.workflowRunId, { status: runStatus, updatedAt: now, ...(terminal(runStatus) ? { endedAt: now } : {}) });
+        });
+        this.pending.delete(id);
+        this.emitTask(a, "completed");
+        this.events.publish({ type: "interaction.changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { interactionId: id, state: "answered" } });
+        this.emitRun(a.workflowRunId, runStatus);
+        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId, false, false);
+        return this.view(a.workflowRunId, workflow);
+      }
+      // Non-gate: resume the executor by flipping the attempt back to running and resolving its Promise.
       const changed = { ...a, status: "running" as const, updatedAt: now };
       const status = aggregate(workflow, replace(this.store.attempts(a.workflowRunId), changed));
       this.store.transaction(() => { this.store.updateAttempt(a.id, { status: "running", updatedAt: now }); this.store.updateRun(a.workflowRunId, { status, updatedAt: now }); });
