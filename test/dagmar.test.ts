@@ -779,6 +779,8 @@ test("scheduler parks a gate task awaiting input and completes on answer", async
   }
   const depView = (await app.scheduler.get(started.workflowRunId)).tasks.dep!;
   assert.equal(depView.state, "completed");
+  const parkedView = await app.scheduler.get(started.workflowRunId);
+  assert.equal(parkedView.tasks.gate!.executor, "gate", "view() surfaces 'gate' as the executor for gate tasks (no task.executor was set)");
   const gateInteraction = app.scheduler.interactions().find((x) => x.kind === "gate")!;
   assert.ok(gateInteraction, "expected a gate interaction");
   assert.equal(gateInteraction.method, "gate/answer");
@@ -907,6 +909,65 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   assert.equal(gate.error, null);
   // Run status is still waiting (gate survived).
   assert.equal(app.store.run("wr_m")!.status, "waiting");
+  app.store.close();
+});
+
+// T3 (gate input-resolution failure): a gate task whose `inputs` reference a path that does not
+// resolve against a completed dep's output fails synchronously at prepare() time. The attempt
+// is inserted with status: "failed" and error.code "input_resolution_failed", no Pending entry
+// is registered, and the run reaches "blocked" without ever producing a gate interaction.
+test("a gate with an unresolvable input fails at prepare() rather than parking", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-input-fail-"));
+  const stub = new StubAcpExecutor(async () => ({ result: { outcome: "completed", message: "ok", output: null } }));
+  const workflow = {
+    id: "gateinputfail",
+    tasks: {
+      dep: { executor: "agent", inputs: {}, prompt: "do" },
+      // $tasks.dep.output.x on a null output: validation accepts (path syntax is valid), but
+      // resolveInputs() throws at prepare() time because !current short-circuits the path walk.
+      gate: { dependsOn: ["dep"], inputs: { v: "$tasks.dep.output.x" }, gate: { prompt: "?" } },
+    },
+  };
+  const app = await fixture(root, workflow, stub);
+  const started = await app.scheduler.start("gateinputfail", {});
+  const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.gate!.state, "failed");
+  assert.equal(blocked.tasks.gate!.attempts[0]!.error!.code, "input_resolution_failed");
+  assert.equal(blocked.status, "blocked");
+  assert.equal(app.scheduler.interactions().length, 0, "a failed-at-prepare gate must not register a Pending interaction");
+  app.store.close();
+});
+
+// T3 (recover() clears stale endedAt on non-terminal restoration): when a run arrives at recover()
+// with endedAt set (because a prior shutdown() wrote it via failActiveLocked + skipGates:true),
+// and the recomputed run status is non-terminal ("waiting", because a gate survived), the run's
+// endedAt must be cleared — mirroring the symmetric advance() pattern. Without this, run.list /
+// run.get surface a stale (status="waiting", endedAt!=null) view.
+test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-gate-recover-endedat-"));
+  const workflow = {
+    id: "gatemix2",
+    tasks: {
+      dep: { executor: "agent", inputs: {}, prompt: "do" },
+      gate: { dependsOn: ["dep"], inputs: {}, gate: { prompt: "Approve?" } },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const now = new Date().toISOString();
+  // Run with endedAt set (simulating the state left by the prior shutdown).
+  app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
+  app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  assert.equal(app.store.run("wr_m2")!.endedAt, now, "precondition: run arrived with stale endedAt");
+  await app.scheduler.recover();
+  const run = app.store.run("wr_m2")!;
+  assert.equal(run.status, "waiting");
+  assert.equal(run.endedAt, null, "recover() must clear endedAt when the recomputed status is non-terminal");
+  assert.equal(app.store.attempt("tr_m2_gate")!.status, "awaiting_input");
+  assert.equal(app.store.attempt("tr_m2_dep")!.error!.code, "executor_lost");
+  // run.get view: endedAt is null on the surfaced shape too (no non-JSON-null leak).
+  const view = await app.scheduler.get("wr_m2");
+  assert.equal(view.endedAt, null);
   app.store.close();
 });
 

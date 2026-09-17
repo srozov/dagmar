@@ -115,6 +115,10 @@ export class Scheduler {
     for (const [runId, attempts] of byRun) {
       await this.serial(runId, async () => {
         const now = timestamp();
+        // Hoist the workflow definition: gates below and the run-status recompute after both need
+        // it, and loading once instead of N+1 times keeps recovery cheap for gate-heavy runs.
+        let workflow: Workflow | undefined;
+        const loadDefinition = async (): Promise<Workflow> => workflow ??= await this.definition(runId);
         const gates: AttemptRow[] = [], nonGates: AttemptRow[] = [];
         for (const a of attempts) (a.executorType === "gate" ? gates : nonGates).push(a);
         // Non-gates: every active attempt was running on a now-dead executor. Fail them all.
@@ -129,15 +133,17 @@ export class Scheduler {
         // is a real state error and fails with executor_lost.
         for (const a of gates) {
           if (a.status !== "awaiting_input") { this.store.updateAttempt(a.id, { status: "failed", error: { code: "executor_lost", message: "Gate in unexpected state on recovery" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); continue; }
-          try { const wf = await this.definition(runId); const task = wf.tasks[a.taskId]; if (!task?.gate) throw new Error("not a gate"); this.registerGate(a, task.gate); }
+          try { const wf = await loadDefinition(); const task = wf.tasks[a.taskId]; if (!task?.gate) throw new Error("not a gate"); this.registerGate(a, task.gate); }
           catch { this.store.updateAttempt(a.id, { status: "failed", error: { code: "gate_definition_unavailable", message: "Gate definition unavailable after restart" }, updatedAt: now, endedAt: now }); this.emitTask(a, "failed"); }
         }
-        // Recompute the run status from the (possibly corrected) attempts. failActiveLocked above
-        // may have set the run to blocked; a surviving gate rewrites it to waiting.
+        // Recompute the run status from the (possibly corrected) attempts. A non-terminal status
+        // also clears any endedAt the run may have carried on arrival (e.g. a prior shutdown()
+        // that failed only the non-gate attempts), so run.list/run.get never surface a stale
+        // (status='waiting', endedAt!=null) view.
         let status: RunStatus;
-        try { status = aggregate(await this.definition(runId), this.store.attempts(runId)); }
+        try { status = aggregate(await loadDefinition(), this.store.attempts(runId)); }
         catch { status = "blocked"; }
-        this.store.updateRun(runId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : {}) });
+        this.store.updateRun(runId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : { endedAt: null }) });
         this.emitRun(runId, status);
       });
     }
@@ -256,6 +262,9 @@ export class Scheduler {
   private requestInteraction(row: AttemptRow, request: InteractionRequest): Promise<Json> {
     let answer!: Promise<Json>;
     return this.serial(row.workflowRunId, async () => {
+      // Gate attempts never reach this path: their interactions are registered by registerGate(),
+      // not requested by an executor. The `awaiting_input` branch below only fires for executor
+      // requests whose kind is something other than permission (e.g. "input", "turn").
       const old = this.store.attempt(row.id); if (!old || old.status !== "running") throw new DagmarError("invalid_task_state", "Task cannot request interaction");
       const id = `ix_${randomUUID()}`, now = timestamp(), status = request.kind === "permission" ? "awaiting_permission" : "awaiting_input";
       let resolve!: (value: Json) => void, reject!: (error: Error) => void; answer = new Promise<Json>((a, b) => { resolve = a; reject = b; }); answer.catch(() => undefined);
