@@ -39,7 +39,7 @@ export function validateOutputSchema(value: unknown): asserts value is JsonSchem
 // must conform or the answer is rejected as gate_validation_failed. The returned function matches
 // the InteractionRequest.validate contract: return the accepted value or throw.
 export function gateValidator(schema?: JsonSchema): (response: Json) => Json {
-  if (schema === undefined) return (value) => value as Json;
+  if (schema === undefined) return (value) => value;
   let validate: ReturnType<typeof ajv.compile>;
   try { validate = ajv.compile(schema); }
   catch { throw new DagmarError("invalid_gate_schema", "Gate schema is invalid"); }
