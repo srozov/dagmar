@@ -5,6 +5,7 @@ import { Transcripts } from "./transcript.js";
 import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, resolveInputs } from "./workflow.js";
+import { gateValidator } from "./result.js";
 
 type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
 type Executors = { process: Executor<ProcessRequest>; acp: Executor<AcpRequest> };
@@ -132,15 +133,31 @@ export class Scheduler {
       catch (error) { await this.settle(item.row.id, { error: taskError("transcript_write_failed", error) }); }
     }
     for (const item of launchable) this.launch(item.row, item.request!);
+    for (const item of prepared) {
+      if (item.row.executorType !== "gate" || item.row.status !== "awaiting_input") continue;
+      try {
+        await this.append(item.row, { type: "lifecycle", direction: "internal", event: "gate_parked" });
+        this.registerGate(item.row, workflow.tasks[item.row.taskId]!.gate!);
+      } catch (error) { await this.settle(item.row.id, { error: taskError("transcript_write_failed", error) }); }
+    }
   }
 
   private prepare(run: RunRow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
-    const profile = this.profiles[task.executor];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+    if (task.gate) {
+      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+      try {
+        resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
+        return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
+      } catch (error) {
+        return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
+      }
+    }
+    const profile = this.profiles[task.executor!];
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       const inputs = resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -196,6 +213,17 @@ export class Scheduler {
       this.store.transaction(() => { this.store.updateAttempt(row.id, { status, updatedAt: now }); this.store.updateRun(row.workflowRunId, { status: runStatus, updatedAt: now }); });
       this.pending.set(id, { view, request, resolve, reject }); this.emitTask(old, status); this.events.publish({ type: "interaction.changed", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { interactionId: id, state: "pending" } }); this.emitRun(row.workflowRunId, runStatus);
     }).then(() => answer);
+  }
+
+  // Register a Pending entry for a gate attempt. Gate Pending entries do not await an executor's
+  // Promise: answer() detects kind:"gate" and settles the attempt directly, so resolve/reject are
+  // never called. The fresh ix_ id is fine — the user re-queries dagmar pending after a restart.
+  private registerGate(row: AttemptRow, gate: NonNullable<TaskDef["gate"]>): void {
+    const id = `ix_${randomUUID()}`, now = timestamp();
+    const validate = gateValidator(gate.schema);
+    const view: Interaction = { id, workflowRunId: row.workflowRunId, taskRunId: row.id, kind: "gate", method: "gate/answer", request: { prompt: gate.prompt, ...(gate.schema !== undefined ? { schema: gate.schema } : {}) } as Json, createdAt: now };
+    this.pending.set(id, { view, request: { kind: "gate", method: "gate/answer", request: view.request, validate }, resolve: () => {}, reject: () => {} });
+    this.events.publish({ type: "interaction.changed", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { interactionId: id, state: "pending" } });
   }
 
   private async failActiveLocked(id: string, code: string, message: string, collect: boolean): Promise<string[]> {
