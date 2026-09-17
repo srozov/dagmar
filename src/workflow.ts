@@ -86,7 +86,7 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
         session = { mode: "fresh" };
       }
     }
-    if (profile.type === "process" && (!item.run?.[0] || item.prompt !== undefined || item.session !== undefined)) throw new DagmarError("invalid_task", `Process task ${id} requires run only`);
+    if (profile.type === "process" && (!item.run?.[0] || item.prompt !== undefined || item.session !== undefined || item.interactive !== undefined)) throw new DagmarError("invalid_task", `Process task ${id} requires run only`);
     if (profile.type === "acp" && (!item.prompt?.trim() || item.run !== undefined)) throw new DagmarError("invalid_task", `ACP task ${id} requires prompt only`);
     if (item.outputSchema !== undefined) validateOutputSchema(item.outputSchema);
     tasks[id] = { ...item, dependsOn: item.dependsOn ?? [], session } as TaskDef;
