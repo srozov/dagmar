@@ -1,12 +1,19 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
-import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionNotification } from "@agentclientprotocol/sdk";
-import { validateResult } from "../result.js";
+import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionNotification } from "@agentclientprotocol/sdk";
+import { isEnvelope, validateResult } from "../result.js";
 import type { Json, JsonObject, TaskError } from "../types.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "./types.js";
 
 export const RESULT_INSTRUCTION = 'Respond with exactly one JSON object and no surrounding prose or Markdown. The object must contain exactly three fields: "outcome" ("completed" or "blocked"), "message" (a non-empty string), and "output" (any JSON value).';
+// Interactive tasks converse with the agent across several turns on one live session.
+// The agent emits the TaskResult envelope (same shape as the single-shot path) when the
+// task is done; anything else is delivered to the user as a message and the attempt
+// parks awaiting their next prompt. Subsequent turns send the user's raw text only —
+// we do NOT re-append INTERACTIVE_INSTRUCTION or Inputs on turns ≥ 2, or the agent
+// sees the instruction repeatedly and may forget the task is multi-turn.
+export const INTERACTIVE_INSTRUCTION = 'This is a multi-turn interactive task. Reply to the user normally to converse; the task pauses for their next message after each of your turns. When (and only when) the task is complete, respond with exactly one JSON object and no surrounding prose: {"outcome":"completed"|"blocked","message":<non-empty string>,"output":<any JSON>}. Any reply that is not exactly that object is delivered to the user as a message.';
 
 export class AcpExecutor implements Executor<AcpRequest> {
   async start(request: AcpRequest, hooks: Hooks): Promise<Execution> {
@@ -128,30 +135,80 @@ class Attempt {
         this.sessionId = session.sessionId;
       }
       await this.hooks.session(this.sessionId);
-      const prompt = `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${RESULT_INSTRUCTION}`;
-      const response = await this.agent.request(methods.agent.session.prompt, {
-        sessionId: this.sessionId,
-        prompt: [{ type: "text", text: prompt }],
-      });
-      if (this.cancelled) throw new Error("ACP attempt was cancelled");
-      if (response.stopReason !== "end_turn") {
-        throw new Error(`ACP prompt stopped with ${response.stopReason}`);
+      // First turn: append the contract the agent must follow. Interactive tasks get the
+      // multi-turn contract; non-interactive tasks get the single-shot envelope contract.
+      let turnText = this.request.interactive
+        ? `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${INTERACTIVE_INSTRUCTION}`
+        : `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${RESULT_INSTRUCTION}`;
+      let response: PromptResponse;
+      for (;;) {
+        // Reset the accumulation buffer PER TURN, or turn N would contain turns 1..N
+        // concatenated and the envelope check would misfire on conversational replies.
+        this.text = "";
+        response = await this.agent.request(methods.agent.session.prompt, {
+          sessionId: this.sessionId,
+          prompt: [{ type: "text", text: turnText }],
+        });
+        if (this.cancelled) throw new Error("ACP attempt was cancelled");
+        if (response.stopReason !== "end_turn") {
+          throw new Error(`ACP prompt stopped with ${response.stopReason}`);
+        }
+        if (!this.request.interactive) {
+          // Non-interactive: today's exact single-shot logic — preserve byte-for-byte so the
+          // single-shot path is not a silent regression target.
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(this.text);
+          } catch {
+            throw new Error("ACP response must be exactly one JSON value");
+          }
+          const result = validateResult(parsed, this.request.outputSchema);
+          await this.hooks.transcript({
+            type: "lifecycle",
+            direction: "internal",
+            event: "acp_turn_completed",
+            data: { stopReason: response.stopReason },
+          });
+          if (this.cancelled) throw new Error("ACP attempt was cancelled");
+          return { result };
+        }
+        // Interactive: shape check decides conversation vs final. A JSON.parse failure
+        // here means the agent spoke to the user — that is exactly the conversational
+        // case we are designed for — so we swallow the parse error and treat the reply
+        // as a message. A positive shape check is followed by validateResult so a final
+        // answer whose output violates outputSchema still fails the task (not suspended).
+        let parsed: unknown;
+        try { parsed = JSON.parse(this.text); } catch { parsed = undefined; }
+        if (parsed !== undefined && isEnvelope(parsed)) {
+          const result = validateResult(parsed, this.request.outputSchema);
+          await this.hooks.transcript({
+            type: "lifecycle",
+            direction: "internal",
+            event: "acp_turn_completed",
+            data: { stopReason: response.stopReason },
+          });
+          if (this.cancelled) throw new Error("ACP attempt was cancelled");
+          return { result };
+        }
+        // Conversational turn: surface to the user as a turn interaction and wait for
+        // the next prompt. A rejected interact promise (cancel / dropInteraction) bubbles
+        // out of the loop and is caught by the `this.done` catch above — same path as
+        // elicitation cancellation today.
+        await this.hooks.transcript({
+          type: "lifecycle",
+          direction: "internal",
+          event: "acp_turn_suspended",
+          data: { length: this.text.length },
+        });
+        const next = await this.hooks.interact({
+          kind: "turn",
+          method: "turn/next",
+          request: { message: this.text },
+          validate: turn,
+        });
+        // Turns ≥ 2 send the user's raw text only — do NOT re-append instruction or inputs.
+        turnText = String(next);
       }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(this.text);
-      } catch {
-        throw new Error("ACP response must be exactly one JSON value");
-      }
-      const result = validateResult(parsed, this.request.outputSchema);
-      await this.hooks.transcript({
-        type: "lifecycle",
-        direction: "internal",
-        event: "acp_turn_completed",
-        data: { stopReason: response.stopReason },
-      });
-      if (this.cancelled) throw new Error("ACP attempt was cancelled");
-      return { result };
     } finally {
       await this.cleanup(false);
     }
@@ -300,6 +357,14 @@ function elicitation(value: Json): Json {
   ) {
     throw new Error("Invalid elicitation response");
   }
+  return value;
+}
+
+// A turn is the raw text the user types as their next message to the agent. Non-empty
+// string so the agent always has something to reply to; whitespace-only is rejected so
+// accidental empty submits cannot stall the conversation.
+function turn(value: Json): Json {
+  if (typeof value !== "string" || !value.trim()) throw new Error("Turn message must be a non-empty string");
   return value;
 }
 

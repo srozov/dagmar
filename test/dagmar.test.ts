@@ -531,6 +531,142 @@ test("scheduler fails the continuing task with continuation_unavailable when the
   app.store.close();
 });
 
+// T2 (workflow validation): validateWorkflow accepts an ACP task with interactive:true
+// (and normalizes it onto the TaskDef) but rejects it on a process task — interactive
+// is an ACP-only flag. Mirrors the T1 validateWorkflow test (lines 348-426): profiles
+// are passed directly so each case pins a specific failure mode without disk I/O.
+test("validateWorkflow accepts interactive on ACP tasks and rejects it on process tasks", () => {
+  const profiles: Config["executors"] = {
+    acp: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] },
+    proc: { type: "process", cwd: "/tmp", env: {} },
+  };
+
+  // Accept: ACP task with interactive: true; the normalized TaskDef carries it.
+  const ok = validateWorkflow({
+    id: "ok",
+    tasks: { A: { executor: "acp", inputs: {}, prompt: "talk", interactive: true } },
+  }, profiles);
+  assert.equal(ok.tasks.A!.interactive, true);
+
+  // Reject: process task with interactive: true. The validator must surface a clear
+  // `invalid_task` code (not a schema shape failure — the JSON schema accepts boolean).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { P: { executor: "proc", inputs: {}, run: ["true"], interactive: true } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /Process task/.test(error.message),
+  );
+});
+
+// T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session
+// when request.interactive === true. Turn 1 is conversational ("need input"); turn 2
+// emits the envelope. The same agent connection takes both turns (two session/prompt
+// sends on one sessionId) and the attempt settles `completed` with the envelope output.
+test("AcpExecutor loops session/prompt across turns for an interactive task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-interactive-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+let prompts=0;
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{sessionCapabilities:{close:{}}}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'i-1'}});
+if(m.method==='session/prompt'){
+  prompts++;
+  // Turn 1: conversational (non-envelope) → expect a turn interaction. Turn 2: envelope → done.
+  const text=prompts===1?'need input':'{"outcome":"completed","message":"ok","output":{"recalled":"next"}}';
+  send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'i-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text}}}});
+  send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}});
+}
+if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
+});
+`);
+  const records: unknown[] = []; let interactCalls = 0; let capturedMessage = "";
+  const execution = await new AcpExecutor().start(
+    { type: "acp", runId: "wr_i", taskRunId: "tr_i", taskId: "i", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Converse", interactive: true },
+    {
+      transcript: async (record) => { records.push(record); return records.length; },
+      session: async () => {},
+      interact: async (req) => {
+        interactCalls++;
+        assert.equal(req.kind, "turn");
+        assert.equal(req.method, "turn/next");
+        assert.equal((req.request as { message?: string }).message, "need input");
+        capturedMessage = (req.request as { message: string }).message;
+        // Validate runs the answer through the executor's `turn` validator.
+        return req.validate("do it");
+      },
+    },
+  );
+  const settled = await execution.done;
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.deepEqual("result" in settled ? settled.result.output : undefined, { recalled: "next" });
+  assert.equal(interactCalls, 1, "interact must be called exactly once (one conversational turn)");
+  assert.equal(capturedMessage, "need input");
+  // Same live session took two turns: count session/prompt sends on the acp transcript.
+  const promptMethods = records.filter((r) => (r as { type?: string }).type === "acp").map((r) => (r as { message?: { method?: string } }).message?.method);
+  const promptCount = promptMethods.filter((x) => x === "session/prompt").length;
+  assert.equal(promptCount, 2, "expected exactly two session/prompt sends on the live session");
+  // The suspend lifecycle event must be recorded between the two turns.
+  const events = records.map((r) => (r as { event?: string }).event).filter((x) => typeof x === "string");
+  assert.ok(events.includes("acp_turn_suspended"), "expected an acp_turn_suspended lifecycle event");
+  assert.ok(events.includes("acp_turn_completed"), "expected an acp_turn_completed lifecycle event");
+});
+
+// T2 (scheduler park→turn→complete): an ACP task with interactive:true whose fake
+// executor issues one `turn` interaction via hooks.interact then completes after the
+// user answers. The scheduler must park the attempt as awaiting_input with kind="turn",
+// surface the interaction, and resume on answer(). Mirrors the existing ACP-interaction
+// park/answer test (lines 162-173) but with a `turn` interaction instead of `permission`.
+test("scheduler parks an interactive task awaiting a turn and completes on answer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-turn-park-"));
+  const workflow = { id: "turn", tasks: { talk: { executor: "agent", inputs: {}, prompt: "converse", interactive: true } } };
+  const app = await fixture(root, workflow, new TurnInteractionExecutor());
+  const started = await app.scheduler.start("turn", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const interaction = app.scheduler.interactions()[0]!;
+  assert.equal(interaction.kind, "turn");
+  assert.equal(interaction.method, "turn/next");
+  await app.scheduler.answer(interaction.id, "next turn please");
+  const completed = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(completed.tasks.talk!.state, "completed");
+  assert.deepEqual(completed.tasks.talk!.attempts[0]!.result, { outcome: "completed", message: "turn", output: { turn: "next turn please" } });
+  app.store.close();
+});
+
+// T2 (regression): the non-interactive single-shot path must be unchanged — a mock
+// agent emitting non-envelope prose ("hello") + end_turn must settle the attempt as
+// `failed` (the existing "ACP response must be exactly one JSON value" throw), and
+// must NOT park a `turn` interaction. Guards AC5: no silent behavior change.
+test("non-interactive ACP task with non-envelope prose fails fast without suspending", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-nonenv-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{sessionCapabilities:{close:{}}}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'s-1'}});
+if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'s-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'hello'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
+});
+`);
+  let interactCalls = 0;
+  const execution = await new AcpExecutor().start(
+    { type: "acp", runId: "wr_n", taskRunId: "tr_n", taskId: "n", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    {
+      transcript: async () => 1,
+      session: async () => {},
+      interact: async () => { interactCalls++; throw new Error("non-interactive task must not request interactions"); },
+    },
+  );
+  const settled = await execution.done;
+  assert.ok("error" in settled, "expected a failed settlement, not a parked turn");
+  assert.equal("error" in settled && settled.error.code, "acp_failed");
+  assert.match("error" in settled ? settled.error.message : "", /ACP response must be exactly one JSON value/);
+  assert.equal(interactCalls, 0);
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
@@ -547,6 +683,21 @@ class InteractiveExecutor implements Executor<AcpRequest> {
     const done = (async () => {
       const response = await hooks.interact({ kind: "permission", method: "session/request_permission", request: { options: [{ optionId: "yes" }] }, validate: (value: Json) => value });
       const result: TaskResult = { outcome: "completed", message: "answered", output: response };
+      return cancelled ? { error: { code: "cancelled", message: "cancelled" } } : { result };
+    })();
+    return { done, cancel: async () => { cancelled = true; } };
+  }
+}
+
+// T2 helper: like InteractiveExecutor but emits a `turn` interaction instead of a
+// `permission` interaction. The validate function passes the answer through as-is so
+// the scheduler sees the user's next-turn text in the resulting TaskResult.output.
+class TurnInteractionExecutor implements Executor<AcpRequest> {
+  async start(_request: AcpRequest, hooks: Hooks): Promise<Execution> {
+    let cancelled = false;
+    const done = (async () => {
+      const answer = await hooks.interact({ kind: "turn", method: "turn/next", request: { message: "first turn" }, validate: (value: Json) => value });
+      const result: TaskResult = { outcome: "completed", message: "turn", output: { turn: answer } };
       return cancelled ? { error: { code: "cancelled", message: "cancelled" } } : { result };
     })();
     return { done, cancel: async () => { cancelled = true; } };
