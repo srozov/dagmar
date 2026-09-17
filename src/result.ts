@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { Ajv } from "ajv";
-import type { JsonSchema, TaskResult } from "./types.js";
+import type { Json, JsonSchema, TaskResult } from "./types.js";
 import { DagmarError } from "./types.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false, validateFormats: false });
@@ -32,6 +32,21 @@ export function validateOutputSchema(value: unknown): asserts value is JsonSchem
   if (typeof value !== "boolean" && (!value || typeof value !== "object" || Array.isArray(value))) throw new DagmarError("invalid_output_schema", "outputSchema is invalid");
   try { ajv.compile(value as JsonSchema); }
   catch { throw new DagmarError("invalid_output_schema", "outputSchema is invalid"); }
+}
+
+// Compile a gate's optional JSON Schema into an InteractionRequest.validate function. Without a
+// schema, the validator accepts any value (gate has no inherent shape). With a schema, the value
+// must conform or the answer is rejected as gate_validation_failed. The returned function matches
+// the InteractionRequest.validate contract: return the accepted value or throw.
+export function gateValidator(schema?: JsonSchema): (response: Json) => Json {
+  if (schema === undefined) return (value) => value as Json;
+  let validate: ReturnType<typeof ajv.compile>;
+  try { validate = ajv.compile(schema); }
+  catch { throw new DagmarError("invalid_gate_schema", "Gate schema is invalid"); }
+  return (value: Json): Json => {
+    if (!validate(value)) throw new DagmarError("gate_validation_failed", "Gate response does not match schema");
+    return value;
+  };
 }
 
 function json(value: unknown, seen = new Set<object>()): boolean {
