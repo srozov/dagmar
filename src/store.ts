@@ -74,7 +74,7 @@ export class Store {
     return row && attempt(row);
   }
   attempts(runId: string): AttemptRow[] {
-    return (this.db.prepare("SELECT * FROM task_runs WHERE workflow_run_id=? ORDER BY task_id,attempt").all(runId) as Row[]).map(attempt);
+    return (this.db.prepare("SELECT * FROM task_runs WHERE workflow_run_id=? ORDER BY rowid").all(runId) as Row[]).map(attempt);
   }
   activeAttempts(): AttemptRow[] {
     return (this.db.prepare("SELECT * FROM task_runs WHERE status IN ('running','awaiting_permission','awaiting_input')").all() as Row[]).map(attempt);
