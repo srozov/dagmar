@@ -280,8 +280,13 @@ export class Scheduler {
   // ref is a declared dependency; depsSettled() guarantees those deps are terminal (completed or
   // skipped) before we get here. A clause whose $tasks ref points to a skipped dep returns false
   // immediately (the output can never exist). Missing paths return undefined -> clause false -> skip.
+  // A guardless task (no `when`) is vacuously satisfied: every guard clause passes, so the guard
+  // evaluator returns true. This matches the documented "guardless source loops to the cap" assumption
+  // used by `loopFinal` (the only caller that does not already short-circuit on empty `when`).
   private guardPasses(task: TaskDef, runInput: Json, latest: Map<string, AttemptRow>): boolean {
-    for (const clause of task.when!) {
+    const clauses = task.when;
+    if (!clauses || clauses.length === 0) return true;
+    for (const clause of clauses) {
       const ref = reference(clause.ref)!;
       let value: Json | undefined;
       if (ref.task) { const dep = latest.get(ref.task)!; if (dep.status === "skipped") return false; value = walk(dep.result?.output, ref.path); }
