@@ -1406,6 +1406,322 @@ test("a run-input guard decides on the run input and skips or completes accordin
 });
 
 
+// T5 (loop validation matrix): validateWorkflow accepts loop { to, maxVisits } on a source
+// whose `to` is a direct dependency, and rejects every variant the plan enumerates. Mirrors
+// the T4 validateWorkflow matrix at lines 1049-1165: profiles are passed in directly so each
+// case pins a specific failure mode.
+test("validateWorkflow accepts loop on a direct-dependency source and rejects malformed variants", () => {
+  const profiles: Config["executors"] = {
+    local: { type: "process", cwd: "/tmp", env: {} },
+  };
+
+  // Accept: direct-dep target with both when and loop; loop fields flow through onto the TaskDef.
+  const ok1 = validateWorkflow({
+    id: "loop-ok1",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: ["true"] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"],
+        when: [{ ref: "$tasks.verify.output.passed", equals: false }],
+        loop: { to: "verify", maxVisits: 3 },
+      },
+    },
+  }, profiles);
+  assert.equal(ok1.tasks.fixup!.loop!.to, "verify");
+  assert.equal(ok1.tasks.fixup!.loop!.maxVisits, 3);
+
+  // Accept: a loop source without a `when` guard (topology-only check).
+  const ok2 = validateWorkflow({
+    id: "loop-ok2",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: ["true"] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"],
+        loop: { to: "verify", maxVisits: 5 },
+      },
+    },
+  }, profiles);
+  assert.equal(ok2.tasks.fixup!.loop!.maxVisits, 5);
+
+  // Reject: loop.to refers to an unknown task.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        verify: { executor: "local", inputs: {}, run: ["true"] },
+        fixup: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], loop: { to: "ghost", maxVisits: 3 } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_loop" && /not a task/.test(error.message),
+  );
+
+  // Reject: loop.to is not a direct dependency.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        verify: { executor: "local", inputs: {}, run: ["true"] },
+        middle: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"] },
+        fixup: { executor: "local", dependsOn: ["middle"], inputs: {}, run: ["true"], loop: { to: "verify", maxVisits: 3 } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_loop" && /direct dependency/.test(error.message),
+  );
+
+  // Reject: loop.to === id (self-loop).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        step: { executor: "local", inputs: {}, run: ["true"], loop: { to: "step", maxVisits: 2 } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_loop" && /cannot be itself/.test(error.message),
+  );
+
+  // Reject: maxVisits < 1 (schema rejects 0 with workflow_invalid).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        verify: { executor: "local", inputs: {}, run: ["true"] },
+        fixup: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], loop: { to: "verify", maxVisits: 0 } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && (error.code === "workflow_invalid" || (error.code === "invalid_loop" && /maxVisits must be an integer/.test(error.message))),
+  );
+
+  // Reject: two sources sharing the same loop.to.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        verify: { executor: "local", inputs: {}, run: ["true"] },
+        fixup1: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], loop: { to: "verify", maxVisits: 3 } },
+        fixup2: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], loop: { to: "verify", maxVisits: 2 } },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_loop" && /more than one loop/.test(error.message),
+  );
+
+  // Regression: a raw dependsOn cycle is still rejected as dependency_cycle.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        a: { executor: "local", inputs: {}, run: ["true"], dependsOn: ["b"] },
+        b: { executor: "local", inputs: {}, run: ["true"], dependsOn: ["a"] },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "dependency_cycle",
+  );
+});
+
+// T5 (loop then pass): verify/fixup/review workflow where verify.mjs fails for the first K-1
+// invocations (read from a fixture-root file counter) and passes on the Kth. verify is the
+// loop target, fixup is the source (when:[passed==false], loop:{to:verify,maxVisits:3}), review
+// depends on verify and gates on passed==true.
+test("scheduler runs the bounded loop, exits on the source's guard, and decides review once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-loop-pass-"));
+  const counter = join(root, "counter");
+  const verifyScript = join(root, "verify.mjs");
+  const echoScript = join(root, "echo.mjs");
+  await writeFile(
+    verifyScript,
+    "import {existsSync, readFileSync, writeFileSync} from 'node:fs';\nfor await (const _ of process.stdin) {}\nconst counterFile = " + JSON.stringify(counter) + ";\nconst threshold = 3;\nconst n = existsSync(counterFile) ? parseInt(readFileSync(counterFile, 'utf8'), 10) : 0;\nconst next = n + 1;\nwriteFileSync(counterFile, String(next));\nconst passed = next >= threshold;\nconsole.log(JSON.stringify({outcome:'completed',message:'v',output:{passed, count: next}}));\n",
+  );
+  await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
+  const workflow = {
+    id: "looppass",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: [process.execPath, verifyScript] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: false }],
+        loop: { to: "verify", maxVisits: 3 },
+      },
+      review: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: true }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("looppass", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.status, "completed");
+  assert.equal(view.tasks.verify!.attempts.length, 3, "verify runs until the Kth pass; here K=3");
+  assert.ok(view.tasks.verify!.attempts.every((a) => a.status === "completed"));
+  const fixupCompleted = view.tasks.fixup!.attempts.filter((a) => a.status === "completed").length;
+  const fixupSkipped = view.tasks.fixup!.attempts.filter((a) => a.status === "skipped").length;
+  assert.equal(fixupCompleted, 2, "fixup completes exactly twice (after verify#1 and verify#2)");
+  assert.equal(fixupSkipped, 1, "fixup skips on the final iteration when verify passes");
+  assert.equal(view.tasks.review!.state, "completed");
+  assert.equal(view.tasks.review!.attempts.length, 1);
+  app.store.close();
+});
+
+// T5 (exhaustion): maxVisits:3 and verify always fails — source saturates its cap (3 completions),
+// target runs maxVisits+1 times (4), review skips because loopFinal pulls the run to completed
+// with the exit branch skipped (gate #3).
+test("loop exhausts at maxVisits and the exit branch is decided once as skipped", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-loop-exhaust-"));
+  const verifyScript = join(root, "verify.mjs");
+  const echoScript = join(root, "echo.mjs");
+  await writeFile(verifyScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'v',output:{passed:false, count: 1}}));");
+  await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
+  const workflow = {
+    id: "loopexhaust",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: [process.execPath, verifyScript] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: false }],
+        loop: { to: "verify", maxVisits: 3 },
+      },
+      review: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: true }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("loopexhaust", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.status, "completed");
+  assert.equal(view.tasks.verify!.attempts.length, 4, "target runs maxVisits+1 times (1 initial + 3 re-verifies)");
+  const fixupCompleted = view.tasks.fixup!.attempts.filter((a) => a.status === "completed").length;
+  assert.equal(fixupCompleted, 3, "source completes exactly maxVisits times before exhaustion");
+  assert.equal(view.tasks.review!.state, "skipped", "exit branch skipped when the loop exhausts");
+  assert.equal(view.tasks.review!.attempts[0]!.status, "skipped");
+  app.store.close();
+});
+
+// T5 (immediate pass): verify passes on the first invocation — loop never iterates; fixup's
+// guard fails, review is decided once and runs.
+test("loop exits on the first iteration when verify passes immediately", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-loop-immediate-"));
+  const verifyScript = join(root, "verify.mjs");
+  const echoScript = join(root, "echo.mjs");
+  await writeFile(verifyScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'v',output:{passed:true, count: 1}}));");
+  await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
+  const workflow = {
+    id: "loopimmediate",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: [process.execPath, verifyScript] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: false }],
+        loop: { to: "verify", maxVisits: 3 },
+      },
+      review: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: true }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("loopimmediate", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.status, "completed");
+  assert.equal(view.tasks.verify!.attempts.length, 1);
+  assert.equal(view.tasks.fixup!.state, "skipped");
+  assert.equal(view.tasks.fixup!.attempts.length, 1);
+  assert.equal(view.tasks.fixup!.attempts[0]!.status, "skipped");
+  assert.equal(view.tasks.review!.state, "completed");
+  assert.equal(view.tasks.review!.attempts.length, 1);
+  app.store.close();
+});
+
+// T5 (restart mid-loop): the loop is in flight when the daemon is killed; the next scheduler
+// recovers the executor_lost attempt, the operator resumes, and the loop continues with the
+// visit count preserved (gate #4 — resume continues, never resets). Pre-inserting the running
+// attempt mirrors the recovery test at lines 211-217 and the gateshutdown restart test at
+// lines 977-1013 ��� deterministic, no real daemon kill, same store path. verify is the loop
+// target; pre-inserting it `running` makes recover() fail it with `executor_lost`, which
+// cascades blocked_by_dependency through fixup and review, so the run lands `blocked` and
+// resume() can pick it up.
+test("restart mid-loop: recover() blocks, resume() continues, visit count preserved", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-loop-restart-"));
+  const counter = join(root, "counter");
+  const verifyScript = join(root, "verify.mjs");
+  const echoScript = join(root, "echo.mjs");
+  await writeFile(
+    verifyScript,
+    "import {existsSync, readFileSync, writeFileSync} from 'node:fs';\nfor await (const _ of process.stdin) {}\nconst counterFile = " + JSON.stringify(counter) + ";\nconst n = existsSync(counterFile) ? parseInt(readFileSync(counterFile, 'utf8'), 10) : 0;\nconst next = n + 1;\nwriteFileSync(counterFile, String(next));\nconst passed = next >= 4;\nconsole.log(JSON.stringify({outcome:'completed',message:'v',output:{passed, count: next}}));\n",
+  );
+  await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
+  const workflow = {
+    id: "looprestart",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: [process.execPath, verifyScript] },
+      fixup: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: false }],
+        loop: { to: "verify", maxVisits: 3 },
+      },
+      review: {
+        executor: "local", dependsOn: ["verify"], inputs: {},
+        run: [process.execPath, echoScript],
+        when: [{ ref: "$tasks.verify.output.passed", equals: true }],
+      },
+    },
+  };
+  const storePath = join(root, "state", "dagmar.sqlite");
+  await mkdir(join(root, "workflows"), { recursive: true });
+  await mkdir(join(root, "state"), { recursive: true });
+  await writeFile(join(root, "workflows", `${workflow.id}.yaml`), stringify(workflow));
+  // Pre-write the counter so verify#2 (the first verify run by scheduler2) reads count=1.
+  await writeFile(counter, "1");
+
+  // Pre-insert a mid-loop state: verify#1 was running on a scheduler that has since died.
+  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} } };
+  const now = new Date().toISOString();
+  const store1 = new Store(storePath);
+  store1.insertRun({ id: "wr_loop_r", workflowId: workflow.id, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_loop_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  store1.close();
+
+  // Second scheduler on the same store — recovers the in-flight attempt then resumes.
+  const store2 = new Store(storePath);
+  const transcripts2 = new Transcripts(join(root, "state"));
+  const events2 = new EventBus();
+  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows"), profiles), events2, profiles, { process: new ProcessExecutor(), acp: new InteractiveExecutor() });
+  await scheduler2.recover();
+  // After recover: in-flight attempt is executor_lost and the run is blocked (the failed
+  // task cascades blocked_by_dependency through fixup and review).
+  assert.equal(store2.run("wr_loop_r")!.status, "blocked");
+  assert.equal(store2.attempt("tr_v1")!.status, "failed");
+  assert.equal(store2.attempt("tr_v1")!.error!.code, "executor_lost");
+
+  // Resume retries the failed attempt; the loop continues and verify eventually passes.
+  await scheduler2.resume("wr_loop_r");
+  const view = await waitFor(scheduler2, "wr_loop_r", "completed");
+  assert.equal(view.status, "completed");
+
+  // Visit count preserved across the restart: only `completed` counts toward the cap.
+  const fixupCompleted = view.tasks.fixup!.attempts.filter((a) => a.status === "completed").length;
+  assert.ok(fixupCompleted <= 3, `fixup completed count (${fixupCompleted}) must be <= maxVisits (3)`);
+
+  // verify ran 3 successful times on scheduler2; verify#1 was the pre-inserted failed attempt.
+  const verifyCompleted = view.tasks.verify!.attempts.filter((a) => a.status === "completed");
+  assert.equal(verifyCompleted.length, 3, "verify ran three times on scheduler2 (2 fail, 1 pass)");
+  const lastVerify = verifyCompleted[verifyCompleted.length - 1]!;
+  assert.deepEqual(lastVerify.result!.output, { passed: true, count: 4 });
+
+  // review decided once after loopFinal.
+  assert.equal(view.tasks.review!.state, "completed");
+  store2.close();
+});
+
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
