@@ -111,6 +111,17 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
     }
+    if (task.when !== undefined) {
+      for (const clause of task.when) {
+        const hasEquals = Object.hasOwn(clause, "equals");
+        const hasIn = clause.in !== undefined;
+        if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} when clause needs exactly one of equals or in`);
+        if (hasIn && (!Array.isArray(clause.in) || clause.in.length === 0)) throw new DagmarError("invalid_guard", `Task ${id} when in must be a non-empty array`);
+        const ref = reference(clause.ref);
+        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} when ref must be a $tasks or $run reference`);
+        if (ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
+      }
+    }
     if (task.session?.mode === "continue") {
       const from = task.session.from;
       if (!task.dependsOn.includes(from)) throw new DagmarError("invalid_dependency", `Task ${id} continue from ${from} must be a dependency`);
@@ -160,7 +171,7 @@ function yaml(text: string): unknown {
   if (doc.errors.length) throw new DagmarError("invalid_yaml", "Workflow is not valid YAML");
   return doc.toJS({ maxAliasCount: 100 });
 }
-function reference(value: string): { task?: string; path: string[] } | undefined {
+export function reference(value: string): { task?: string; path: string[] } | undefined {
   if (value === "$run.input") return { path: [] };
   if (value.startsWith("$run.input.")) return { path: value.slice(11).split(".") };
   const match = /^\$tasks\.([A-Za-z0-9_-]+)\.output(?:\.(.+))?$/.exec(value);
