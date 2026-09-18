@@ -127,8 +127,7 @@
               },
               "equals": {},
               "in": {
-                "type": "array",
-                "minItems": 1
+                "type": "array"
               }
             }
           }
