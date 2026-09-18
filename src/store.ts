@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
  id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), task_id TEXT NOT NULL,
  attempt INTEGER NOT NULL CHECK(attempt>=1), executor_profile TEXT NOT NULL,
  executor_type TEXT NOT NULL CHECK(executor_type IN ('acp','process','gate')),
- status TEXT NOT NULL CHECK(status IN ('running','awaiting_permission','awaiting_input','completed','blocked','failed','cancelled')),
+ status TEXT NOT NULL CHECK(status IN ('running','awaiting_permission','awaiting_input','completed','blocked','failed','cancelled','skipped')),
  result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT,
  UNIQUE(workflow_run_id,task_id,attempt)
 );

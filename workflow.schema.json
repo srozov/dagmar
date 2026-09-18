@@ -2,44 +2,136 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["id", "tasks"],
+  "required": [
+    "id",
+    "tasks"
+  ],
   "properties": {
-    "id": { "$ref": "#/$defs/id" },
+    "id": {
+      "$ref": "#/$defs/id"
+    },
     "tasks": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "$ref": "#/$defs/id" },
-      "additionalProperties": { "$ref": "#/$defs/task" }
+      "propertyNames": {
+        "$ref": "#/$defs/id"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/task"
+      }
     }
   },
   "$defs": {
-    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$" },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$"
+    },
     "task": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["inputs"],
+      "required": [
+        "inputs"
+      ],
       "properties": {
-        "executor": { "$ref": "#/$defs/id" },
-        "dependsOn": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
-        "inputs": { "type": "object" },
-        "prompt": { "type": "string" },
-        "run": { "type": "array", "minItems": 1, "items": { "type": "string" } },
-        "outputSchema": { "anyOf": [{ "type": "object" }, { "type": "boolean" }] },
-        "interactive": { "type": "boolean" },
+        "executor": {
+          "$ref": "#/$defs/id"
+        },
+        "dependsOn": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "inputs": {
+          "type": "object"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "run": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "outputSchema": {
+          "anyOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        },
+        "interactive": {
+          "type": "boolean"
+        },
         "gate": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["prompt"],
+          "required": [
+            "prompt"
+          ],
           "properties": {
-            "prompt": { "type": "string", "minLength": 1 },
-            "schema": { "anyOf": [{ "type": "object" }, { "type": "boolean" }] }
+            "prompt": {
+              "type": "string",
+              "minLength": 1
+            },
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "object"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            }
           }
         },
         "session": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["mode"],
-          "properties": { "mode": { "enum": ["fresh", "continue", "fork"] }, "from": { "$ref": "#/$defs/id" } }
+          "required": [
+            "mode"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "fresh",
+                "continue",
+                "fork"
+              ]
+            },
+            "from": {
+              "$ref": "#/$defs/id"
+            }
+          }
+        },
+        "when": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ref"
+            ],
+            "properties": {
+              "ref": {
+                "type": "string",
+                "minLength": 1
+              },
+              "equals": {},
+              "in": {
+                "type": "array",
+                "minItems": 1
+              }
+            }
+          }
         }
       }
     }
