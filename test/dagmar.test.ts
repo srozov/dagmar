@@ -1043,6 +1043,369 @@ test("gate output is available as $tasks.<gate>.output to downstream tasks", asy
 });
 
 
+// T4 (when validation matrix): validateWorkflow accepts well-formed when clauses (ref/equals/in/dep
+// checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the variants the
+// plan enumerates. Profiles are passed directly so each rejection pins a specific failure mode.
+test("validateWorkflow accepts when guards and rejects malformed variants", () => {
+  const profiles: Config["executors"] = {
+    local: { type: "process", cwd: "/tmp", env: {} },
+    gate: { type: "gate", cwd: "/tmp", env: {} } as never, // gate tasks don't need a profile lookup
+    // Gate tasks short-circuit validation (item.gate branch) before the executor profile lookup, so
+    // we register a "gate" key just so any non-gate test that names it as executor can fail loudly.
+  };
+  // Accept: ref + equals, dep [decide].
+  const ok1 = validateWorkflow({
+    id: "ok1",
+    tasks: {
+      decide: { executor: "local", inputs: {}, run: ["true"] },
+      branch: { executor: "local", dependsOn: ["decide"], inputs: {}, run: ["true"], when: [{ ref: "$tasks.decide.output.route", equals: "a" }] },
+    },
+  }, profiles);
+  assert.equal(ok1.tasks.branch!.when!.length, 1);
+  assert.equal(ok1.tasks.branch!.when![0]!.ref, "$tasks.decide.output.route");
+  assert.equal(ok1.tasks.branch!.when![0]!.equals, "a");
+
+  // Accept: ref + in.
+  const ok2 = validateWorkflow({
+    id: "ok2",
+    tasks: {
+      decide: { executor: "local", inputs: {}, run: ["true"] },
+      branch: { executor: "local", dependsOn: ["decide"], inputs: {}, run: ["true"], when: [{ ref: "$tasks.decide.output.route", in: ["a", "b"] }] },
+    },
+  }, profiles);
+  assert.deepEqual(ok2.tasks.branch!.when![0]!.in, ["a", "b"]);
+
+  // Accept: run-input ref with NO deps.
+  const ok3 = validateWorkflow({
+    id: "ok3",
+    tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", equals: "fast" }] } },
+  }, profiles);
+  assert.equal(ok3.tasks.t!.when![0]!.ref, "$run.input.mode");
+
+  // Accept: multi-clause AND.
+  const ok4 = validateWorkflow({
+    id: "ok4",
+    tasks: {
+      decide: { executor: "local", inputs: {}, run: ["true"] },
+      branch: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: ["true"],
+        when: [{ ref: "$tasks.decide.output.route", equals: "a" }, { ref: "$run.input.mode", in: ["fast", "slow"] }],
+      },
+    },
+  }, profiles);
+  assert.equal(ok4.tasks.branch!.when!.length, 2);
+
+  // Accept: when on a gate task (guard evaluated before the gate branch).
+  const ok5 = validateWorkflow({
+    id: "ok5",
+    tasks: {
+      decide: { executor: "local", inputs: {}, run: ["true"] },
+      gate: { dependsOn: ["decide"], inputs: {}, gate: { prompt: "Approve?" }, when: [{ ref: "$tasks.decide.output.route", equals: "a" }] },
+    },
+  }, profiles);
+  assert.equal(ok5.tasks.gate!.when!.length, 1);
+  assert.ok(ok5.tasks.gate!.gate);
+
+  // Reject: clause with neither equals nor in.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode" }] } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_guard" && /exactly one/.test(error.message),
+  );
+
+  // Reject: clause with BOTH equals and in.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", equals: "a", in: ["a"] }] } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_guard" && /exactly one/.test(error.message),
+  );
+
+  // Reject: empty in.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", in: [] }] } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_guard" && /non-empty/.test(error.message),
+  );
+
+  // Reject: $tasks ref to a non-dependency.
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: {
+        a: { executor: "local", inputs: {}, run: ["true"] },
+        b: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$tasks.a.output.route", equals: "x" }] },
+      },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_guard" && /non-dependency/.test(error.message),
+  );
+
+  // Reject: plain-string ref (not a $ reference).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "route", equals: "a" }] } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_guard" && /\$tasks or \$run/.test(error.message),
+  );
+
+  // Reject: malformed $ ref -> invalid_input_reference (propagated from reference()).
+  assert.throws(
+    () => validateWorkflow({
+      id: "x",
+      tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$tasks.", equals: "a" }] } },
+    }, profiles),
+    (error: unknown) => error instanceof DagmarError && error.code === "invalid_input_reference",
+  );
+});
+
+// T4 (N-way decider): an upstream decide task picks a route; three branches each gate on a different
+// value. Exactly one branch runs, the other two skip, and the run completes (not blocked).
+// Uses the local process executor with an echo script that emits {outcome,output:<inputs>}.
+test("scheduler runs only the matching branch of an N-way decider and skips the rest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-decider-"));
+  const script = join(root, "task.mjs");
+  await writeFile(
+    script,
+    `
+import {readFileSync} from 'node:fs';
+const input=[]; for await (const c of process.stdin) input.push(c);
+const data=JSON.parse(input.join(''));
+console.log(JSON.stringify({outcome:'completed',message:'ok',output:{lane:data.route ?? 'decide',got:data}}));
+`,
+  );
+  const workflow = {
+    id: "decider",
+    tasks: {
+      decide: {
+        executor: "local",
+        inputs: { route: "$run.input.route" },
+        run: [process.execPath, script],
+      },
+      branchA: {
+        executor: "local",
+        dependsOn: ["decide"],
+        inputs: { route: "$tasks.decide.output.got.route" },
+        run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.got.route", equals: "a" }],
+      },
+      branchB: {
+        executor: "local",
+        dependsOn: ["decide"],
+        inputs: { route: "$tasks.decide.output.got.route" },
+        run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.got.route", equals: "b" }],
+      },
+      branchC: {
+        executor: "local",
+        dependsOn: ["decide"],
+        inputs: { route: "$tasks.decide.output.got.route" },
+        run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.got.route", equals: "c" }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("decider", { route: "b" });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.status, "completed");
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])),
+    { decide: "completed", branchA: "skipped", branchB: "completed", branchC: "skipped" },
+  );
+  // Skipped attempts have a single row with status: skipped and endedAt set; no request was sent.
+  assert.equal(view.tasks.branchA!.attempts.length, 1);
+  assert.equal(view.tasks.branchA!.attempts[0]!.status, "skipped");
+  assert.notEqual(view.tasks.branchA!.attempts[0]!.endedAt, null);
+  assert.equal(view.tasks.branchB!.attempts[0]!.status, "completed");
+  app.store.close();
+});
+
+// T4 (cascade via guard referencing a skipped output): a1's guard references decide.output.route;
+// a2's guard references a1.output. If decide.output.route != "a", a1 skips; a2's guard then
+// references a skipped dep, so the cascade short-circuits and a2 also skips.
+test("scheduler cascades a skip through a guard referencing a skipped output", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cascade-"));
+  const script = join(root, "task.mjs");
+  await writeFile(
+    script,
+    `
+const input=[]; for await (const c of process.stdin) input.push(c);
+const data=JSON.parse(input.join(''));
+console.log(JSON.stringify({outcome:'completed',message:'ok',output:{x:1,route:data.route ?? null}}));
+`,
+  );
+  const workflow = {
+    id: "cascade",
+    tasks: {
+      decide: { executor: "local", inputs: { route: "$run.input.route" }, run: [process.execPath, script] },
+      a1: {
+        executor: "local", dependsOn: ["decide"], inputs: { route: "$tasks.decide.output.route" }, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.route", equals: "a" }],
+      },
+      a2: {
+        executor: "local", dependsOn: ["a1"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.a1.output.x", equals: 1 }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("cascade", { route: "b" });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])),
+    { decide: "completed", a1: "skipped", a2: "skipped" },
+  );
+  assert.equal(view.status, "completed");
+  app.store.close();
+});
+
+// T4 (no-guard join past a skipped sibling): a1 has a guard and skips; keep has NO guard and
+// references decide (not a1) so it runs past the skip and completes.
+test("a no-guard task runs past a skipped sibling it does not reference", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-noguard-join-"));
+  const script = join(root, "task.mjs");
+  await writeFile(
+    script,
+    `
+const input=[]; for await (const c of process.stdin) input.push(c);
+const data=JSON.parse(input.join(''));
+console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.r ?? null}}));
+`,
+  );
+  const workflow = {
+    id: "noguard",
+    tasks: {
+      decide: { executor: "local", inputs: { r: "$run.input.route" }, run: [process.execPath, script] },
+      a1: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.route", equals: "a" }],
+      },
+      keep: {
+        executor: "local", dependsOn: ["decide"], inputs: { r: "$tasks.decide.output.route" }, run: [process.execPath, script],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("noguard", { route: "b" });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.deepEqual(
+    Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.state])),
+    { decide: "completed", a1: "skipped", keep: "completed" },
+  );
+  assert.equal(view.status, "completed");
+  app.store.close();
+});
+
+// T4 (no-guard task referencing a skipped output fails): convention violation surface. a1 skips;
+// join has no guard and references a1.output -> input_resolution_failed at prepare() time. Run
+// reaches blocked, not completed.
+test("a no-guard task referencing a skipped output fails with input_resolution_failed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-skip-ref-"));
+  const script = join(root, "task.mjs");
+  await writeFile(
+    script,
+    `
+const input=[]; for await (const c of process.stdin) input.push(c);
+const data=JSON.parse(input.join(''));
+console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.route ?? null}}));
+`,
+  );
+  const workflow = {
+    id: "skipref",
+    tasks: {
+      decide: { executor: "local", inputs: { route: "$run.input.route" }, run: [process.execPath, script] },
+      a1: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.route", equals: "a" }],
+      },
+      join: {
+        executor: "local", dependsOn: ["a1"], inputs: { x: "$tasks.a1.output" }, run: [process.execPath, script],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("skipref", { route: "b" });
+  const blocked = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.a1!.state, "skipped");
+  assert.equal(blocked.tasks.join!.state, "failed");
+  assert.equal(blocked.tasks.join!.attempts[0]!.error!.code, "input_resolution_failed");
+  assert.equal(blocked.status, "blocked");
+  app.store.close();
+});
+
+// T4 (missing path -> skip, never throws): decide.output lacks `flavor`; b's guard references
+// $tasks.decide.output.flavor. walk() returns undefined for the missing path, the clause is
+// false, b skips. Run completes (not blocked).
+test("a guard referencing a missing path causes the task to skip (not fail)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-missing-"));
+  const script = join(root, "task.mjs");
+  await writeFile(
+    script,
+    `
+const input=[]; for await (const c of process.stdin) input.push(c);
+const data=JSON.parse(input.join(''));
+console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.route ?? null}}));
+`,
+  );
+  const workflow = {
+    id: "missing",
+    tasks: {
+      decide: { executor: "local", inputs: { route: "$run.input.route" }, run: [process.execPath, script] },
+      b: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.flavor", equals: "x" }],
+      },
+    },
+  };
+  const app = await fixture(root, workflow);
+  const started = await app.scheduler.start("missing", { route: "a" });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.tasks.decide!.state, "completed");
+  assert.equal(view.tasks.b!.state, "skipped");
+  assert.equal(view.status, "completed");
+  app.store.close();
+});
+
+// T4 (run-input guard): a single task with no deps and a guard on $run.input. Two separate runs
+// (different workflow ids because one active run per workflow), one with mode:slow -> skip, one
+// with mode:fast -> complete.
+test("a run-input guard decides on the run input and skips or completes accordingly", async () => {
+  // Skip case.
+  const root1 = await mkdtemp(join(tmpdir(), "dagmar-runinput-skip-"));
+  const script = join(root1, "task.mjs");
+  await writeFile(script, `for await (const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));`);
+  const skipWf = {
+    id: "runinputskip",
+    tasks: { t: { executor: "local", inputs: {}, run: [process.execPath, script], when: [{ ref: "$run.input.mode", equals: "fast" }] } },
+  };
+  const app1 = await fixture(root1, skipWf);
+  const started1 = await app1.scheduler.start("runinputskip", { mode: "slow" });
+  const view1 = await waitFor(app1.scheduler, started1.workflowRunId, "completed");
+  assert.equal(view1.tasks.t!.state, "skipped");
+  assert.equal(view1.status, "completed");
+  app1.store.close();
+
+  // Run case (different workflow id).
+  const root2 = await mkdtemp(join(tmpdir(), "dagmar-runinput-run-"));
+  const runWf = {
+    id: "runinputrun",
+    tasks: { t: { executor: "local", inputs: {}, run: [process.execPath, script], when: [{ ref: "$run.input.mode", equals: "fast" }] } },
+  };
+  const app2 = await fixture(root2, runWf);
+  const started2 = await app2.scheduler.start("runinputrun", { mode: "fast" });
+  const view2 = await waitFor(app2.scheduler, started2.workflowRunId, "completed");
+  assert.equal(view2.tasks.t!.state, "completed");
+  assert.equal(view2.status, "completed");
+  app2.store.close();
+});
+
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
