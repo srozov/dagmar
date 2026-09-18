@@ -170,17 +170,26 @@ export class Scheduler {
     catch (error) { await this.blockDefinition(id, error); return; }
     const existing = this.store.attempts(id);
     const latest = latestAttempts(existing);
+    // Loop machinery: build the per-workflow loops map (keyed by target) once and an insertion-order
+    // position map from the rowid-ordered `existing`. Body re-arm comparisons only need already-persisted
+    // attempts (rows prepared this pass are `running`/terminal, not re-arm candidates in this scan).
+    const loops = loopsOf(workflow);
+    const pos = new Map(existing.map((r, i) => [r.id, i]));
     const now = timestamp();
     // Decide every task whose deps have settled (completed or skipped). A `skipped` decision settles
     // synchronously, so re-scanning lets a skip cascade to its dependants within this same advance;
     // runnable/gate tasks are prepared once and their dependants wait for the async settle. Terminates:
-    // a decided row is no longer a candidate (its status is not in `blocking`).
+    // a decided row is no longer a candidate (its status is not in `blocking`), EXCEPT for the loop's
+    // own re-arm (a terminal completed/skipped attempt may be re-prepared when loopRearm says so).
     const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [];
     for (;;) {
       let progressed = false;
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        if ((current && !(retry && blocking.has(current.status))) || !depsSettled(task, latest)) continue;
+        let candidate = !current || (retry && blocking.has(current.status));
+        if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
+          candidate = this.loopRearm(taskId, task, current, latest, pos, existing, loops);
+        if (!candidate || !this.depsSettled(workflow, task, taskId, latest, loops, existing, run)) continue;
         const item = this.prepare(run, taskId, task, latest, now);
         prepared.push(item); latest.set(taskId, item.row); progressed = true;
       }
@@ -283,6 +292,56 @@ export class Scheduler {
     return true;
   }
 
+  // Loop re-arm predicate. A task with a TERMINAL (completed/skipped) attempt may be re-prepared when
+  // the loop's other side has produced a NEWER completed attempt (rowid insertion order):
+  //   (a) the task is the loop's TARGET (loop.to === taskId): re-arm when its SOURCE completed newer.
+  //   (b) the task is the loop's SOURCE (task.loop?.to): re-arm when its TARGET completed newer AND
+  //       the source has not yet completed `maxVisits` times. Only `completed` counts toward the cap
+  //       so a failed+retried or skipped source attempt does not consume a visit (gate #4).
+  private loopRearm(taskId: string, task: TaskDef, current: AttemptRow, latest: Map<string, AttemptRow>, pos: Map<string, number>, rows: AttemptRow[], loops: Map<string, { source: string; maxVisits: number }>): boolean {
+    const asTarget = loops.get(taskId);
+    if (asTarget) {
+      const s = latest.get(asTarget.source);
+      if (s && s.status === "completed" && pos.get(s.id)! > pos.get(current.id)!) return true;
+    }
+    if (task.loop) {
+      const tgt = latest.get(task.loop.to);
+      if (tgt && tgt.status === "completed" && pos.get(tgt.id)! > pos.get(current.id)! && completedCount(taskId, rows) < task.loop.maxVisits) return true;
+    }
+    return false;
+  }
+
+  // Loop-final predicate. The loop is final when the target has a completed attempt and either the
+  // source has already exhausted its cap OR the source's exit guard would fire on the target's latest
+  // output (target passed; source's `when` is now false). A guardless source (no `when`) only exits
+  // at the cap (guardPasses returns true vacuously, so !guardPasses is false).
+  private loopFinal(workflow: Workflow, target: string, latest: Map<string, AttemptRow>, rows: AttemptRow[], loops: Map<string, { source: string; maxVisits: number }>, run: RunRow): boolean {
+    const t = latest.get(target);
+    if (!t || t.status !== "completed") return false;
+    const entry = loops.get(target)!;
+    if (completedCount(entry.source, rows) >= entry.maxVisits) return true;
+    const sourceTask = workflow.tasks[entry.source];
+    return sourceTask ? !this.guardPasses(sourceTask, run.input, latest) : false;
+  }
+
+  // Loop-aware depsSettled. Body edges (source depends on target; source is a member) settle when the
+  // target is completed — same as before. Exit-branch edges (dependants outside the loop) require the
+  // loop to be `final`. When `loops` is empty the new check never fires and behavior is identical to
+  // the prior implementation.
+  private depsSettled(workflow: Workflow, task: TaskDef, taskId: string, latest: Map<string, AttemptRow>, loops: Map<string, { source: string; maxVisits: number }>, rows: AttemptRow[], run: RunRow): boolean {
+    for (const dep of task.dependsOn) {
+      const d = latest.get(dep);
+      if (!d || !(d.status === "completed" || d.status === "skipped")) return false;
+      const target = loops.has(dep) ? dep : workflow.tasks[dep]?.loop?.to;
+      if (!target) continue;
+      const entry = loops.get(target);
+      if (!entry) continue;
+      const members = new Set([target, entry.source]);
+      if (!members.has(taskId) && !this.loopFinal(workflow, target, latest, rows, loops, run)) return false;
+    }
+    return true;
+  }
+
   private launch(row: AttemptRow, request: ProcessRequest | AcpRequest): void {
     let ready!: (handle: Execution) => void, failed!: (error: unknown) => void;
     const readyPromise = new Promise<Execution>((resolve, reject) => { ready = resolve; failed = reject; }); readyPromise.catch(() => undefined);
@@ -380,7 +439,21 @@ export class Scheduler {
 }
 
 function latestAttempts(rows: AttemptRow[]): Map<string, AttemptRow> { const map = new Map<string, AttemptRow>(); for (const row of rows) map.set(row.taskId, row); return map; }
-function depsSettled(task: TaskDef, latest: Map<string, AttemptRow>): boolean { return task.dependsOn.every((id) => { const s = latest.get(id)?.status; return s === "completed" || s === "skipped"; }); }
+// Per-workflow loops map, keyed by target. The source carries `loop: { to, maxVisits }`; the inverse
+// map lets the scheduler answer "who loops to this target?" in O(1) for both the re-arm predicate
+// and the exit-branch gating in depsSettled. Empty for loop-free workflows (no behavioral change).
+function loopsOf(workflow: Workflow): Map<string, { source: string; maxVisits: number }> {
+  const m = new Map<string, { source: string; maxVisits: number }>();
+  for (const [id, t] of Object.entries(workflow.tasks)) if (t.loop) m.set(t.loop.to, { source: id, maxVisits: t.loop.maxVisits });
+  return m;
+}
+// Counts `completed` attempts of a task across ALL its rows (not just latest). Only `completed`
+// counts toward the loop cap (a failed+retried or skipped attempt does not consume a visit).
+function completedCount(taskId: string, rows: AttemptRow[]): number {
+  let n = 0;
+  for (const r of rows) if (r.taskId === taskId && r.status === "completed") n++;
+  return n;
+}
 function replace(rows: AttemptRow[], changed: AttemptRow): AttemptRow[] { return rows.map((x) => x.id === changed.id ? changed : x); }
 function aggregate(workflow: Workflow, rows: AttemptRow[]): RunStatus { const states = taskStates(workflow, latestAttempts(rows), "running"), values = [...states.values()]; if (values.every((x) => x === "completed" || x === "skipped")) return "completed"; if (values.some((x) => x === "running" || x === "ready")) return "running"; if (values.some((x) => x === "awaiting_input" || x === "awaiting_permission")) return "waiting"; return "blocked"; }
 function taskStates(workflow: Workflow, latest: Map<string, AttemptRow>, runStatus: RunStatus): Map<string, TaskState> {
