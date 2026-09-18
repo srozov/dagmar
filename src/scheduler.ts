@@ -4,7 +4,7 @@ import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
 import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
-import { WorkflowRepository, resolveInputs } from "./workflow.js";
+import { WorkflowRepository, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
 
 type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
@@ -171,8 +171,21 @@ export class Scheduler {
     const existing = this.store.attempts(id);
     const latest = latestAttempts(existing);
     const now = timestamp();
-    const ready = Object.entries(workflow.tasks).filter(([taskId, task]) => depsDone(task, latest) && (!latest.has(taskId) || (retry && blocking.has(latest.get(taskId)!.status))));
-    const prepared = ready.map(([taskId, task]) => this.prepare(run, taskId, task, latest, now));
+    // Decide every task whose deps have settled (completed or skipped). A `skipped` decision settles
+    // synchronously, so re-scanning lets a skip cascade to its dependants within this same advance;
+    // runnable/gate tasks are prepared once and their dependants wait for the async settle. Terminates:
+    // a decided row is no longer a candidate (its status is not in `blocking`).
+    const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [];
+    for (;;) {
+      let progressed = false;
+      for (const [taskId, task] of Object.entries(workflow.tasks)) {
+        const current = latest.get(taskId);
+        if ((current && !(retry && blocking.has(current.status))) || !depsSettled(task, latest)) continue;
+        const item = this.prepare(run, taskId, task, latest, now);
+        prepared.push(item); latest.set(taskId, item.row); progressed = true;
+      }
+      if (!progressed) break;
+    }
     const combined = [...existing, ...prepared.map((x) => x.row)];
     const status = aggregate(workflow, combined);
     if (prepared.length || resuming || status !== run.status) {
@@ -200,10 +213,20 @@ export class Scheduler {
   }
 
   private prepare(run: RunRow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
+    // Guard branch first: a task whose `when` clauses are unsatisfied becomes a terminal, non-launching
+    // skipped attempt. The real executorType/executorProfile are preserved so view() surfaces the
+    // task's kind accurately. Sits ABOVE the gate branch so a conditional gate is decided by the
+    // guard, not parked.
+    if (task.when && task.when.length && !this.guardPasses(task, run.input, latest)) {
+      const isGate = Boolean(task.gate);
+      const executorType = isGate ? "gate" as const : (this.profiles[task.executor!]?.type ?? "process");
+      const executorProfile = isGate ? "gate" : task.executor!;
+      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: "skipped" as const, result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
+    }
     if (task.gate) {
       const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
       try {
-        resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
+        resolveInputs(task, run.input, this.depOutputs(task, latest));
         return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
       } catch (error) {
         return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
@@ -213,7 +236,7 @@ export class Scheduler {
     const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
-      const inputs = resolveInputs(task, run.input, Object.fromEntries(task.dependsOn.map((x) => [x, latest.get(x)!.result!.output])));
+      const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest));
       const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
@@ -233,6 +256,31 @@ export class Scheduler {
       // so validation/scheduling failures surface with their semantic code instead of a generic one.
       return { row: { ...base, status: "failed", error: taskError("input_resolution_failed", error), endedAt: now } };
     }
+  }
+
+  // Skip-safe replacement for the inline output-map builds. Excludes deps whose latest attempt
+  // has no result (e.g. skipped), so a no-guard task referencing a skipped dep output gets
+  // input_resolution_failed instead of a null-deref.
+  private depOutputs(task: TaskDef, latest: Map<string, AttemptRow>): Record<string, Json> {
+    const out: Record<string, Json> = {};
+    for (const dep of task.dependsOn) { const r = latest.get(dep)?.result; if (r) out[dep] = r.output; }
+    return out;
+  }
+
+  // Evaluate every `when` clause. Validation guarantees each ref is well-formed and every $tasks
+  // ref is a declared dependency; depsSettled() guarantees those deps are terminal (completed or
+  // skipped) before we get here. A clause whose $tasks ref points to a skipped dep returns false
+  // immediately (the output can never exist). Missing paths return undefined -> clause false -> skip.
+  private guardPasses(task: TaskDef, runInput: Json, latest: Map<string, AttemptRow>): boolean {
+    for (const clause of task.when!) {
+      const ref = reference(clause.ref)!;
+      let value: Json | undefined;
+      if (ref.task) { const dep = latest.get(ref.task)!; if (dep.status === "skipped") return false; value = walk(dep.result?.output, ref.path); }
+      else value = walk(runInput, ref.path);
+      const ok = clause.in !== undefined ? clause.in.some((v) => jsonEqual(value, v)) : jsonEqual(value, clause.equals!);
+      if (!ok) return false;
+    }
+    return true;
   }
 
   private launch(row: AttemptRow, request: ProcessRequest | AcpRequest): void {
@@ -332,9 +380,9 @@ export class Scheduler {
 }
 
 function latestAttempts(rows: AttemptRow[]): Map<string, AttemptRow> { const map = new Map<string, AttemptRow>(); for (const row of rows) map.set(row.taskId, row); return map; }
-function depsDone(task: TaskDef, latest: Map<string, AttemptRow>): boolean { return task.dependsOn.every((id) => latest.get(id)?.status === "completed"); }
+function depsSettled(task: TaskDef, latest: Map<string, AttemptRow>): boolean { return task.dependsOn.every((id) => { const s = latest.get(id)?.status; return s === "completed" || s === "skipped"; }); }
 function replace(rows: AttemptRow[], changed: AttemptRow): AttemptRow[] { return rows.map((x) => x.id === changed.id ? changed : x); }
-function aggregate(workflow: Workflow, rows: AttemptRow[]): RunStatus { const states = taskStates(workflow, latestAttempts(rows), "running"), values = [...states.values()]; if (values.every((x) => x === "completed")) return "completed"; if (values.some((x) => x === "running" || x === "ready")) return "running"; if (values.some((x) => x === "awaiting_input" || x === "awaiting_permission")) return "waiting"; return "blocked"; }
+function aggregate(workflow: Workflow, rows: AttemptRow[]): RunStatus { const states = taskStates(workflow, latestAttempts(rows), "running"), values = [...states.values()]; if (values.every((x) => x === "completed" || x === "skipped")) return "completed"; if (values.some((x) => x === "running" || x === "ready")) return "running"; if (values.some((x) => x === "awaiting_input" || x === "awaiting_permission")) return "waiting"; return "blocked"; }
 function taskStates(workflow: Workflow, latest: Map<string, AttemptRow>, runStatus: RunStatus): Map<string, TaskState> {
   const states = new Map<string, TaskState>();
   const state = (id: string): TaskState => {
@@ -355,3 +403,16 @@ function taskStates(workflow: Workflow, latest: Map<string, AttemptRow>, runStat
 function terminal(status: RunStatus): boolean { return status === "completed" || status === "blocked" || status === "cancelled"; }
 function taskError(code: string, error: unknown): TaskError { return { code: error instanceof DagmarError ? error.code : code, message: error instanceof Error ? error.message : code }; }
 function timestamp(): string { return new Date().toISOString(); }
+function walk(value: Json | undefined, path: string[]): Json | undefined {
+  let current = value;
+  for (const key of path) { if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) return undefined; current = current[key]; }
+  return current;
+}
+function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {
+  if (a === b) return true;
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]));
+  const ak = Object.keys(a), bk = Object.keys(b as object);
+  return ak.length === bk.length && ak.every((k) => Object.hasOwn(b as object, k) && jsonEqual((a as {[k:string]:Json})[k], (b as {[k:string]:Json})[k]));
+}
