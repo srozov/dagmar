@@ -116,7 +116,7 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
         const hasEquals = Object.hasOwn(clause, "equals");
         const hasIn = clause.in !== undefined;
         if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} when clause needs exactly one of equals or in`);
-        if (hasIn && (!Array.isArray(clause.in) || clause.in.length === 0)) throw new DagmarError("invalid_guard", `Task ${id} when in must be a non-empty array`);
+        if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} when in must be a non-empty array`);
         const ref = reference(clause.ref);
         if (!ref) throw new DagmarError("invalid_guard", `Task ${id} when ref must be a $tasks or $run reference`);
         if (ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);

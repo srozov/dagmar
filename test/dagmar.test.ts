@@ -1235,7 +1235,6 @@ test("scheduler cascades a skip through a guard referencing a skipped output", a
   await writeFile(
     script,
     `
-import {} from 'node:fs';
 const input=[]; for await (const c of process.stdin) input.push(c);
 const data=JSON.parse(input.join(''));
 console.log(JSON.stringify({outcome:'completed',message:'ok',output:{x:1,route:data.route ?? null}}));
