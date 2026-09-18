@@ -76,8 +76,8 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
   for (const [id, item] of Object.entries(raw.tasks)) {
     if (item.gate) {
       if (item.executor) throw new DagmarError("invalid_task", `Task ${id} cannot have both executor and gate`);
-      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined)
-        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, or outputSchema`);
+      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.loop !== undefined)
+        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, or loop`);
       if (typeof item.gate.prompt !== "string" || !item.gate.prompt.trim())
         throw new DagmarError("invalid_task", `Gate task ${id} requires a non-empty prompt`);
       if (item.gate.schema !== undefined) validateOutputSchema(item.gate.schema);
@@ -122,6 +122,13 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
         if (ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
       }
     }
+    if (task.loop !== undefined) {
+      const to = task.loop.to;
+      if (to === id) throw new DagmarError("invalid_loop", `Task ${id} loop.to cannot be itself`);
+      if (!tasks[to]) throw new DagmarError("invalid_loop", `Task ${id} loop.to ${to} is not a task`);
+      if (!task.dependsOn.includes(to)) throw new DagmarError("invalid_loop", `Task ${id} loop.to ${to} must be a direct dependency`);
+      if (!Number.isInteger(task.loop.maxVisits) || task.loop.maxVisits < 1) throw new DagmarError("invalid_loop", `Task ${id} loop.maxVisits must be an integer >= 1`);
+    }
     if (task.session?.mode === "continue") {
       const from = task.session.from;
       if (!task.dependsOn.includes(from)) throw new DagmarError("invalid_dependency", `Task ${id} continue from ${from} must be a dependency`);
@@ -131,6 +138,12 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
       const thisProfile = profiles[task.executor!]!;
       if (!sameAgent(thisProfile.run, sourceProfile.run)) throw new DagmarError("invalid_task", `Task ${id} continue must target the same agent`);
     }
+  }
+  // Enforce one source per target — only one task may loop back to a given target.
+  const loopTargets = new Set<string>();
+  for (const [sid, t] of Object.entries(tasks)) if (t.loop) {
+    if (loopTargets.has(t.loop.to)) throw new DagmarError("invalid_loop", `Task ${t.loop.to} is the target of more than one loop`);
+    loopTargets.add(t.loop.to);
   }
   const visiting = new Set<string>();
   const done = new Set<string>();
