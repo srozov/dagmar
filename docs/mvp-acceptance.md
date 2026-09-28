@@ -83,15 +83,13 @@ git -C "$DAGMAR" worktree add "$TARGET" -b claude/t6-acceptance-target main
 
 **Agent permissions.** `claude-agent-acp` asks before editing files or running commands; each ask
 parks the task as `awaiting_permission` until answered with `dagmar answer`. The builder profile sets
-`mode: acceptEdits` (see Config), so file edits go through without asking. Commands still ask; to
-pre-approve the test commands too, optionally allow them in the target only (agent-side config, not
-dagmar's):
-
-```bash
-mkdir -p "$TARGET/.claude" && cat > "$TARGET/.claude/settings.local.json" <<'EOF'
-{ "permissions": { "allow": ["Bash(pnpm test:*)", "Bash(pnpm check:*)", "Bash(pnpm build:*)"] } }
-EOF
-```
+`mode: acceptEdits` (see Config), so file edits go through without asking. The mode is only the
+baseline: the agent also honors the host's own Claude Code permission rules in `~/.claude/settings.json`
+(deny, then ask, then allow; ask and deny rules apply in every mode). On this host `Bash` is allowed
+and `Bash(rm *)` asks, so builder commands run without asking and an `rm` parks for `dagmar answer`.
+The reviewer keeps the default mode, so an edit by the reviewer would park as a permission ask. No
+settings file is written into the target: a target `.claude/settings*.json` would apply to every
+profile working in it.
 
 **Config** — `$T6/config.yaml` (machine-local, not committed):
 
