@@ -1,0 +1,95 @@
+# Review-iteration loop: implement → verify → fixup (bounded loop) → review → human gate → done/revise.
+#
+# Template for docs/mvp-acceptance.md. Before use, replace /ABSOLUTE/PATH/TO/dagmar with the
+# absolute path of this checkout, and define three executor profiles sharing one target `cwd`:
+#   builder  — ACP, model e.g. `default`
+#   reviewer — ACP, BYTE-IDENTICAL `run` to builder (same agent), different `model` e.g. `opus`
+#   check    — process
+#
+# Context passes through the builder's ACP session (fixup, review and revise continue it);
+# code passes through the shared working tree.
+id: review-iteration-loop
+tasks:
+  implement:
+    executor: builder
+    inputs: { task: $run.input.task }
+    prompt: |
+      Implement the task given in the inputs in this repository, including tests.
+      Keep a short note of your design decisions and anything you were unsure about,
+      and put it in your result's output as `notes`.
+    session: { mode: fresh }
+
+  verify:
+    executor: check
+    dependsOn: [implement]
+    inputs: {}
+    run: [node, /ABSOLUTE/PATH/TO/dagmar/examples/verify.example.mjs, pnpm, test]
+    outputSchema:
+      type: object
+      required: [passed]
+      properties: { passed: { type: boolean } }
+
+  # Loop source: runs while verify fails, re-arms verify, at most maxVisits completed fixups.
+  fixup:
+    executor: builder
+    dependsOn: [verify, implement]      # implement: required for `continue from implement`
+    inputs: { report: $tasks.verify.output }
+    prompt: |
+      Verification failed; the report is in the inputs. Fix the change so the checks pass.
+    session: { mode: continue, from: implement }
+    when: [{ ref: $tasks.verify.output.passed, equals: false }]
+    loop: { to: verify, maxVisits: 3 }
+
+  # Exit branch (held until the loop is final). The reviewer gets no builder notes in its
+  # prompt or inputs: anything it knows about the builder's reasoning comes from the session.
+  review:
+    executor: reviewer
+    dependsOn: [verify, implement]
+    inputs: {}
+    prompt: |
+      You are now the reviewer, not the builder. Review the change made in this session
+      (the files are in the working tree). In your output include `verdict`, `concerns`, and
+      `on_builder_notes`: which of the builder's stated design decisions or uncertainties you
+      agree or disagree with, and why.
+    session: { mode: continue, from: implement }
+    when: [{ ref: $tasks.verify.output.passed, equals: true }]
+
+  # Loop gave up without passing: end the run blocked, explicitly.
+  exhausted:
+    executor: check
+    dependsOn: [verify]
+    inputs: {}
+    run: [node, -e, "process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({outcome:'blocked',message:'verify still failing after maxVisits',output:{}})))"]
+    when: [{ ref: $tasks.verify.output.passed, equals: false }]
+
+  # Guarded on passed so a skipped review can never reach the human as "approve?".
+  gate:
+    dependsOn: [review, verify]
+    inputs: {}
+    when: [{ ref: $tasks.verify.output.passed, equals: true }]
+    gate:
+      prompt: "Approve the reviewed change, or revise it interactively with the builder?"
+      schema:
+        type: object
+        required: [decision]
+        properties: { decision: { enum: [approve, revise] } }
+
+  done:
+    executor: check
+    dependsOn: [gate]
+    inputs: {}
+    run: [node, -e, "process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({outcome:'completed',message:'approved',output:{}})))"]
+    when: [{ ref: $tasks.gate.output.decision, equals: approve }]
+
+  # Human-driven multi-turn: each agent reply parks as a `turn` interaction (dagmar pending /
+  # dagmar answer). Live-only: a daemon restart during revise fails it (executor_lost).
+  revise:
+    executor: builder
+    dependsOn: [gate, implement, review]   # review: its output is an input
+    inputs: { review: $tasks.review.output }
+    prompt: |
+      The change was not approved yet; the reviewer's assessment is in the inputs. Ask the user
+      what they want changed, discuss, and apply the changes. Finish only when the user is satisfied.
+    interactive: true
+    session: { mode: continue, from: implement }
+    when: [{ ref: $tasks.gate.output.decision, equals: revise }]
