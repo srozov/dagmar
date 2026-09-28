@@ -27,7 +27,7 @@ export async function loadConfig(path = DEFAULT_CONFIG): Promise<Config> {
     if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) fail(`Invalid executor name ${name}`);
     const p = object(raw, `executors.${name}`);
     if (p.type !== "process" && p.type !== "acp") fail(`Invalid executor type for ${name}`);
-    keys(p, p.type === "acp" ? ["type", "cwd", "run", "env"] : ["type", "cwd", "env"], `executors.${name}`);
+    keys(p, p.type === "acp" ? ["type", "cwd", "run", "env", "model", "mode"] : ["type", "cwd", "env"], `executors.${name}`);
     const env: Record<string, string> = {};
     for (const [key, value] of Object.entries(p.env === undefined ? {} : object(p.env, `${name}.env`))) {
       if (!key || key.includes("=") || typeof value !== "string") fail(`Invalid environment for ${name}`);
@@ -35,6 +35,14 @@ export async function loadConfig(path = DEFAULT_CONFIG): Promise<Config> {
     }
     const profile: ExecutorProfile = { type: p.type, cwd: absolute(p.cwd, `${name}.cwd`), env };
     if (p.type === "acp") profile.run = argv(p.run, `${name}.run`);
+    if (p.model !== undefined) {
+      if (typeof p.model !== "string" || !p.model) fail(`${name}.model must be a non-empty string`);
+      profile.model = p.model;
+    }
+    if (p.mode !== undefined) {
+      if (typeof p.mode !== "string" || !p.mode) fail(`${name}.mode must be a non-empty string`);
+      profile.mode = p.mode;
+    }
     executors[name] = profile;
   }
   return { workflowDir, storageDir, listen: { host: listen.host, port: listen.port as number }, executors };

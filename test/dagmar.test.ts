@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createServer } from "node:net";
 import test from "node:test";
 import { stringify } from "yaml";
+import { loadConfig } from "../src/config.js";
 import { startDaemon } from "../src/daemon.js";
 import { AcpExecutor } from "../src/executors/acp.js";
 import { ProcessExecutor } from "../src/executors/process.js";
@@ -502,6 +503,167 @@ if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1
   assert.ok("error" in settled, "expected a failed settlement, not a crash");
   assert.equal("error" in settled && settled.error.code, "acp_load_unsupported");
   assert.ok(records.some((r) => (r as { type?: string; event?: string }).type === "lifecycle" && (r as { event?: string }).event === "acp_load_unsupported"));
+});
+
+// Profile model selection: the fake agent advertises `configOptions` on session/new and
+// session/load; `apply: false` makes it acknowledge set_config_option without switching.
+const MODEL_OPTION = { id: "model", name: "Model", category: "model", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] };
+async function modelAgent(prefix: string, configOptions: unknown, apply = true): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+const options=${JSON.stringify(configOptions)};
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'m-1',...(options?{configOptions:options}:{})}});
+if(m.method==='session/load')send({jsonrpc:'2.0',id:m.id,result:options?{configOptions:options}:{}});
+if(m.method==='session/set_config_option')send({jsonrpc:'2.0',id:m.id,result:{configOptions:options.map(o=>o.id===m.params.configId&&${apply}?{...o,currentValue:m.params.value}:o)}});
+if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',params:{sessionId:m.params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'{"outcome":"completed","message":"ok","output":{}}'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  return { root, script };
+}
+async function runModelAgent(root: string, script: string, extra: Partial<AcpRequest>): Promise<{ settled: Settlement; records: unknown[]; sent: Array<{ method?: string; params?: Record<string, unknown> }> }> {
+  const records: unknown[] = [];
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_m", taskRunId: "tr_m", taskId: "m", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...extra }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const settled = await execution.done;
+  const sent = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: Record<string, unknown> } }).message);
+  return { settled, records, sent };
+}
+
+test("AcpExecutor selects the profile model via session/set_config_option before prompting", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-model-", [MODEL_OPTION]);
+  const { settled, records, sent } = await runModelAgent(root, script, { model: "opus" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.indexOf("session/set_config_option") > methods.indexOf("session/new"));
+  assert.ok(methods.indexOf("session/set_config_option") < methods.indexOf("session/prompt"));
+  const set = sent.find((m) => m.method === "session/set_config_option")!;
+  assert.equal(set.params?.configId, "model");
+  assert.equal(set.params?.value, "opus");
+  assert.ok(records.some((r) => (r as { event?: string }).event === "acp_model_selected"));
+});
+
+test("AcpExecutor re-applies the profile model after session/load (grouped options)", async () => {
+  const grouped = { ...MODEL_OPTION, options: [{ group: "claude", name: "Claude", options: MODEL_OPTION.options }] };
+  const { root, script } = await modelAgent("dagmar-acp-model-load-", [grouped]);
+  const { settled, sent } = await runModelAgent(root, script, { model: "sonnet", loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.indexOf("session/set_config_option") > methods.indexOf("session/load"));
+  assert.equal(sent.find((m) => m.method === "session/set_config_option")?.params?.value, "sonnet");
+});
+
+test("AcpExecutor skips set_config_option when the profile model is already current", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-model-current-", [MODEL_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { model: "default" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.ok(!sent.some((m) => m.method === "session/set_config_option"));
+});
+
+test("AcpExecutor fails with acp_model_unknown for a model the agent does not offer", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-model-unknown-", [MODEL_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { model: "claude-3-opus-latest" });
+  assert.equal("error" in settled && settled.error.code, "acp_model_unknown");
+  assert.match("error" in settled ? settled.error.message : "", /available: default, sonnet, opus/);
+  assert.ok(!sent.some((m) => m.method === "session/set_config_option" || m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_model_unsupported when the agent has no model selector", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-model-none-", null);
+  const { settled, sent } = await runModelAgent(root, script, { model: "opus" });
+  assert.equal("error" in settled && settled.error.code, "acp_model_unsupported");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_model_not_applied when the agent does not switch", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-model-ignored-", [MODEL_OPTION], false);
+  const { settled, sent } = await runModelAgent(root, script, { model: "opus" });
+  assert.equal("error" in settled && settled.error.code, "acp_model_not_applied");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+test("scheduler forwards the executor profile's model and mode on the ACP request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-model-fwd-"));
+  const workflowDir = join(root, "workflows");
+  await mkdir(workflowDir, { recursive: true });
+  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
+  const profiles: Config["executors"] = { reviewer: { type: "acp", cwd: root, env: {}, run: ["unused"], model: "opus", mode: "plan" } };
+  const captured = { request: undefined as AcpRequest | undefined };
+  const stub = new StubAcpExecutor(async (request) => { captured.request = request; return { result: { outcome: "completed", message: "a", output: {} } }; });
+  const store = new Store(":memory:");
+  const scheduler = new Scheduler(store, new Transcripts(join(root, "state")), new WorkflowRepository(workflowDir, profiles), new EventBus(), profiles, { process: new ProcessExecutor(), acp: stub });
+  const started = await scheduler.start("fwd", {});
+  await waitFor(scheduler, started.workflowRunId, "completed");
+  assert.equal(captured.request?.model, "opus");
+  assert.equal(captured.request?.mode, "plan");
+  store.close();
+});
+
+test("loadConfig accepts model on ACP profiles only and rejects an empty model", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-config-model-"));
+  let n = 0;
+  const write = async (executors: object) => { const path = join(root, `config-${++n}.yaml`); await writeFile(path, stringify({ workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 }, executors })); return path; };
+  const config = await loadConfig(await write({ reviewer: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, model: "opus" } }));
+  assert.equal(config.executors.reviewer!.model, "opus");
+  await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, model: "opus" } })), /unknown field model/);
+  await assert.rejects(loadConfig(await write({ reviewer: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, model: "" } })), /model must be a non-empty string/);
+});
+
+test("loadConfig accepts mode on ACP profiles only and rejects an empty mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-config-mode-"));
+  let n = 0;
+  const write = async (executors: object) => { const path = join(root, `config-${++n}.yaml`); await writeFile(path, stringify({ workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 }, executors })); return path; };
+  const config = await loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "acceptEdits" } }));
+  assert.equal(config.executors.builder!.mode, "acceptEdits");
+  await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, mode: "acceptEdits" } })), /unknown field mode/);
+  await assert.rejects(loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "" } })), /mode must be a non-empty string/);
+});
+
+// Profile mode selection reuses the model fake agent with a "mode" config option.
+const MODE_OPTION = { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "acceptEdits", name: "Accept edits" }, { value: "plan", name: "Plan" }] };
+
+test("AcpExecutor selects the profile mode after the model, before prompting", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-", [MODEL_OPTION, MODE_OPTION]);
+  const { settled, records, sent } = await runModelAgent(root, script, { model: "opus", mode: "acceptEdits" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const sets = sent.filter((m) => m.method === "session/set_config_option").map((m) => [m.params?.configId, m.params?.value]);
+  assert.deepEqual(sets, [["model", "opus"], ["mode", "acceptEdits"]]);
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.lastIndexOf("session/set_config_option") < methods.indexOf("session/prompt"));
+  assert.ok(records.some((r) => (r as { event?: string; data?: { mode?: string } }).event === "acp_mode_selected" && (r as { data?: { mode?: string } }).data?.mode === "acceptEdits"));
+});
+
+test("AcpExecutor re-applies the profile mode after session/load", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-load-", [MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "plan", loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.indexOf("session/set_config_option") > methods.indexOf("session/load"));
+  assert.equal(sent.find((m) => m.method === "session/set_config_option")?.params?.value, "plan");
+});
+
+test("AcpExecutor fails with acp_mode_unknown for a mode the agent does not offer", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-unknown-", [MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "dontAsk" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_unknown");
+  assert.match("error" in settled ? settled.error.message : "", /available: default, acceptEdits, plan/);
+  assert.ok(!sent.some((m) => m.method === "session/set_config_option" || m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_mode_unsupported when the agent has no mode selector", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-none-", [MODEL_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "acceptEdits" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_unsupported");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_mode_not_applied when the agent does not switch", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-ignored-", [MODE_OPTION], false);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "plan" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_not_applied");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
 // T1 (continuation_unavailable): when the source task completes without persisting an
