@@ -559,6 +559,50 @@ test("validateWorkflow accepts interactive on ACP tasks and rejects it on proces
   );
 });
 
+// A tool-using agent sends several messages in one turn (progress notes, then the answer), each
+// tagged with an ACP messageId. The executor parses only the last message. `chunks` is the list of
+// [messageId | null, text] the fake agent streams for its single prompt.
+async function messagesAgent(prefix: string, chunks: Array<[string | null, string]>): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+const chunks=${JSON.stringify(chunks)};
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'m-1'}});
+if(m.method==='session/prompt'){for(const [id,text] of chunks)send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'m-1',update:{sessionUpdate:'agent_message_chunk',...(id?{messageId:id}:{}),content:{type:'text',text}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  return { root, script };
+}
+async function runMessagesAgent(root: string, script: string, interactive: boolean): Promise<{ settled: Settlement; turns: number }> {
+  let turns = 0;
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_msg", taskRunId: "tr_msg", taskId: "msg", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(interactive ? { interactive: true } : {}) }, { transcript: async () => 1, session: async () => undefined, interact: async () => { turns++; throw new Error("unexpected turn"); } });
+  return { settled: await execution.done, turns };
+}
+const ENVELOPE_PARTS = ['{"outcome":"completed",', '"message":"ok","output":{"n":1}}'];
+
+test("AcpExecutor parses only the turn's last agent message as the result", async () => {
+  const { root, script } = await messagesAgent("dagmar-acp-msgs-", [["m1", "Reading files."], ["m2", "Exit 0. Committing."], ["m3", ENVELOPE_PARTS[0]!], ["m3", ENVELOPE_PARTS[1]!]]);
+  const { settled } = await runMessagesAgent(root, script, false);
+  assert.ok("result" in settled, `expected a result, got ${JSON.stringify(settled)}`);
+  assert.deepEqual(settled.result.output, { n: 1 });
+});
+
+test("an interactive task completes when its last message is the envelope after progress notes", async () => {
+  const { root, script } = await messagesAgent("dagmar-acp-msgs-int-", [["m1", "Let me check the tests."], ["m2", ENVELOPE_PARTS.join("")]]);
+  const { settled, turns } = await runMessagesAgent(root, script, true);
+  assert.equal(turns, 0, "a final envelope must not be delivered to the user as a turn");
+  assert.ok("result" in settled && settled.result.message === "ok");
+});
+
+test("chunks without a messageId still accumulate, so prose before the envelope fails", async () => {
+  const { root, script } = await messagesAgent("dagmar-acp-msgs-noid-", [[null, "Reading files."], [null, ENVELOPE_PARTS.join("")]]);
+  const { settled } = await runMessagesAgent(root, script, false);
+  assert.equal("error" in settled && settled.error.code, "acp_failed");
+});
+
 // T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session
 // when request.interactive === true. Turn 1 is conversational ("need input"); turn 2
 // emits the envelope. The same agent connection takes both turns (two session/prompt
