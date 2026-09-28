@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
-import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionNotification } from "@agentclientprotocol/sdk";
+import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionConfigOption, type SessionNotification } from "@agentclientprotocol/sdk";
 import { isEnvelope, validateResult } from "../result.js";
 import type { Json, JsonObject, TaskError } from "../types.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "./types.js";
@@ -108,6 +108,7 @@ class Attempt {
         throw new Error("ACP protocol version is unsupported");
       }
       this.supportsClose = initialized.agentCapabilities?.sessionCapabilities?.close != null;
+      let configOptions: SessionConfigOption[] | null | undefined;
       if (this.request.loadSessionId) {
         // The capability is top-level (not under sessionCapabilities), contrast with close.
         const supportsLoad = initialized.agentCapabilities?.loadSession === true;
@@ -122,20 +123,30 @@ class Attempt {
           // is the contract for non-throwing executor failures.
           return { error: { code: "acp_load_unsupported", message: "ACP agent does not advertise loadSession" } };
         }
-        await this.agent.request(methods.agent.session.load, {
+        const loaded = await this.agent.request(methods.agent.session.load, {
           sessionId: this.request.loadSessionId,
           cwd: this.request.cwd,
           mcpServers: [],
         });
         this.sessionId = this.request.loadSessionId;
+        configOptions = loaded.configOptions;
       } else {
         const session = await this.agent.request(methods.agent.session.new, {
           cwd: this.request.cwd,
           mcpServers: [],
         });
         this.sessionId = session.sessionId;
+        configOptions = session.configOptions;
       }
       await this.hooks.session(this.sessionId);
+      if (this.request.model !== undefined) {
+        const error = await this.selectOption("model", this.request.model, configOptions);
+        if (error) return { error };
+      }
+      if (this.request.mode !== undefined) {
+        const error = await this.selectOption("mode", this.request.mode, configOptions);
+        if (error) return { error };
+      }
       // First turn: append the contract the agent must follow. Interactive tasks get the
       // multi-turn contract; non-interactive tasks get the single-shot envelope contract.
       let turnText = this.request.interactive
@@ -213,6 +224,34 @@ class Attempt {
     } finally {
       await this.cleanup(false);
     }
+  }
+
+  // The profile's model and mode are applied through the agent's ACP config option of that
+  // category ("model" / "mode"), on every new or loaded session, so a continuing task runs with its
+  // own profile's settings. The value must be one the agent advertises, exactly: agents may
+  // fuzzy-match or silently keep a default for an unknown value, so dagmar fails fast instead.
+  private async selectOption(category: "model" | "mode", value: string, options: SessionConfigOption[] | null | undefined): Promise<TaskError | undefined> {
+    const option = options?.find((o) => o.category === category);
+    if (!option || option.type !== "select") {
+      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${category} ${value}` };
+    }
+    const values = option.options.flatMap((o) => ("group" in o ? o.options : [o])).map((o) => o.value);
+    if (!values.includes(value)) {
+      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${category} ${value}; available: ${values.join(", ")}` };
+    }
+    if (option.currentValue !== value) {
+      const set = await this.agent!.request(methods.agent.session.setConfigOption, {
+        sessionId: this.sessionId!,
+        configId: option.id,
+        value,
+      });
+      const current = set.configOptions.find((o) => o.id === option.id)?.currentValue;
+      if (current !== value) {
+        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${category} ${value} (current: ${String(current)})` };
+      }
+    }
+    await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: `acp_${category}_selected`, data: { [category]: value } });
+    return undefined;
   }
 
   private update(params: SessionNotification): void {
