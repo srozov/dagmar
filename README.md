@@ -61,6 +61,8 @@ executors:
 
 All directory paths must be absolute. The server accepts only the loopback hosts `127.0.0.1` and `::1`. Each executor profile provides its working directory and environment overrides; ACP profiles also require the command used to start their agent.
 
+An ACP profile may also set `model`. Dagmar applies it through the agent's ACP model selector (`session/set_config_option`) on every new or loaded session, and fails the attempt if the agent has no model selector (`acp_model_unsupported`), does not offer that exact value (`acp_model_unknown`, the error lists the offered values), or does not switch (`acp_model_not_applied`). Two profiles with the same `run` and different `model` are the same agent, so one can `continue` the other's session.
+
 ## Define a workflow
 
 Place YAML files in `workflowDir`. A workflow has a unique ID and a non-empty mapping of task IDs to tasks:
