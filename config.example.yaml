@@ -38,6 +38,12 @@ executors:
     # checks (acp_mode_unknown lists the offered values). For claude-agent-acp this is the
     # permission mode; 0.84.0 offers default, acceptEdits, plan, auto and bypassPermissions.
     # mode: acceptEdits
+    # To route one profile to another Anthropic-compatible provider, set it in this profile's
+    # `env` (the agent passes it on to Claude Code), not in a settings file in the working
+    # directory, which would apply to every profile using that directory:
+    #   env: { ANTHROPIC_BASE_URL: https://provider.example/anthropic, ANTHROPIC_AUTH_TOKEN: <key> }
+    # An `env` block in a Claude settings file overrides this env. Check the model values the
+    # agent offers under that provider (scratchpad/probe-acp-agent.mjs) before setting `model`.
 
   openclaw-acp:
     type: acp
