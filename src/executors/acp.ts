@@ -39,6 +39,7 @@ class Attempt {
   private sessionId?: string;
   private supportsClose = false;
   private text = "";
+  private messageId?: string;
   private cancelled = false;
   private cancelPromise?: Promise<void>;
   private cleanupPromise?: Promise<void>;
@@ -220,6 +221,13 @@ class Attempt {
     }
     const update = params.update;
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+      // A tool-using agent sends several messages per turn (progress notes between tool calls,
+      // then the answer). ACP tags each with a messageId; keep only the latest message so the
+      // result is parsed from the turn's final message. Chunks without an id accumulate as before.
+      if (update.messageId && update.messageId !== this.messageId) {
+        this.text = "";
+        this.messageId = update.messageId;
+      }
       this.text += update.content.text;
     }
   }
