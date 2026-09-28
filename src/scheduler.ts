@@ -258,7 +258,7 @@ export class Scheduler {
       }
       const request = profile.type === "process"
         ? { ...common, type: "process" as const, run: task.run! }
-        : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}), ...(task.interactive ? { interactive: true } : {}) };
+        : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}), ...(task.interactive ? { interactive: true } : {}), ...(profile.model ? { model: profile.model } : {}) };
       return { row: { ...base, executorType: profile.type, status: "running", error: null, endedAt: null }, request };
     } catch (error) {
       // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, executor_unavailable),
