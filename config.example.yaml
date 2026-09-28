@@ -30,8 +30,9 @@ executors:
     env: {}
     # Optional: the model, applied via the agent's ACP model selector. Must be a value the
     # agent offers exactly — the list depends on the adapter version and account (claude-agent-acp
-    # 0.55.0 offered: default = Sonnet 4.6, opus, haiku, and sonnet[1m], which needs extra-usage
-    # credits). An unknown value fails the task with acp_model_unknown, listing the offered values.
+    # 0.84.0 offered: default = opus = Opus 5.5, sonnet = Sonnet 5.5, haiku, and pinned IDs such as
+    # claude-fable-5-1 and claude-sonnet-5). An unknown value fails the task with acp_model_unknown,
+    # listing the offered values.
     # model: opus
     # Optional: the mode, applied via the agent's ACP mode selector with the same exact-value
     # checks (acp_mode_unknown lists the offered values). For claude-agent-acp this is the

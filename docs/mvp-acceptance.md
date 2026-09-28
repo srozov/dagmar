@@ -37,8 +37,10 @@ implement ─► verify ─┬─ passed=false ─► fixup ──(loop, maxVisi
   same agent, and dagmar compares the `run` argv exactly. Select the model with the profile's `model`
   field, never with an argv flag.
 - **`model` must be a value the agent offers, exactly.** Otherwise the task fails with
-  `acp_model_unknown`, which lists the valid values. With `claude-agent-acp` 0.55.0 on this account:
-  `default` (Sonnet 4.6), `opus` (Opus 4.7), `haiku`; `sonnet[1m]` fails without extra-usage credits.
+  `acp_model_unknown`, which lists the valid values. With `claude-agent-acp` 0.84.0 on this account:
+  `default` (Opus 5.5), `opus` (Opus 5.5), `sonnet` (Sonnet 5.5), `haiku` (Haiku 4.5), plus pinned
+  IDs such as `claude-fable-5-1`, `claude-sonnet-5` and `claude-opus-4-8`. `default` and `opus` are the
+  same model, so the builder uses `sonnet` to keep the reviewer a different model.
 - **All three profiles share one `cwd`**, the target repo, or verify and review won't see the builder's
   files.
 - **`revise` is live-only.** Restarting the daemon during `revise` fails it (`executor_lost`); that is
@@ -48,7 +50,7 @@ implement ─► verify ─┬─ passed=false ─► fixup ──(loop, maxVisi
 
 ## Setup
 
-Prerequisites: Node 24, `pnpm`, an installed and authenticated `claude-agent-acp`, and dagmar built
+Prerequisites: Node 24, `pnpm`, an authenticated `claude-agent-acp` 0.84.0, and dagmar built
 from a branch that has the profile `model` field (`pnpm install --frozen-lockfile && pnpm build`).
 
 ```bash
@@ -57,6 +59,19 @@ T6=$HOME/.local/state/dagmar-t6                 # acceptance config, workflows, 
 TARGET=/absolute/path/to/target-worktree        # repo the agents will change
 mkdir -p "$T6/workflows" "$T6/state"
 ```
+
+**Agent.** `claude-agent-acp` is pinned in its own install outside the repo (not global, not a
+dagmar dependency); it reuses the host's Claude login (`~/.claude`):
+
+```bash
+mkdir -p ~/.local/share/dagmar-agents && cd ~/.local/share/dagmar-agents
+echo '{"private":true,"dependencies":{"@agentclientprotocol/claude-agent-acp":"0.84.0"}}' > package.json
+pnpm install
+node "$DAGMAR/scratchpad/probe-acp-agent.mjs" --agent "$PWD/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+```
+
+The probe prints the protocol version (must match dagmar's), `loadSession: true`, and the offered
+model values.
 
 **Target repo.** A git worktree with a working `pnpm test`. Confirm the baseline is green before
 starting (a red baseline makes verify meaningless):
@@ -86,13 +101,13 @@ executors:
   builder:
     type: acp
     cwd: /absolute/path/to/target-worktree
-    run: [node, /home/agi01/clawdbot/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
+    run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
     env: {}
-    model: default
+    model: sonnet
   reviewer:
     type: acp
     cwd: /absolute/path/to/target-worktree
-    run: [node, /home/agi01/clawdbot/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
+    run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
     env: {}
     model: opus
   check:
@@ -130,7 +145,7 @@ dagmar transcript <taskRunId>                         # full ACP / process traff
 What to check while it runs:
 
 - Every ACP attempt's transcript has an `acp_model_selected` event with the expected model (builder
-  `default`, reviewer `opus`).
+  `sonnet`, reviewer `opus`).
 - `fixup` and `review` transcripts show `session/load` with `implement`'s session id (the
   `acpSessionId` on implement's attempt in `dagmar status`).
 - `verify` attempts alternate with `fixup` attempts while the tests fail.
