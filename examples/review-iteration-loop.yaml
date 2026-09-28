@@ -2,8 +2,10 @@
 #
 # Template for docs/mvp-acceptance.md. Before use, replace /ABSOLUTE/PATH/TO/dagmar with the
 # absolute path of this checkout, and define three executor profiles sharing one target `cwd`:
-#   builder  — ACP, model e.g. `default`
-#   reviewer — ACP, BYTE-IDENTICAL `run` to builder (same agent), different `model` e.g. `opus`
+#   builder  — ACP, `model: sonnet`, `mode: acceptEdits` (edits without permission asks)
+#   reviewer — ACP, BYTE-IDENTICAL `run` to builder (same agent), a different model: `model: opus`,
+#              `mode: default` (on claude-agent-acp 0.84.0 `default` is also Opus, so don't use it
+#              as the builder's model)
 #   check    — process
 #
 # Context passes through the builder's ACP session (fixup, review and revise continue it);

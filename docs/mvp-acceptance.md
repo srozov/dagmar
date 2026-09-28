@@ -87,7 +87,9 @@ parks the task as `awaiting_permission` until answered with `dagmar answer`. The
 baseline: the agent also honors the host's own Claude Code permission rules in `~/.claude/settings.json`
 (deny, then ask, then allow; ask and deny rules apply in every mode). On this host `Bash` is allowed
 and `Bash(rm *)` asks, so builder commands run without asking and an `rm` parks for `dagmar answer`.
-The reviewer keeps the default mode, so an edit by the reviewer would park as a permission ask. No
+The reviewer pins `mode: default`, so an edit by the reviewer would park as a permission ask. (Each
+attempt is a fresh agent process, and a loaded session starts in the host's `defaultMode`, not the
+builder's mode; pinning it keeps the reviewer independent of host settings.) No
 settings file is written into the target: a target `.claude/settings*.json` would apply to every
 profile working in it.
 
@@ -111,6 +113,7 @@ executors:
     run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
     env: {}
     model: opus
+    mode: default
   check:
     type: process
     cwd: /absolute/path/to/target-worktree
@@ -146,7 +149,8 @@ dagmar transcript <taskRunId>                         # full ACP / process traff
 What to check while it runs:
 
 - Every ACP attempt's transcript has an `acp_model_selected` event with the expected model (builder
-  `sonnet`, reviewer `opus`); builder attempts also have `acp_mode_selected` (`acceptEdits`).
+  `sonnet`, reviewer `opus`) and an `acp_mode_selected` event (builder `acceptEdits`, reviewer
+  `default`).
 - `fixup` and `review` transcripts show `session/load` with `implement`'s session id (the
   `acpSessionId` on implement's attempt in `dagmar status`).
 - `verify` attempts alternate with `fixup` attempts while the tests fail.
