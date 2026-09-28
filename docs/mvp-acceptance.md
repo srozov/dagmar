@@ -81,13 +81,15 @@ git -C "$DAGMAR" worktree add "$TARGET" -b claude/t6-acceptance-target main
 (cd "$TARGET" && pnpm install --frozen-lockfile && pnpm test)
 ```
 
-**Agent permissions (optional).** `claude-agent-acp` asks before editing files or running commands;
-each ask parks the task as `awaiting_permission` until answered with `dagmar answer`. To reduce the
-asks, give the agent its own settings in the target only (agent-side config, not dagmar's):
+**Agent permissions.** `claude-agent-acp` asks before editing files or running commands; each ask
+parks the task as `awaiting_permission` until answered with `dagmar answer`. The builder profile sets
+`mode: acceptEdits` (see Config), so file edits go through without asking. Commands still ask; to
+pre-approve the test commands too, optionally allow them in the target only (agent-side config, not
+dagmar's):
 
 ```bash
 mkdir -p "$TARGET/.claude" && cat > "$TARGET/.claude/settings.local.json" <<'EOF'
-{ "permissions": { "defaultMode": "acceptEdits", "allow": ["Bash(pnpm test:*)", "Bash(pnpm check:*)", "Bash(pnpm build:*)"] } }
+{ "permissions": { "allow": ["Bash(pnpm test:*)", "Bash(pnpm check:*)", "Bash(pnpm build:*)"] } }
 EOF
 ```
 
@@ -104,6 +106,7 @@ executors:
     run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
     env: {}
     model: sonnet
+    mode: acceptEdits
   reviewer:
     type: acp
     cwd: /absolute/path/to/target-worktree
@@ -145,7 +148,7 @@ dagmar transcript <taskRunId>                         # full ACP / process traff
 What to check while it runs:
 
 - Every ACP attempt's transcript has an `acp_model_selected` event with the expected model (builder
-  `sonnet`, reviewer `opus`).
+  `sonnet`, reviewer `opus`); builder attempts also have `acp_mode_selected` (`acceptEdits`).
 - `fixup` and `review` transcripts show `session/load` with `implement`'s session id (the
   `acpSessionId` on implement's attempt in `dagmar status`).
 - `verify` attempts alternate with `fixup` attempts while the tests fail.
@@ -202,6 +205,7 @@ Check: the new fixup attempt still loads `implement`'s session; completed fixup 
 |---|---|
 | `acp_model_unknown` | `model` not offered by the agent; the message lists valid values |
 | `acp_model_unsupported` / `acp_model_not_applied` | agent has no model selector / didn't switch |
+| `acp_mode_unknown` / `acp_mode_unsupported` / `acp_mode_not_applied` | the same checks for the profile's `mode` |
 | `acp_load_unsupported` | agent can't `session/load`, so it can't continue a session |
 | `acp_authentication_required` | authenticate `claude-agent-acp` out-of-band |
 | `continuation_unavailable` | the source task has no persisted session id |
