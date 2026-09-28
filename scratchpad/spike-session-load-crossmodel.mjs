@@ -41,7 +41,7 @@ if (!agent) throw new Error("Usage: node scratchpad/spike-session-load-crossmode
 
 const TOKEN = `t1smoke-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const cwd = process.cwd();
-const builderModel = process.env.BUILDER_MODEL ?? "default";
+const builderModel = process.env.BUILDER_MODEL ?? "sonnet";
 const reviewerModel = process.env.REVIEWER_MODEL ?? "opus";
 const run = agent.endsWith(".js") ? [process.execPath, agent] : [agent];
 const models = {};
