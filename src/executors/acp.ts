@@ -139,7 +139,11 @@ class Attempt {
       }
       await this.hooks.session(this.sessionId);
       if (this.request.model !== undefined) {
-        const error = await this.selectModel(this.request.model, configOptions);
+        const error = await this.selectOption("model", this.request.model, configOptions);
+        if (error) return { error };
+      }
+      if (this.request.mode !== undefined) {
+        const error = await this.selectOption("mode", this.request.mode, configOptions);
         if (error) return { error };
       }
       // First turn: append the contract the agent must follow. Interactive tasks get the
@@ -221,31 +225,31 @@ class Attempt {
     }
   }
 
-  // The profile's model is applied through the agent's ACP model selector (the config option with
-  // category "model"), on every new or loaded session, so a continuing task runs on its own
-  // profile's model. The value must be one the agent advertises, exactly: agents may fuzzy-match
-  // or silently keep a default for an unknown value, so dagmar fails fast instead.
-  private async selectModel(model: string, options: SessionConfigOption[] | null | undefined): Promise<TaskError | undefined> {
-    const option = options?.find((o) => o.category === "model");
+  // The profile's model and mode are applied through the agent's ACP config option of that
+  // category ("model" / "mode"), on every new or loaded session, so a continuing task runs with its
+  // own profile's settings. The value must be one the agent advertises, exactly: agents may
+  // fuzzy-match or silently keep a default for an unknown value, so dagmar fails fast instead.
+  private async selectOption(category: "model" | "mode", value: string, options: SessionConfigOption[] | null | undefined): Promise<TaskError | undefined> {
+    const option = options?.find((o) => o.category === category);
     if (!option || option.type !== "select") {
-      return { code: "acp_model_unsupported", message: `ACP agent does not advertise a model selector; cannot select model ${model}` };
+      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${category} ${value}` };
     }
     const values = option.options.flatMap((o) => ("group" in o ? o.options : [o])).map((o) => o.value);
-    if (!values.includes(model)) {
-      return { code: "acp_model_unknown", message: `ACP agent does not offer model ${model}; available: ${values.join(", ")}` };
+    if (!values.includes(value)) {
+      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${category} ${value}; available: ${values.join(", ")}` };
     }
-    if (option.currentValue !== model) {
+    if (option.currentValue !== value) {
       const set = await this.agent!.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionId!,
         configId: option.id,
-        value: model,
+        value,
       });
       const current = set.configOptions.find((o) => o.id === option.id)?.currentValue;
-      if (current !== model) {
-        return { code: "acp_model_not_applied", message: `ACP agent did not apply model ${model} (current: ${String(current)})` };
+      if (current !== value) {
+        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${category} ${value} (current: ${String(current)})` };
       }
     }
-    await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_model_selected", data: { model } });
+    await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: `acp_${category}_selected`, data: { [category]: value } });
     return undefined;
   }
 

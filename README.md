@@ -63,6 +63,8 @@ All directory paths must be absolute. The server accepts only the loopback hosts
 
 An ACP profile may also set `model`. Dagmar applies it through the agent's ACP model selector (`session/set_config_option`) on every new or loaded session, and fails the attempt if the agent has no model selector (`acp_model_unsupported`), does not offer that exact value (`acp_model_unknown`, the error lists the offered values), or does not switch (`acp_model_not_applied`). Two profiles with the same `run` and different `model` are the same agent, so one can `continue` the other's session.
 
+An ACP profile may likewise set `mode`, applied the same way through the agent's ACP mode selector (the config option with category `mode`), failing with `acp_mode_unsupported`, `acp_mode_unknown` or `acp_mode_not_applied`. For `claude-agent-acp` the mode is its permission mode (for example `acceptEdits` accepts file edits without asking). Profiles that differ only in `model` or `mode` are still the same agent.
+
 ## Define a workflow
 
 Place YAML files in `workflowDir`. A workflow has a unique ID and a non-empty mapping of task IDs to tasks:

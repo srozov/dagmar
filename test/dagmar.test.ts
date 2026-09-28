@@ -584,12 +584,12 @@ test("AcpExecutor fails with acp_model_not_applied when the agent does not switc
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
-test("scheduler forwards the executor profile's model on the ACP request", async () => {
+test("scheduler forwards the executor profile's model and mode on the ACP request", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-model-fwd-"));
   const workflowDir = join(root, "workflows");
   await mkdir(workflowDir, { recursive: true });
   await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
-  const profiles: Config["executors"] = { reviewer: { type: "acp", cwd: root, env: {}, run: ["unused"], model: "opus" } };
+  const profiles: Config["executors"] = { reviewer: { type: "acp", cwd: root, env: {}, run: ["unused"], model: "opus", mode: "plan" } };
   const captured = { request: undefined as AcpRequest | undefined };
   const stub = new StubAcpExecutor(async (request) => { captured.request = request; return { result: { outcome: "completed", message: "a", output: {} } }; });
   const store = new Store(":memory:");
@@ -597,6 +597,7 @@ test("scheduler forwards the executor profile's model on the ACP request", async
   const started = await scheduler.start("fwd", {});
   await waitFor(scheduler, started.workflowRunId, "completed");
   assert.equal(captured.request?.model, "opus");
+  assert.equal(captured.request?.mode, "plan");
   store.close();
 });
 
@@ -608,6 +609,61 @@ test("loadConfig accepts model on ACP profiles only and rejects an empty model",
   assert.equal(config.executors.reviewer!.model, "opus");
   await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, model: "opus" } })), /unknown field model/);
   await assert.rejects(loadConfig(await write({ reviewer: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, model: "" } })), /model must be a non-empty string/);
+});
+
+test("loadConfig accepts mode on ACP profiles only and rejects an empty mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-config-mode-"));
+  let n = 0;
+  const write = async (executors: object) => { const path = join(root, `config-${++n}.yaml`); await writeFile(path, stringify({ workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 }, executors })); return path; };
+  const config = await loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "acceptEdits" } }));
+  assert.equal(config.executors.builder!.mode, "acceptEdits");
+  await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, mode: "acceptEdits" } })), /unknown field mode/);
+  await assert.rejects(loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "" } })), /mode must be a non-empty string/);
+});
+
+// Profile mode selection reuses the model fake agent with a "mode" config option.
+const MODE_OPTION = { id: "mode", name: "Mode", category: "mode", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "acceptEdits", name: "Accept edits" }, { value: "plan", name: "Plan" }] };
+
+test("AcpExecutor selects the profile mode after the model, before prompting", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-", [MODEL_OPTION, MODE_OPTION]);
+  const { settled, records, sent } = await runModelAgent(root, script, { model: "opus", mode: "acceptEdits" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const sets = sent.filter((m) => m.method === "session/set_config_option").map((m) => [m.params?.configId, m.params?.value]);
+  assert.deepEqual(sets, [["model", "opus"], ["mode", "acceptEdits"]]);
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.lastIndexOf("session/set_config_option") < methods.indexOf("session/prompt"));
+  assert.ok(records.some((r) => (r as { event?: string; data?: { mode?: string } }).event === "acp_mode_selected" && (r as { data?: { mode?: string } }).data?.mode === "acceptEdits"));
+});
+
+test("AcpExecutor re-applies the profile mode after session/load", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-load-", [MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "plan", loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.indexOf("session/set_config_option") > methods.indexOf("session/load"));
+  assert.equal(sent.find((m) => m.method === "session/set_config_option")?.params?.value, "plan");
+});
+
+test("AcpExecutor fails with acp_mode_unknown for a mode the agent does not offer", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-unknown-", [MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "dontAsk" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_unknown");
+  assert.match("error" in settled ? settled.error.message : "", /available: default, acceptEdits, plan/);
+  assert.ok(!sent.some((m) => m.method === "session/set_config_option" || m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_mode_unsupported when the agent has no mode selector", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-none-", [MODEL_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "acceptEdits" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_unsupported");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_mode_not_applied when the agent does not switch", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-mode-ignored-", [MODE_OPTION], false);
+  const { settled, sent } = await runModelAgent(root, script, { mode: "plan" });
+  assert.equal("error" in settled && settled.error.code, "acp_mode_not_applied");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
 // T1 (continuation_unavailable): when the source task completes without persisting an
