@@ -17,11 +17,16 @@
 //          --agent /absolute/path/to/claude-agent-acp
 //      (Pass the agent binary explicitly; AGENT env var also accepted.)
 //
+// Models are selected with the executor's `model` field (ACP session/set_config_option),
+// the same path an executor profile's `model` takes. Override with BUILDER_MODEL /
+// REVIEWER_MODEL; values must be ones the agent offers exactly.
+//
 // Expected: a JSON line printed on stdout containing
-//   { "recalled": true, "sessionA": "...", "sessionB": "..." }
-// — `recalled` is true iff the opus process's transcript contains the
-// token that the sonnet process wrote in turn 1. `sessionB` should equal
-// `sessionA` (loaded, not new).
+//   { "recalled": true, "sessionA": "...", "sessionB": "...", "models": { ... } }
+// — `recalled` is true iff the opus process's result contains the token that
+// the sonnet process was told in turn 1 (B is NOT given the token in its
+// prompt or inputs). `sessionB` should equal `sessionA` (loaded, not new), and
+// `models` shows the model each side confirmed via acp_model_selected.
 
 import { AcpExecutor } from "../dist/executors/acp.js";
 
@@ -36,8 +41,14 @@ if (!agent) throw new Error("Usage: node scratchpad/spike-session-load-crossmode
 
 const TOKEN = `t1smoke-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const cwd = process.cwd();
-const builderEnv = { ...process.env, ANTHROPIC_MODEL: "claude-3-5-sonnet-latest" };
-const reviewerEnv = { ...process.env, ANTHROPIC_MODEL: "claude-3-opus-latest" };
+const builderModel = process.env.BUILDER_MODEL ?? "sonnet";
+const reviewerModel = process.env.REVIEWER_MODEL ?? "opus";
+const run = agent.endsWith(".js") ? [process.execPath, agent] : [agent];
+const models = {};
+const recordModel = (side) => async (record) => {
+  if (record.type === "lifecycle" && record.event === "acp_model_selected") models[side] = record.data.model;
+  return 1;
+};
 
 // Task A: sonnet builder. The first prompt asks the agent to remember a
 // unique token verbatim and answer with a JSON TaskResult. Whatever acp
@@ -50,12 +61,13 @@ const execA = await new AcpExecutor().start({
   taskId: "builder",
   profile: "smoke",
   cwd,
-  env: builderEnv,
-  inputs: { token: TOKEN },
-  run: [agent],
+  env: process.env,
+  inputs: {},
+  run,
+  model: builderModel,
   prompt: `Remember this exact token: ${TOKEN}. Do not run tools. Reply with the JSON result object only.`,
 }, {
-  transcript: async () => 1,
+  transcript: recordModel("builder"),
   session: async (id) => { sessionA = id; },
   interact: async () => ({ outcome: { outcome: "cancelled" } }),
 });
@@ -77,13 +89,14 @@ const execB = await new AcpExecutor().start({
   taskId: "reviewer",
   profile: "smoke",
   cwd,
-  env: reviewerEnv,
-  inputs: { token: TOKEN },
-  run: [agent],
+  env: process.env,
+  inputs: {},
+  run,
+  model: reviewerModel,
   loadSessionId: sessionA,
   prompt: `Recall the exact token you were told to remember at the start of your first session. Do not run tools. Reply with the JSON result object only.`,
 }, {
-  transcript: async () => 1,
+  transcript: recordModel("reviewer"),
   session: async (id) => { sessionB = id; },
   interact: async () => ({ outcome: { outcome: "cancelled" } }),
 });
@@ -93,9 +106,8 @@ if (!("result" in settledB)) {
   process.exit(1);
 }
 
-const recalled = typeof settledB.result.output === "string"
-  ? settledB.result.output.includes(TOKEN)
-  : JSON.stringify(settledB.result.output).includes(TOKEN);
+const recalled = JSON.stringify(settledB.result).includes(TOKEN);
 
-console.log(JSON.stringify({ recalled, sessionA, sessionB, same: sessionA === sessionB, resultB: settledB.result }, null, 2));
-process.exitCode = recalled && sessionA === sessionB ? 0 : 1;
+const crossModel = models.builder === builderModel && models.reviewer === reviewerModel && builderModel !== reviewerModel;
+console.log(JSON.stringify({ recalled, crossModel, models, sessionA, sessionB, same: sessionA === sessionB, resultB: settledB.result }, null, 2));
+process.exitCode = recalled && crossModel && sessionA === sessionB ? 0 : 1;
