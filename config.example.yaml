@@ -33,6 +33,10 @@ executors:
     # 0.55.0 offered: default = Sonnet 4.6, opus, haiku, and sonnet[1m], which needs extra-usage
     # credits). An unknown value fails the task with acp_model_unknown, listing the offered values.
     # model: opus
+    # Optional: the mode, applied via the agent's ACP mode selector with the same exact-value
+    # checks (acp_mode_unknown lists the offered values). For claude-agent-acp this is the
+    # permission mode; 0.84.0 offers default, acceptEdits, plan, auto and bypassPermissions.
+    # mode: acceptEdits
 
   openclaw-acp:
     type: acp
