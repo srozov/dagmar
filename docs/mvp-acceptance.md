@@ -230,18 +230,45 @@ Check: the new fixup attempt still loads `implement`'s session; completed fixup 
 
 ## Results
 
-*Not run yet.* Fill in per criterion: pass/fail, run id, and the evidence (a short excerpt; raw
-transcripts stay in `$T6/state`).
+Run 2026-09-28 to 2026-09-30 on `claude-agent-acp` 0.84.0: builder `sonnet` + `acceptEdits`, reviewer
+`opus` + `default`. The target was OpsDash's T6 integration plan, one milestone slice per run, in a
+worktree on branch `claude/t6-integration`, with verify = `bun run typecheck && bun run build && bun
+test --pass-with-no-tests`. Raw transcripts are in `~/.local/state/dagmar-t6/state`.
+
+| Run | Task | Outcome |
+|---|---|---|
+| `wr_65aa29e4-8937-426a-b645-a17ad0f2f9b6` | OpsDash M1 | `completed` via gate → revise (1 human turn) |
+| `wr_9dac61cb-53fe-455b-b188-e08d1a72508e` | OpsDash M2 | `completed` via gate → revise (1 human turn) |
+| `wr_1d091387-70bb-4b9b-b006-ca37e2b32fdc` | OpsDash M3, first commit; seeded verify failure + restart | `completed` via gate → revise (2 human turns) |
 
 | # | Result | Run id | Evidence |
 |---|---|---|---|
-| 1 | | | |
-| 2 | | | |
-| 3 | | | |
-| 4 | | | |
-| 5 | | | |
-| 6 | | | |
+| 1 | Pass | all three | Each ran implement → verify → review → gate → revise to `completed`. Approve → `done` was not taken live (it is covered by the dry run). |
+| 2 | Pass (mechanics only) | `wr_1d091387…` | With `VERIFY_FAIL_FIRST=1`: verify #1 `passed:false` (seeded), then fixup #1 continued the implement session and changed nothing ("the report is marked seeded … its own summary shows every check passing"), then verify #3 passed, fixup #2 was `skipped` and the loop exited at 1/3 visits. No verify failed for real in three milestones, so an agent fixing a genuine failure was not observed. |
+| 3 | Pass | all three | The reviewer's prompt had no builder notes, yet it answered them point by point. M1: it took a position on the builder's doubt about S2's counts, which appears in no file or commit. M3: it found a real bug the builder's tests hid (skipped tasks always have attempt rows, so the inspector never showed their note). |
+| 4 | Pass | `wr_1d091387…` | `kill -9` of the daemon one loop step in: the interrupted verify #2 became `failed (executor_lost)` and the run `blocked`. After restart, `resume` re-ran only verify; fixup's completed visit was kept, the loop exited, and the run went on to review and gate. No orphaned agent or verify process remained. |
+| 5 | Pass | all three | `revise` parked as `turn` interactions answered with `dagmar answer`. In M3 the builder asked for scope, made five commits, then asked "Are you satisfied?" before finishing. |
+| 6 | Pass | — | `src` is 2,308 lines (budget 3–4k); dagmar `pnpm check` / `test` (66 pass) / `build` green. OpsDash after M3a: typecheck, build and 19 tests green, re-run independently of the builder. |
 
 Findings, surprises and fold-backs:
 
-- (none yet)
+- **Fold-back 1, fixed (`claude/acp-last-message`):** the executor parsed all agent text of a turn
+  as the result. A tool-using agent sends progress notes between tool calls, so a correct final JSON
+  failed with "exactly one JSON value" (`wr_f1484d0c…`, M1 attempt 1, work done). Only the last
+  message (by ACP `messageId`) is parsed now.
+- **Fold-back 2, built (`claude/acp-result-repair`):** an invalid single-shot result gets one repair
+  turn on the same session. In `wr_4548a0c6…` the repair fired but the builder repeated the same
+  mistake: it nested `notes` one level deeper and closed with one `}` too few. Both it and
+  `wr_bfdcd3dd…` lost a finished M2. Requiring a flat result shape in the task text is what made
+  the result parse first time.
+- Shell commands that write files or chain steps (heredocs, `cd … &&`, `rm`, `kill`) asked for
+  permission despite `mode: acceptEdits`: 3–5 per milestone, all in scope. The operator answered
+  them; there is no "always allow" option.
+- `wr_bfdcd3dd…`: the first prompt failed with an OAuth token refresh collision with other Claude
+  Code processes on the host (environmental). The run blocked cleanly and `resume` retried it.
+- `kill -9` left no orphans: the agent and the verify wrapper exit when their pipes to the daemon
+  close. The restart step still checks the recorded agent PID.
+- The fixup for a seeded failure took 7 s, so a kill timed "5 s into fixup" hit the next verify
+  instead. That is still a crash mid-loop.
+- Not done: no browser check of the OpsDash pages (the fixture is only reachable over `wss://` with
+  a `tailscale serve` mapping, which the task forbade).
