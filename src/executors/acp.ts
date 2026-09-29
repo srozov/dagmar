@@ -3,7 +3,7 @@ import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionConfigOption, type SessionNotification } from "@agentclientprotocol/sdk";
 import { isEnvelope, validateResult } from "../result.js";
-import type { Json, JsonObject, TaskError } from "../types.js";
+import { DagmarError, type Json, type JsonObject, type JsonSchema, type TaskError, type TaskResult } from "../types.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "./types.js";
 
 export const RESULT_INSTRUCTION = 'Respond with exactly one JSON object and no surrounding prose or Markdown. The object must contain exactly three fields: "outcome" ("completed" or "blocked"), "message" (a non-empty string), and "output" (any JSON value).';
@@ -14,6 +14,8 @@ export const RESULT_INSTRUCTION = 'Respond with exactly one JSON object and no s
 // we do NOT re-append INTERACTIVE_INSTRUCTION or Inputs on turns ≥ 2, or the agent
 // sees the instruction repeatedly and may forget the task is multi-turn.
 export const INTERACTIVE_INSTRUCTION = 'This is a multi-turn interactive task. Reply to the user normally to converse; the task pauses for their next message after each of your turns. When (and only when) the task is complete, respond with exactly one JSON object and no surrounding prose: {"outcome":"completed"|"blocked","message":<non-empty string>,"output":<any JSON>}. Any reply that is not exactly that object is delivered to the user as a message.';
+
+export const REPAIR_INSTRUCTION = "Your previous reply was not a valid result, so the task is not finished yet. Do not redo any work.";
 
 export class AcpExecutor implements Executor<AcpRequest> {
   async start(request: AcpRequest, hooks: Hooks): Promise<Execution> {
@@ -153,6 +155,7 @@ class Attempt {
         ? `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${INTERACTIVE_INSTRUCTION}`
         : `${this.request.prompt}\n\nInputs:\n${JSON.stringify(this.request.inputs)}\n\n${RESULT_INSTRUCTION}`;
       let response: PromptResponse;
+      let repaired = false;
       for (;;) {
         // Reset the accumulation buffer PER TURN, or turn N would contain turns 1..N
         // concatenated and the envelope check would misfire on conversational replies.
@@ -166,15 +169,22 @@ class Attempt {
           throw new Error(`ACP prompt stopped with ${response.stopReason}`);
         }
         if (!this.request.interactive) {
-          // Non-interactive: today's exact single-shot logic — preserve byte-for-byte so the
-          // single-shot path is not a silent regression target.
-          let parsed: unknown;
+          // Non-interactive: the reply must be exactly one TaskResult. An agent can finish long
+          // work and then emit a malformed result (e.g. a missing closing brace), so an invalid
+          // result gets exactly one repair turn on the same live session; a second invalid
+          // result fails the attempt with the original error. A task's own invalid outputSchema
+          // is a configuration error the agent cannot repair.
+          let result: TaskResult;
           try {
-            parsed = JSON.parse(this.text);
-          } catch {
-            throw new Error("ACP response must be exactly one JSON value");
+            result = parseResult(this.text, this.request.outputSchema);
+          } catch (error) {
+            if (repaired || (error instanceof DagmarError && error.code === "invalid_output_schema")) throw error;
+            repaired = true;
+            const message = error instanceof Error ? error.message : "Invalid result";
+            await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_result_repair", data: { message } });
+            turnText = `${REPAIR_INSTRUCTION} Error: ${message}. ${RESULT_INSTRUCTION}`;
+            continue;
           }
-          const result = validateResult(parsed, this.request.outputSchema);
           await this.hooks.transcript({
             type: "lifecycle",
             direction: "internal",
@@ -464,3 +474,12 @@ function classifyFailure(error: unknown): TaskError {
   return { code: "acp_failed", message: error instanceof Error ? error.message : "ACP execution failed" };
 }
 function finished(value: Settlement): Execution { return { done: Promise.resolve(value), cancel: async () => undefined }; }
+function parseResult(text: string, outputSchema?: JsonSchema): TaskResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`ACP response must be exactly one JSON value (${error instanceof Error ? error.message : "parse error"})`);
+  }
+  return validateResult(parsed, outputSchema);
+}

@@ -113,6 +113,8 @@ Dagmar writes the resolved task inputs as one JSON value to the process's standa
 
 `outcome` may be `completed` or `blocked`; all three fields are required. Standard error is captured in the task transcript.
 
+An ACP task's agent returns the same JSON result as its final message; earlier messages in the turn (progress notes between tool calls) are ignored. If that final message is not a valid result, Dagmar sends one repair prompt on the same session asking for only the corrected result (transcript event `acp_result_repair`). A second invalid result fails the attempt. Interactive tasks treat a non-result reply as conversation instead.
+
 The repository includes a runnable process example at `examples/process-workflow.yaml`. Its helper program is `examples/process-result.mjs`.
 
 ## Run the daemon and CLI
