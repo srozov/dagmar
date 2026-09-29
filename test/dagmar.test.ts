@@ -7,7 +7,7 @@ import test from "node:test";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.js";
 import { startDaemon } from "../src/daemon.js";
-import { AcpExecutor } from "../src/executors/acp.js";
+import { AcpExecutor, REPAIR_INSTRUCTION } from "../src/executors/acp.js";
 import { ProcessExecutor } from "../src/executors/process.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "../src/executors/types.js";
 import { EventBus, RpcClient } from "../src/rpc.js";
@@ -763,6 +763,58 @@ test("chunks without a messageId still accumulate, so prose before the envelope 
   const { root, script } = await messagesAgent("dagmar-acp-msgs-noid-", [[null, "Reading files."], [null, ENVELOPE_PARTS.join("")]]);
   const { settled } = await runMessagesAgent(root, script, false);
   assert.equal("error" in settled && settled.error.code, "acp_failed");
+});
+
+// Result repair: a single-shot agent whose reply is not a valid result gets exactly one repair turn
+// on the same session. `replies` is what the fake agent answers to its 1st, 2nd, ... prompt.
+async function repairAgent(prefix: string, replies: string[]): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+const replies=${JSON.stringify(replies)}; let n=0;
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'r-1'}});
+if(m.method==='session/prompt'){const text=replies[Math.min(n++,replies.length-1)];send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'r-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  return { root, script };
+}
+async function runRepairAgent(root: string, script: string, outputSchema?: AcpRequest["outputSchema"]): Promise<{ settled: Settlement; prompts: string[]; events: string[] }> {
+  const records: unknown[] = [];
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_r", taskRunId: "tr_r", taskId: "r", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(outputSchema === undefined ? {} : { outputSchema }) }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const settled = await execution.done;
+  const prompts = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: { prompt?: Array<{ text: string }> } } }).message).filter((m) => m.method === "session/prompt").map((m) => m.params!.prompt![0]!.text);
+  const events = records.filter((r) => (r as { type?: string }).type === "lifecycle").map((r) => (r as { event: string }).event);
+  return { settled, prompts, events };
+}
+const VALID_RESULT = '{"outcome":"completed","message":"ok","output":{"n":1}}';
+
+test("AcpExecutor repairs an invalid result with one follow-up turn on the same session", async () => {
+  const { root, script } = await repairAgent("dagmar-acp-repair-", ['{"outcome":"completed","message":"ok","output":{"n":1}', VALID_RESULT]);
+  const { settled, prompts, events } = await runRepairAgent(root, script);
+  assert.ok("result" in settled, `expected a result, got ${JSON.stringify(settled)}`);
+  assert.deepEqual(settled.result.output, { n: 1 });
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[1]!.startsWith(REPAIR_INSTRUCTION), "the repair prompt must not repeat the task");
+  assert.match(prompts[1]!, /exactly one JSON value/);
+  assert.ok(events.includes("acp_result_repair"));
+});
+
+test("AcpExecutor fails after the repair turn also returns an invalid result", async () => {
+  const { root, script } = await repairAgent("dagmar-acp-repair-twice-", ["Done, see above.", "Still prose."]);
+  const { settled, prompts } = await runRepairAgent(root, script);
+  assert.equal("error" in settled && settled.error.code, "acp_failed");
+  assert.match("error" in settled ? settled.error.message : "", /exactly one JSON value/);
+  assert.equal(prompts.length, 2, "exactly one repair turn");
+});
+
+test("AcpExecutor does not repair a task whose own outputSchema is invalid", async () => {
+  const { root, script } = await repairAgent("dagmar-acp-repair-schema-", [VALID_RESULT]);
+  const { settled, prompts } = await runRepairAgent(root, script, { type: 123 });
+  assert.equal("error" in settled && settled.error.message, "Task outputSchema is invalid");
+  assert.equal(prompts.length, 1);
 });
 
 // T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session
