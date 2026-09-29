@@ -191,8 +191,22 @@ the daemon with the seeded-failure env on the `check` profile:
 The daemon reads its config at start, so restart it after editing, and delete the counter file before
 each seeded run. Then, while `fixup` is running:
 
+Dagmar starts agents as separate process groups, so killing the daemon does not necessarily kill the
+running `fixup` agent. Note the agent's PID **before** the kill (the CLI needs a running daemon): it
+is the `pid` of the `acp_process_started` event in the fixup attempt's transcript.
+
 ```bash
+dagmar transcript <fixupTaskRunId> | grep -o '"acp_process_started"[^}]*'   # → "data":{"pid":<agentPid>
 kill -9 "$DAEMON"                                     # simulate a crash
+ps -o pid,cmd -p <agentPid>                           # still alive = orphan
+```
+
+An orphan can keep editing the worktree while the resumed run starts a second agent, so record it as a
+finding and stop it before resuming: `kill <agentPid>` (only that PID; never a pattern match).
+
+Then restart and resume:
+
+```bash
 node "$DAGMAR/dist/daemon.js" --config "$T6/config.yaml" >>"$T6/daemon.log" 2>&1 & DAEMON=$!
 dagmar status <runId>                                 # expect blocked; fixup attempt failed: executor_lost
 dagmar resume <runId>                                 # fixup re-runs, verify re-runs, loop exits
