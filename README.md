@@ -14,7 +14,7 @@ Use Dagmar when you need durable task state, explicit handoffs, and operator con
 
 ## What Dagmar provides
 
-- A small YAML language for static dependency graphs.
+- A small YAML language for static task graphs, with guards, human gates, and bounded loops.
 - ACP and local-process executors behind named profiles.
 - Concurrent execution of independent ready tasks.
 - A CLI and loopback API for run control, live observation, and ACP interactions.
@@ -90,14 +90,40 @@ tasks:
       mode: fresh
 ```
 
-`executor` selects a configured profile. A process task requires `run` and cannot use `prompt` or `session`; an ACP task requires `prompt` and cannot use `run`. Dependencies must exist and form an acyclic graph. Independent dependency-ready tasks run concurrently.
+`executor` selects a configured profile. A process task requires `run` and cannot use `prompt`, `session` or `interactive`; an ACP task requires `prompt` and cannot use `run`. Dependencies must exist and form an acyclic graph. Independent dependency-ready tasks run concurrently.
 
 Input values may be literals or references:
 
 - `$run.input` and `$run.input.key` read the input supplied when the run starts.
 - `$tasks.<task-id>.output` and `$tasks.<task-id>.output.key` read a dependency's output.
 
-A task may also declare `outputSchema`, a JSON Schema applied to its `output`. Only `session: { mode: fresh }` is supported in v0.
+A task may also declare `outputSchema`, a JSON Schema applied to its `output`.
+
+An ACP task starts a new agent session unless it sets `session: { mode: continue, from: <task-id> }`, which loads that task's session through ACP `session/load`. The source must be a dependency (`invalid_dependency`) and an ACP task whose profile has a byte-identical `run` (`invalid_task`); `model` and `mode` may differ. The attempt fails with `acp_load_unsupported` if the agent cannot load sessions, or `continuation_unavailable` if the source has no recorded session (for example, it was skipped). `session: { mode: fork }` is rejected (`unsupported_session_mode`).
+
+An ACP task with `interactive: true` is a human-driven conversation. Each agent reply that is not a result parks the task as `awaiting_input` with a `turn` interaction carrying the reply in `request.message`; answer with the next message as a non-empty JSON string, for example `dagmar answer <interaction-id> --json '"Add a test"'`. The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
+
+A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema` or `loop`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
+
+`when` guards a task with a list of clauses, all of which must hold. Each clause has a `ref` to `$run.input…` or `$tasks.<dependency>.output…` and exactly one of `equals` (a JSON value) or `in` (a non-empty array of JSON values), compared by JSON equality; other shapes fail validation with `invalid_guard`. If a clause is false when the task's dependencies settle, the task is `skipped` instead of run. A missing path, or a reference to a skipped task, makes a clause false. A skipped task counts as settled for its dependants, but an unguarded input reference to its output fails with `input_resolution_failed`. A run completes when every task is `completed` or `skipped`.
+
+`loop: { to, maxVisits }` makes a task (the source) loop back to `to` (the target), which must be one of its direct dependencies; a target has at most one source (`invalid_loop`). The loop-back is not a dependency edge, so the graph stays acyclic. Each time the source completes, the target runs again; while the source has fewer than `maxVisits` completed attempts, it is then decided again on the target's new output. The loop is final when the target has completed and either the source's `when` no longer holds or the source has completed `maxVisits` times. Only completed source attempts count as visits, and `resume` continues the count. Other tasks that depend on the target or the source wait until the loop is final.
+
+In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s session and loops back to `verify` while verification fails, at most three times:
+
+```yaml
+  fixup:
+    executor: builder
+    dependsOn: [verify, implement]
+    inputs: { report: $tasks.verify.output }
+    prompt: |
+      Verification failed; the report is in the inputs. Fix the change so the checks pass.
+    session: { mode: continue, from: implement }
+    when: [{ ref: $tasks.verify.output.passed, equals: false }]
+    loop: { to: verify, maxVisits: 3 }
+```
+
+The same workflow also uses a gate and an interactive task. `docs/mvp-acceptance.md` is its runbook, including its sharp edges.
 
 ## Process task contract
 
@@ -139,4 +165,4 @@ The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `st
 
 ## v0 scope
 
-Dagmar supports static dependency-only DAGs, local-process and ACP execution, manual cancellation and resume, and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits, dynamic tasks, distributed workers, or automatic redaction of child-process output.
+Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks and bounded loops; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits, dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
