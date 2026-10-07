@@ -1980,6 +1980,130 @@ test("restart mid-loop: recover() blocks, resume() continues, visit count preser
 });
 
 
+// Loop-downstream (a review workflow's shape): an inner fixup loop on verify, and an outer revise loop on
+// `round`, a no-op that starts each round. When revise completes, everything downstream of round is
+// decided again: verify, fixup, publish, review, qa and the gate. `verify` reads its pass/fail answers from a list, one per
+// invocation; `crash` makes that invocation exit without a result.
+async function sdlcFixture(prefix: string, answers: Array<boolean | "crash">, reviseVisits = 3) {
+  const root = await mkdtemp(join(tmpdir(), prefix));
+  const counter = join(root, "counter");
+  const verifyScript = join(root, "verify.mjs"), echoScript = join(root, "echo.mjs"), blockScript = join(root, "block.mjs");
+  await writeFile(verifyScript, `import {existsSync, readFileSync, writeFileSync} from 'node:fs';
+for await (const _ of process.stdin) {}
+const n = existsSync(${JSON.stringify(counter)}) ? Number(readFileSync(${JSON.stringify(counter)}, 'utf8')) : 0;
+writeFileSync(${JSON.stringify(counter)}, String(n + 1));
+const answer = ${JSON.stringify(answers)}[n];
+if (answer === 'crash' || answer === undefined) process.exit(1);
+console.log(JSON.stringify({outcome:'completed',message:'v',output:{passed: answer, run: n + 1}}));`);
+  await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
+  await writeFile(blockScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'blocked',message:'cap',output:{}}));");
+  const echo = [process.execPath, echoScript], passed = { ref: "$tasks.verify.output.passed", equals: true }, failed = { ref: "$tasks.verify.output.passed", equals: false };
+  const workflow = {
+    id: "sdlc",
+    tasks: {
+      implement: { executor: "local", inputs: {}, run: echo },
+      round: { executor: "local", dependsOn: ["implement"], inputs: {}, run: echo },
+      verify: { executor: "local", dependsOn: ["round"], inputs: {}, run: [process.execPath, verifyScript] },
+      fixup: { executor: "local", dependsOn: ["verify"], inputs: {}, run: echo, when: [failed], loop: { to: "verify", maxVisits: 2 } },
+      exhausted: { executor: "local", dependsOn: ["verify"], inputs: {}, run: [process.execPath, blockScript], when: [failed] },
+      publish: { executor: "local", dependsOn: ["verify"], inputs: {}, run: echo, when: [passed] },
+      review: { executor: "local", dependsOn: ["publish", "verify"], inputs: {}, run: echo, when: [passed] },
+      qa: { executor: "local", dependsOn: ["publish", "verify"], inputs: {}, run: echo, when: [passed] },
+      gate: { dependsOn: ["review", "qa", "verify"], inputs: {}, when: [passed], gate: { prompt: "approve or revise?", schema: { type: "object", required: ["decision"], properties: { decision: { enum: ["approve", "revise"] } } } } },
+      ready: { executor: "local", dependsOn: ["gate"], inputs: {}, run: echo, when: [{ ref: "$tasks.gate.output.decision", equals: "approve" }] },
+      revise: { executor: "local", dependsOn: ["gate", "round"], inputs: {}, run: echo, when: [{ ref: "$tasks.gate.output.decision", equals: "revise" }], loop: { to: "round", maxVisits: reviseVisits } },
+      reviseExhausted: { executor: "local", dependsOn: ["gate", "round"], inputs: {}, run: [process.execPath, blockScript], when: [{ ref: "$tasks.gate.output.decision", equals: "revise" }] },
+    },
+  };
+  return fixture(root, workflow);
+}
+// Answers the next gate of the run that has not been answered yet.
+async function answerNextGate(app: Awaited<ReturnType<typeof fixture>>, runId: string, decision: string, answered: Set<string>): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    const gate = app.scheduler.interactions().find((x) => x.kind === "gate" && x.workflowRunId === runId && !answered.has(x.taskRunId));
+    if (gate) { answered.add(gate.taskRunId); await app.scheduler.answer(gate.id, { decision }); return; }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`No new gate: ${JSON.stringify({ status: (await app.scheduler.get(runId)).status, tasks: Object.fromEntries(Object.entries((await app.scheduler.get(runId)).tasks).map(([id, x]) => [id, `${x.state} [${x.attempts.map((a) => a.status).join(",")}]`])) })}`);
+}
+const states = (view: RunView) => Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.attempts.map((a) => a.status).join(",")]));
+
+test("an outer revise loop re-runs verify, the reviews and the gate, then approve completes the run", async () => {
+  const app = await sdlcFixture("dagmar-sdlc-revise-", [false, true, true]);
+  const run = await app.scheduler.start("sdlc", {});
+  const answered = new Set<string>();
+  await answerNextGate(app, run.workflowRunId, "revise", answered);
+  await answerNextGate(app, run.workflowRunId, "approve", answered);
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(states(view), {
+    implement: "completed",
+    round: "completed,completed",
+    verify: "completed,completed,completed",
+    fixup: "completed,skipped,skipped",
+    exhausted: "skipped,skipped",
+    publish: "completed,completed",
+    review: "completed,completed",
+    qa: "completed,completed",
+    gate: "completed,completed",
+    ready: "skipped,completed",
+    revise: "completed,skipped",
+    reviseExhausted: "skipped",
+  });
+  app.store.close();
+});
+
+test("the outer loop's cap ends the run blocked through its exit branch", async () => {
+  const app = await sdlcFixture("dagmar-sdlc-cap-", [true, true, true], 2);
+  const run = await app.scheduler.start("sdlc", {});
+  const answered = new Set<string>();
+  for (let i = 0; i < 3; i++) await answerNextGate(app, run.workflowRunId, "revise", answered);
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.equal(view.tasks.revise!.attempts.filter((a) => a.status === "completed").length, 2, "revise stops at maxVisits");
+  assert.equal(view.tasks.gate!.attempts.length, 3, "one gate per round: the first, plus one after each revise");
+  assert.equal(view.tasks.reviseExhausted!.state, "blocked");
+  assert.equal(view.tasks.exhausted!.state, "skipped", "the inner loop's exit is decided again each round");
+  app.store.close();
+});
+
+test("the inner loop exhausts inside a revise round and blocks the run", async () => {
+  const app = await sdlcFixture("dagmar-sdlc-inner-", [true, false, false, false]);
+  const run = await app.scheduler.start("sdlc", {});
+  await answerNextGate(app, run.workflowRunId, "revise", new Set());
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(states(view), {
+    implement: "completed",
+    round: "completed,completed",
+    verify: "completed,completed,completed,completed",
+    fixup: "skipped,completed,completed",
+    exhausted: "skipped,blocked",
+    publish: "completed,skipped",
+    review: "completed,skipped",
+    qa: "completed,skipped",
+    gate: "completed,skipped",
+    ready: "skipped,skipped",
+    revise: "completed,skipped",
+    reviseExhausted: "skipped",
+  });
+  app.store.close();
+});
+
+test("resume after a failure in a revise round keeps the visit counts", async () => {
+  const app = await sdlcFixture("dagmar-sdlc-resume-", [true, "crash", true, true], 2);
+  const run = await app.scheduler.start("sdlc", {});
+  const answered = new Set<string>();
+  await answerNextGate(app, run.workflowRunId, "revise", answered);
+  const blocked = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.equal(blocked.tasks.verify!.state, "failed");
+  await app.scheduler.resume(run.workflowRunId);
+  await answerNextGate(app, run.workflowRunId, "revise", answered);
+  await answerNextGate(app, run.workflowRunId, "approve", answered);
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.equal(view.tasks.revise!.attempts.filter((a) => a.status === "completed").length, 2, "the revise before the failure still counts");
+  assert.equal(view.tasks.gate!.attempts.length, 3);
+  assert.equal(view.tasks.ready!.state, "completed");
+  app.store.close();
+});
+
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
