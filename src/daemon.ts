@@ -43,7 +43,7 @@ export async function startDaemon(configPath?: string): Promise<Daemon> {
     },
     "workflow.get": async (p: JsonObject) => json(await workflows.get(string(p, "workflowId"))),
     "run.start": async (p: JsonObject) =>
-      json(await scheduler.start(string(p, "workflowId"), required(p, "input"))),
+      json(await scheduler.start(string(p, "workflowId"), required(p, "input"), p.cwd === undefined ? null : string(p, "cwd"))),
     "run.list": (p: JsonObject) => {
       empty(p);
       return json(scheduler.list());

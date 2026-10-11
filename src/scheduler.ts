@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
@@ -29,11 +31,20 @@ export class Scheduler {
     private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
-  async start(workflowId: string, input: Json): Promise<{ workflowRunId: string; status: "running" }> {
+  // `cwd` is the run's working directory, for every executor without a cwd of its own. A workflow with
+  // such an executor needs one; a workflow whose executors all have their own rejects one, since it
+  // would only split the one-active-run rule without changing where anything runs.
+  async start(workflowId: string, input: Json, cwd: string | null = null): Promise<{ workflowRunId: string; status: "running" }> {
     if (this.stopping) throw new DagmarError("daemon_shutting_down", "Daemon is shutting down");
-    await this.workflows.get(workflowId);
+    const workflow = await this.workflows.get(workflowId);
+    const needsCwd = Object.values(workflow.tasks).some((task) => task.executor !== undefined && workflow.executors[task.executor]!.cwd === undefined);
+    if (cwd === null && needsCwd) throw new DagmarError("cwd_required", `Workflow ${workflowId} needs a cwd: one of its executors has none of its own`);
+    if (cwd !== null) {
+      if (!needsCwd) throw new DagmarError("cwd_unused", `Workflow ${workflowId} takes no cwd: each of its executors has its own`);
+      if (!isAbsolute(cwd) || !await stat(cwd).then((x) => x.isDirectory(), () => false)) throw new DagmarError("invalid_params", "cwd must be the absolute path of an existing directory");
+    }
     const id = `wr_${randomUUID()}`, now = timestamp();
-    this.store.insertRun({ id, workflowId, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+    this.store.insertRun({ id, workflowId, cwd, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
     this.emitRun(id, "running");
     this.background(this.serial(id, () => this.advance(id, false, false)));
     return { workflowRunId: id, status: "running" };
@@ -244,8 +255,11 @@ export class Scheduler {
     const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
+      // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
+      const cwd = profile.cwd ?? run.cwd;
+      if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
       const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest));
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its

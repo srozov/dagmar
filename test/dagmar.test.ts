@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.js";
@@ -215,7 +218,7 @@ test("startup recovery blocks persisted active attempts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-recovery-"));
   const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   await app.scheduler.recover();
   assert.equal(app.store.run("wr_recovery")!.status, "blocked");
@@ -1128,7 +1131,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   const workflow = { id: "gaterecover", tasks: { gate: { inputs: {}, gate: { prompt: "Approve?" } } } };
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   await app.scheduler.recover();
   // Gate survives.
@@ -1162,7 +1165,7 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   };
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_m", workflowId: "gatemix", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_m", workflowId: "gatemix", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   // Non-gate (process) attempt in 'running'.
   app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   // Gate attempt in 'awaiting_input'.
@@ -1224,7 +1227,7 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
   // Run with endedAt set (simulating the state left by the prior shutdown).
-  app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
+  app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
   app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   assert.equal(app.store.run("wr_m2")!.endedAt, now, "precondition: run arrived with stale endedAt");
@@ -1950,7 +1953,7 @@ test("restart mid-loop: recover() blocks, resume() continues, visit count preser
   // Pre-insert a mid-loop state: verify#1 was running on a scheduler that has since died.
   const now = new Date().toISOString();
   const store1 = new Store(storePath);
-  store1.insertRun({ id: "wr_loop_r", workflowId: workflow.id, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  store1.insertRun({ id: "wr_loop_r", workflowId: workflow.id, cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
   store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_loop_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   store1.close();
 
@@ -2109,6 +2112,123 @@ test("resume after a failure in a revise round keeps the visit counts", async ()
   assert.equal(view.tasks.gate!.attempts.length, 3);
   assert.equal(view.tasks.ready!.state, "completed");
   app.store.close();
+});
+
+// A process task that reports the directory it runs in.
+async function cwdScript(root: string): Promise<string> {
+  const script = join(root, "cwd.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'cwd',output:{cwd:process.cwd()}}));`);
+  return script;
+}
+
+test("a run's cwd is where its executors without a cwd run; an executor's own cwd wins", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cwd-"))), project = join(root, "project"), fixed = join(root, "fixed");
+  await mkdir(project); await mkdir(fixed);
+  const script = await cwdScript(root);
+  const app = await fixture(root, {
+    id: "cwd",
+    executors: { project: { type: "process" }, fixed: { type: "process", cwd: fixed } },
+    tasks: { a: { executor: "project", inputs: {}, run: [process.execPath, script] }, b: { executor: "fixed", inputs: {}, run: [process.execPath, script] } },
+  });
+  const started = await app.scheduler.start("cwd", {}, project);
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.cwd, project);
+  assert.deepEqual(view.tasks.a!.attempts[0]!.result!.output, { cwd: project });
+  assert.deepEqual(view.tasks.b!.attempts[0]!.result!.output, { cwd: fixed });
+  assert.equal(app.scheduler.list()[0]!.cwd, project);
+  app.store.close();
+});
+
+test("run.start checks the run's cwd against the workflow's executors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cwd-check-"));
+  const app = await fixture(root, { id: "needs", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: ["node"] } } });
+  await writeFile(join(root, "workflows", "own.yaml"), stringify({ id: "own", executors: defaultExecutors(root), tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  const rejects = (cwd: string | null, workflowId: string, code: string) => assert.rejects(app.scheduler.start(workflowId, {}, cwd), (error) => error instanceof DagmarError && error.code === code);
+  await rejects(null, "needs", "cwd_required");
+  await rejects("relative", "needs", "invalid_params");
+  await rejects(join(root, "missing"), "needs", "invalid_params");
+  await rejects(join(root, "workflows", "own.yaml"), "needs", "invalid_params"); // a file, not a directory
+  await rejects(root, "own", "cwd_unused");
+  assert.equal(app.scheduler.list().length, 0);
+  app.store.close();
+});
+
+test("one workflow runs on two cwds at once, but once per cwd", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cwd-active-")), one = join(root, "one"), two = join(root, "two"), wait = join(root, "wait.mjs");
+  await mkdir(one); await mkdir(two);
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "long", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: [process.execPath, wait] } } });
+  try {
+    await app.scheduler.start("long", {}, one);
+    await app.scheduler.start("long", {}, two);
+    await assert.rejects(app.scheduler.start("long", {}, one), (error) => error instanceof DagmarError && error.code === "active_run_exists" && error.message.includes(one));
+  } finally { await app.scheduler.shutdown(); app.store.close(); }
+});
+
+test("a database from before run cwds is upgraded in place", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-upgrade-")), path = join(root, "dagmar.sqlite");
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE workflow_runs (
+ id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, input_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','blocked','cancelled')),
+ started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT
+);
+CREATE UNIQUE INDEX one_active_run_per_workflow ON workflow_runs(workflow_id) WHERE status IN ('running','waiting');
+INSERT INTO workflow_runs VALUES('wr_old','w','{"task":"t"}','completed','2026-10-07T00:00:00.000Z','2026-10-07T00:00:00.000Z','2026-10-07T00:00:00.000Z');`);
+  old.close();
+  const store = new Store(path);
+  try {
+    assert.deepEqual(store.run("wr_old"), { id: "wr_old", workflowId: "w", cwd: null, input: { task: "t" }, status: "completed", startedAt: "2026-10-07T00:00:00.000Z", updatedAt: "2026-10-07T00:00:00.000Z", endedAt: "2026-10-07T00:00:00.000Z" });
+    const now = new Date().toISOString(), active = (id: string, cwd: string | null) => store.insertRun({ id, workflowId: "w", cwd, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+    active("wr_a", "/a"); active("wr_b", "/b"); active("wr_none", null);
+    assert.throws(() => active("wr_a2", "/a"), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+    assert.throws(() => active("wr_none2", null), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+  } finally { store.close(); }
+  const reopened = new Store(path); // the upgrade is idempotent
+  assert.equal(reopened.runs().length, 4);
+  reopened.close();
+});
+
+test("a run's cwd survives a daemon restart", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cwd-restart-"))), project = join(root, "project"), storePath = join(root, "state", "dagmar.sqlite");
+  await mkdir(project); await mkdir(join(root, "workflows")); await mkdir(join(root, "state"));
+  const script = await cwdScript(root);
+  await writeFile(join(root, "workflows", "later.yaml"), stringify({
+    id: "later",
+    executors: { project: { type: "process" } },
+    tasks: { gate: { inputs: {}, gate: { prompt: "Go?" } }, after: { executor: "project", dependsOn: ["gate"], inputs: {}, run: [process.execPath, script] } },
+  }));
+  const scheduler = (store: Store) => new Scheduler(store, new Transcripts(join(root, "state")), new WorkflowRepository(join(root, "workflows")), new EventBus(), { process: new ProcessExecutor(), acp: new InteractiveExecutor() });
+  const store1 = new Store(storePath), scheduler1 = scheduler(store1);
+  const started = await scheduler1.start("later", {}, project);
+  await waitFor(scheduler1, started.workflowRunId, "waiting");
+  await scheduler1.shutdown(); store1.close();
+  const store2 = new Store(storePath), scheduler2 = scheduler(store2);
+  await scheduler2.recover();
+  await scheduler2.answer(scheduler2.interactions()[0]!.id, "go");
+  const view = await waitFor(scheduler2, started.workflowRunId, "completed");
+  assert.deepEqual(view.tasks.after!.attempts[0]!.result!.output, { cwd: project });
+  store2.close();
+});
+
+test("the CLI sends --cwd as an absolute path, resolved in the caller's directory", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cli-cwd-"))), project = join(root, "project"), workflows = join(root, "workflows");
+  await mkdir(project); await mkdir(workflows);
+  const script = await cwdScript(root);
+  await writeFile(join(workflows, "here.yaml"), stringify({ id: "here", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: [process.execPath, script] } } }));
+  const port = await freePort(), config = join(root, "config.yaml");
+  await writeFile(config, stringify({ workflowDir: workflows, storageDir: join(root, "state"), listen: { host: "127.0.0.1", port } }));
+  const daemon = await startDaemon(config), client = new RpcClient(`ws://127.0.0.1:${port}`); await client.connect();
+  try {
+    const cli = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), fileURLToPath(new URL("../src/cli.ts", import.meta.url)), "--config", config, "run", "here", "--cwd", "."], { cwd: project });
+    let stdout = ""; cli.stdout.on("data", (chunk) => { stdout += chunk; });
+    assert.equal(await new Promise((resolve) => cli.once("close", resolve)), 0);
+    const { workflowRunId } = JSON.parse(stdout) as { workflowRunId: string };
+    let view: RunView | undefined;
+    for (let i = 0; i < 200; i++) { view = await client.request("run.get", { workflowRunId }) as unknown as RunView; if (view.status === "completed") break; await new Promise((resolve) => setTimeout(resolve, 10)); }
+    assert.equal(view!.cwd, project);
+    assert.deepEqual(view!.tasks.t!.attempts[0]!.result!.output, { cwd: project });
+  } finally { client.close(); await daemon.stop(); }
 });
 
 // Writes the workflow with the default `local` and `agent` executors unless it declares its own.
