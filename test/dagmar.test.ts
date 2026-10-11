@@ -2231,6 +2231,23 @@ test("the CLI sends --cwd as an absolute path, resolved in the caller's director
   } finally { client.close(); await daemon.stop(); }
 });
 
+test("an executor's envFile reaches its task between the daemon's env and its own env", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-envfile-")), script = join(root, "env.mjs"), file = join(root, "secrets.env");
+  await writeFile(script, `for await(const _ of process.stdin){};const {FROM_FILE,OVERRIDDEN,HOME}=process.env;console.log(JSON.stringify({outcome:'completed',message:'env',output:{FROM_FILE,OVERRIDDEN,HOME}}));`);
+  await writeFile(file, "# a comment\nFROM_FILE=file\nOVERRIDDEN=file\nHOME=/from-file\n");
+  const app = await fixture(root, {
+    id: "envfile",
+    executors: { secret: { type: "process", cwd: root, envFile: file, env: { OVERRIDDEN: "literal" } }, broken: { type: "process", cwd: root, envFile: join(root, "missing.env") } },
+    tasks: { ok: { executor: "secret", inputs: {}, run: [process.execPath, script] }, bad: { executor: "broken", inputs: {}, run: [process.execPath, script] } },
+  });
+  const started = await app.scheduler.start("envfile", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.ok!.attempts[0]!.result!.output, { FROM_FILE: "file", OVERRIDDEN: "literal", HOME: "/from-file" });
+  assert.equal(view.tasks.bad!.attempts[0]!.error!.code, "env_file_unreadable");
+  assert.throws(() => validateWorkflow({ id: "x", executors: { e: { type: "process", envFile: "relative.env" } }, tasks: { t: { executor: "e", inputs: {}, run: ["node"] } } }), (error) => error instanceof DagmarError && error.code === "workflow_invalid");
+  app.store.close();
+});
+
 // Writes the workflow with the default `local` and `agent` executors unless it declares its own.
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
