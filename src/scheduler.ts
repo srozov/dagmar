@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { parseEnv } from "node:util";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
@@ -259,7 +261,9 @@ export class Scheduler {
       const cwd = profile.cwd ?? run.cwd;
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
       const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest));
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      // The daemon's environment, then the executor's envFile, then its literal env on top.
+      const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
+      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -522,4 +526,9 @@ function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]));
   const ak = Object.keys(a), bk = Object.keys(b as object);
   return ak.length === bk.length && ak.every((k) => Object.hasOwn(b as object, k) && jsonEqual((a as {[k:string]:Json})[k], (b as {[k:string]:Json})[k]));
+}
+// Read on every task start, so a changed file (a rotated key) applies without a restart.
+function envFile(path: string): NodeJS.Dict<string> {
+  try { return parseEnv(readFileSync(path, "utf8")); }
+  catch { throw new DagmarError("env_file_unreadable", `Cannot read env file ${path}`); }
 }

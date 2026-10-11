@@ -21,11 +21,13 @@ executors:
     # permission mode; 0.84.0 offers default, acceptEdits, plan, auto and bypassPermissions.
     # mode: acceptEdits
     # To route one executor to another Anthropic-compatible provider, set it in this executor's
-    # `env` (the agent passes it on to Claude Code), not in a settings file in the working
-    # directory, which would apply to every executor using that directory:
-    #   env: { ANTHROPIC_BASE_URL: https://provider.example/anthropic, ANTHROPIC_AUTH_TOKEN: <key> }
-    # An `env` block in a Claude settings file overrides this env. Check the model values the
-    # agent offers under that provider (scratchpad/probe-acp-agent.mjs) before setting `model`.
+    # environment (the agent passes it on to Claude Code), not in a settings file in the working
+    # directory, which would apply to every executor using that directory. Keep the key out of the
+    # workflow file: put both lines in a KEY=VALUE file outside the repository and name it here:
+    #   envFile: /absolute/path/to/provider.env
+    #   (ANTHROPIC_BASE_URL=https://provider.example/anthropic and ANTHROPIC_AUTH_TOKEN=<key>)
+    # An `env` block in a Claude settings file overrides this environment. Check the model values
+    # the agent offers under that provider (scratchpad/probe-acp-agent.mjs) before setting `model`.
 
 tasks:
   identify:

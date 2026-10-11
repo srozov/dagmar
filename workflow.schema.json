@@ -76,6 +76,9 @@
             "env": {
               "$ref": "#/$defs/env"
             },
+            "envFile": {
+              "$ref": "#/$defs/path"
+            },
             "model": {
               "type": "string",
               "minLength": 1
@@ -101,6 +104,9 @@
             },
             "env": {
               "$ref": "#/$defs/env"
+            },
+            "envFile": {
+              "$ref": "#/$defs/path"
             }
           }
         }
