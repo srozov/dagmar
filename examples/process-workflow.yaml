@@ -1,4 +1,10 @@
+# Run from this checkout: the tasks call examples/process-result.mjs by a relative path. Replace
+# /ABSOLUTE/PATH/TO/dagmar with the checkout's absolute path.
 id: process-example
+executors:
+  local-process:
+    type: process
+    cwd: /ABSOLUTE/PATH/TO/dagmar
 tasks:
   first:
     executor: local-process
