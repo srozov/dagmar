@@ -1,4 +1,9 @@
+# The tasks call examples/process-result.mjs by a relative path, so run this in the checkout:
+#   dagmar run process-example --cwd /absolute/path/to/dagmar --input-json '{"hello":"world"}'
 id: process-example
+executors:
+  local-process:
+    type: process
 tasks:
   first:
     executor: local-process
