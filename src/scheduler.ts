@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
+import type { AttemptRow, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
@@ -25,7 +25,6 @@ export class Scheduler {
     private readonly transcripts: Transcripts,
     private readonly workflows: WorkflowRepository,
     private readonly events: Events,
-    private readonly profiles: Config["executors"],
     private readonly executors: Executors,
     private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
@@ -190,7 +189,7 @@ export class Scheduler {
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
         if (!candidate || !this.depsSettled(workflow, task, taskId, latest, loops, existing, run, due)) continue;
-        const item = this.prepare(run, taskId, task, latest, now);
+        const item = this.prepare(run, workflow, taskId, task, latest, now);
         prepared.push(item); latest.set(taskId, item.row); pos.set(item.row.id, pos.size); progressed = true;
       }
       if (!progressed) break;
@@ -221,14 +220,14 @@ export class Scheduler {
     }
   }
 
-  private prepare(run: RunRow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
+  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
     // Guard branch first: a task whose `when` clauses are unsatisfied becomes a terminal, non-launching
     // skipped attempt. The real executorType/executorProfile are preserved so view() surfaces the
     // task's kind accurately. Sits ABOVE the gate branch so a conditional gate is decided by the
     // guard, not parked.
     if (task.when && task.when.length && !this.guardPasses(task, run.input, latest)) {
       const isGate = Boolean(task.gate);
-      const executorType = isGate ? "gate" as const : (this.profiles[task.executor!]?.type ?? "process");
+      const executorType = isGate ? "gate" as const : (workflow.executors[task.executor!]?.type ?? "process");
       const executorProfile = isGate ? "gate" : task.executor!;
       return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: "skipped" as const, result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
     }
@@ -241,7 +240,7 @@ export class Scheduler {
         return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
       }
     }
-    const profile = this.profiles[task.executor!];
+    const profile = workflow.executors[task.executor!];
     const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
