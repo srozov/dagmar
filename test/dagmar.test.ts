@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { stringify } from "yaml";
 import { loadConfig } from "../src/config.js";
@@ -14,7 +17,7 @@ import { EventBus, RpcClient } from "../src/rpc.js";
 import { Scheduler } from "../src/scheduler.js";
 import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
-import type { Config, Json, RunView, TaskResult } from "../src/types.js";
+import type { ExecutorProfile, Json, RunView, TaskResult, Workflow } from "../src/types.js";
 import { DagmarError } from "../src/types.js";
 import { WorkflowRepository, validateWorkflow } from "../src/workflow.js";
 
@@ -100,6 +103,7 @@ test("blocked runs resume only the blocker and cancellation is terminal", async 
     join(root, "workflows", "resume.yaml"),
     stringify({
       id: "resume",
+      executors: defaultExecutors(root),
       tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, wait] } },
     }),
   );
@@ -140,6 +144,7 @@ test("a failed branch does not stop its sibling and task cancellation blocks dep
     join(root, "workflows", "branches.yaml"),
     stringify({
       id: "branches",
+      executors: defaultExecutors(root),
       tasks: {
         wait: { executor: "local", inputs: {}, run: [process.execPath, wait] },
         after: {
@@ -197,9 +202,9 @@ test("daemon exposes the process runtime through JSON-RPC", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-daemon-")), workflows = join(root, "workflows"), state = join(root, "state"), script = join(root, "done.mjs");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflows, { recursive: true }));
   await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'done',output:{}}));`);
-  await writeFile(join(workflows, "one.yaml"), stringify({ id: "one", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, script] } } }));
+  await writeFile(join(workflows, "one.yaml"), stringify({ id: "one", executors: { local: { type: "process", cwd: root } }, tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, script] } } }));
   const port = await freePort(), config = join(root, "config.yaml");
-  await writeFile(config, stringify({ workflowDir: workflows, storageDir: state, listen: { host: "127.0.0.1", port }, executors: { local: { type: "process", cwd: root, env: {} } } }));
+  await writeFile(config, stringify({ workflowDir: workflows, storageDir: state, listen: { host: "127.0.0.1", port } }));
   const daemon = await startDaemon(config), client = new RpcClient(`ws://127.0.0.1:${port}`); await client.connect();
   try {
     const ping = await client.request("system.ping") as JsonObject; assert.equal(ping.ok, true);
@@ -213,7 +218,7 @@ test("startup recovery blocks persisted active attempts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-recovery-"));
   const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   await app.scheduler.recover();
   assert.equal(app.store.run("wr_recovery")!.status, "blocked");
@@ -294,15 +299,15 @@ test("transcript line numbering survives idle eviction of cached counts", async 
 test("workflow.get resolves the requested workflow without being broken by invalid siblings", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-get-")), dir = join(root, "workflows");
   await mkdir(dir, { recursive: true });
-  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} } };
-  await writeFile(join(dir, "alpha.yaml"), stringify({ id: "alpha", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
-  await writeFile(join(dir, "beta.yaml"), stringify({ id: "beta", tasks: { t: { executor: "ghost", inputs: {} } } }));
-  const repo = new WorkflowRepository(dir, profiles);
+  const executors: Record<string, ExecutorProfile> = { local: { type: "process", cwd: root, env: {} } };
+  await writeFile(join(dir, "alpha.yaml"), stringify({ id: "alpha", executors, tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await writeFile(join(dir, "beta.yaml"), stringify({ id: "beta", executors, tasks: { t: { executor: "ghost", inputs: {} } } }));
+  const repo = new WorkflowRepository(dir);
   assert.equal((await repo.get("alpha")).id, "alpha");
   await assert.rejects(repo.get("beta"), (error) => error instanceof DagmarError);
   await assert.rejects(repo.get("missing"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
-  await writeFile(join(dir, "dup-a.yaml"), stringify({ id: "gamma", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
-  await writeFile(join(dir, "dup-b.yaml"), stringify({ id: "gamma", tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await writeFile(join(dir, "dup-a.yaml"), stringify({ id: "gamma", executors, tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  await writeFile(join(dir, "dup-b.yaml"), stringify({ id: "gamma", executors, tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
   await assert.rejects(repo.get("gamma"), (error) => error instanceof DagmarError && error.code === "workflow_not_found");
 });
 
@@ -350,14 +355,14 @@ test("a cancelled run exposes unstarted tasks as cancelled", async () => {
 // same-agent ACP dependency, and rejects every variant the plan enumerates. Profiles are
 // passed in directly so each rejection can pin a specific failure mode without disk I/O.
 test("validateWorkflow accepts continue with a same-agent ACP dependency and rejects variants", () => {
-  const profiles: Config["executors"] = {
+  const profiles: Record<string, ExecutorProfile> = {
     acpA: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] },
     acpB: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] }, // same agent as acpA
     acpOther: { type: "acp", cwd: "/tmp", env: {}, run: ["other"] }, // different agent
     proc: { type: "process", cwd: "/tmp", env: {} },
   };
   // Accept: same-agent acp dependency.
-  const ok = validateWorkflow({
+  const ok = validate({
     id: "ok",
     tasks: {
       A: { executor: "acpA", inputs: {}, prompt: "a" },
@@ -369,7 +374,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
 
   // Reject: missing `from` for continue.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         A: { executor: "acpA", inputs: {}, prompt: "a" },
@@ -381,7 +386,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
 
   // Reject: `from` not in dependsOn.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         A: { executor: "acpA", inputs: {}, prompt: "a" },
@@ -394,7 +399,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
 
   // Reject: `from` is a process task (can't continue a process session).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         P: { executor: "proc", inputs: {}, run: ["true"] },
@@ -406,7 +411,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
 
   // Reject: `from` uses a different agent (different run argv).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         A: { executor: "acpA", inputs: {}, prompt: "a" },
@@ -418,7 +423,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
 
   // Reject: mode: fork (still unsupported).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { A: { executor: "acpA", inputs: {}, prompt: "a", session: { mode: "fork" } } },
     }, profiles),
@@ -588,12 +593,11 @@ test("scheduler forwards the executor profile's model and mode on the ACP reques
   const root = await mkdtemp(join(tmpdir(), "dagmar-model-fwd-"));
   const workflowDir = join(root, "workflows");
   await mkdir(workflowDir, { recursive: true });
-  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
-  const profiles: Config["executors"] = { reviewer: { type: "acp", cwd: root, env: {}, run: ["unused"], model: "opus", mode: "plan" } };
+  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", executors: { reviewer: { type: "acp", cwd: root, run: ["unused"], model: "opus", mode: "plan" } }, tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
   const captured = { request: undefined as AcpRequest | undefined };
   const stub = new StubAcpExecutor(async (request) => { captured.request = request; return { result: { outcome: "completed", message: "a", output: {} } }; });
   const store = new Store(":memory:");
-  const scheduler = new Scheduler(store, new Transcripts(join(root, "state")), new WorkflowRepository(workflowDir, profiles), new EventBus(), profiles, { process: new ProcessExecutor(), acp: stub });
+  const scheduler = new Scheduler(store, new Transcripts(join(root, "state")), new WorkflowRepository(workflowDir), new EventBus(), { process: new ProcessExecutor(), acp: stub });
   const started = await scheduler.start("fwd", {});
   await waitFor(scheduler, started.workflowRunId, "completed");
   assert.equal(captured.request?.model, "opus");
@@ -601,24 +605,34 @@ test("scheduler forwards the executor profile's model and mode on the ACP reques
   store.close();
 });
 
-test("loadConfig accepts model on ACP profiles only and rejects an empty model", async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-config-model-"));
-  let n = 0;
-  const write = async (executors: object) => { const path = join(root, `config-${++n}.yaml`); await writeFile(path, stringify({ workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 }, executors })); return path; };
-  const config = await loadConfig(await write({ reviewer: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, model: "opus" } }));
-  assert.equal(config.executors.reviewer!.model, "opus");
-  await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, model: "opus" } })), /unknown field model/);
-  await assert.rejects(loadConfig(await write({ reviewer: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, model: "" } })), /model must be a non-empty string/);
+test("loadConfig rejects executors, which a workflow declares", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-config-"));
+  const path = join(root, "config.yaml"), base = { workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 } };
+  await writeFile(path, stringify(base));
+  assert.deepEqual(await loadConfig(path), base);
+  await writeFile(path, stringify({ ...base, executors: { local: { type: "process", cwd: root } } }));
+  await assert.rejects(loadConfig(path), /unknown field executors/);
 });
 
-test("loadConfig accepts mode on ACP profiles only and rejects an empty mode", async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-config-mode-"));
-  let n = 0;
-  const write = async (executors: object) => { const path = join(root, `config-${++n}.yaml`); await writeFile(path, stringify({ workflowDir: root, storageDir: root, listen: { host: "127.0.0.1", port: 7331 }, executors })); return path; };
-  const config = await loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "acceptEdits" } }));
-  assert.equal(config.executors.builder!.mode, "acceptEdits");
-  await assert.rejects(loadConfig(await write({ check: { type: "process", cwd: root, env: {}, mode: "acceptEdits" } })), /unknown field mode/);
-  await assert.rejects(loadConfig(await write({ builder: { type: "acp", cwd: root, run: ["/bin/agent"], env: {}, mode: "" } })), /mode must be a non-empty string/);
+test("validateWorkflow reads the workflow's executors and rejects malformed ones", () => {
+  const tasks = { a: { executor: "agent", inputs: {}, prompt: "a" }, p: { executor: "proc", inputs: {}, run: ["node"] } };
+  const agent = { type: "acp", cwd: "/tmp", run: ["/bin/agent"] }, proc = { type: "process", cwd: "/tmp" };
+  const ok = validateWorkflow({ id: "x", executors: { agent: { ...agent, env: { A: "1" }, model: "opus", mode: "acceptEdits" }, proc }, tasks });
+  assert.deepEqual(ok.executors, { agent: { type: "acp", cwd: "/tmp", run: ["/bin/agent"], env: { A: "1" }, model: "opus", mode: "acceptEdits" }, proc: { type: "process", cwd: "/tmp", env: {} } });
+  const invalid = (executors: object) => assert.throws(() => validateWorkflow({ id: "x", executors, tasks }), (error) => error instanceof DagmarError && error.code === "workflow_invalid");
+  invalid({ agent, proc: { ...proc, model: "opus" } }); // model and mode are ACP-only
+  invalid({ agent, proc: { ...proc, mode: "acceptEdits" } });
+  invalid({ agent: { ...agent, model: "" }, proc });
+  invalid({ agent: { ...agent, mode: "" }, proc });
+  invalid({ agent: { ...agent, extra: true }, proc });
+  invalid({ agent: { type: "acp", cwd: "/tmp" }, proc }); // an ACP executor needs run
+  invalid({ agent: { ...agent, run: [""] }, proc });
+  invalid({ agent, proc: { ...proc, cwd: "relative" } });
+  invalid({ agent, proc: { ...proc, env: { A: 1 } } });
+  invalid({ agent, proc: { ...proc, env: { "A=B": "1" } } });
+  invalid({ agent, proc: { type: "gate", cwd: "/tmp" } });
+  invalid({ agent, proc, "-bad": proc });
+  assert.throws(() => validateWorkflow({ id: "x", executors: { agent }, tasks }), (error) => error instanceof DagmarError && error.code === "unknown_executor");
 });
 
 // Profile mode selection reuses the model fake agent with a "mode" config option.
@@ -698,13 +712,13 @@ test("scheduler fails the continuing task with continuation_unavailable when the
 // is an ACP-only flag. Mirrors the T1 validateWorkflow test (lines 348-426): profiles
 // are passed directly so each case pins a specific failure mode without disk I/O.
 test("validateWorkflow accepts interactive on ACP tasks and rejects it on process tasks", () => {
-  const profiles: Config["executors"] = {
+  const profiles: Record<string, ExecutorProfile> = {
     acp: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] },
     proc: { type: "process", cwd: "/tmp", env: {} },
   };
 
   // Accept: ACP task with interactive: true; the normalized TaskDef carries it.
-  const ok = validateWorkflow({
+  const ok = validate({
     id: "ok",
     tasks: { A: { executor: "acp", inputs: {}, prompt: "talk", interactive: true } },
   }, profiles);
@@ -713,7 +727,7 @@ test("validateWorkflow accepts interactive on ACP tasks and rejects it on proces
   // Reject: process task with interactive: true. The validator must surface a clear
   // `invalid_task` code (not a schema shape failure — the JSON schema accepts boolean).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { P: { executor: "proc", inputs: {}, run: ["true"], interactive: true } },
     }, profiles),
@@ -930,23 +944,23 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 // test (lines 348-426): profiles are passed in directly so each case pins a specific failure mode
 // without disk I/O.
 test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
-  const profiles: Config["executors"] = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
+  const profiles: Record<string, ExecutorProfile> = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
 
   // Accept: a gate task with no executor and a prompt.
-  const ok1 = validateWorkflow({ id: "g1", tasks: { g: { inputs: {}, gate: { prompt: "Approve?" } } } }, profiles);
+  const ok1 = validate({ id: "g1", tasks: { g: { inputs: {}, gate: { prompt: "Approve?" } } } }, profiles);
   assert.equal(ok1.tasks.g!.gate?.prompt, "Approve?");
   assert.equal(ok1.tasks.g!.gate?.schema, undefined);
   assert.equal(ok1.tasks.g!.executor, undefined);
 
   // Accept: a gate task with a schema; the schema flows through.
-  const ok2 = validateWorkflow({
+  const ok2 = validate({
     id: "g2",
     tasks: { g: { inputs: {}, gate: { prompt: "Review", schema: { type: "string" } } } },
   }, profiles);
   assert.deepEqual(ok2.tasks.g!.gate?.schema, { type: "string" });
 
   // Accept: a gate task with deps + inputs (references will resolve during prepare()).
-  const ok3 = validateWorkflow({
+  const ok3 = validate({
     id: "g3",
     tasks: {
       dep: { executor: "agent", inputs: {}, prompt: "a" },
@@ -957,55 +971,55 @@ test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
 
   // Reject: task with both executor and gate.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { executor: "agent", inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { executor: "agent", inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /cannot have both/.test(error.message),
   );
 
   // Reject: task with neither executor nor gate.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {} } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {} } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /requires executor or gate/.test(error.message),
   );
 
   // Reject: gate task with prompt (the task-level field, not gate.prompt).
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, prompt: "p", gate: { prompt: "?" } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
   );
 
   // Reject: gate task with run.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, run: ["x"], gate: { prompt: "?" } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, run: ["x"], gate: { prompt: "?" } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
   );
 
   // Reject: gate task with session.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, session: { mode: "fresh" } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, session: { mode: "fresh" } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
   );
 
   // Reject: gate task with interactive.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, interactive: true } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, interactive: true } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
   );
 
   // Reject: gate task with outputSchema.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, outputSchema: { type: "object" } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?" }, outputSchema: { type: "object" } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /must not have/.test(error.message),
   );
 
   // Reject: empty gate prompt.
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "   " } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "   " } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_task" && /non-empty prompt/.test(error.message),
   );
 
   // Reject: invalid gate schema (JSON Schema that fails ajv.compile).
   assert.throws(
-    () => validateWorkflow({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?", schema: { type: 123 } } } } }, profiles),
+    () => validate({ id: "x", tasks: { g: { inputs: {}, gate: { prompt: "?", schema: { type: 123 } } } } }, profiles),
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_output_schema",
   );
 });
@@ -1117,7 +1131,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   const workflow = { id: "gaterecover", tasks: { gate: { inputs: {}, gate: { prompt: "Approve?" } } } };
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   await app.scheduler.recover();
   // Gate survives.
@@ -1151,7 +1165,7 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   };
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
-  app.store.insertRun({ id: "wr_m", workflowId: "gatemix", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertRun({ id: "wr_m", workflowId: "gatemix", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   // Non-gate (process) attempt in 'running'.
   app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   // Gate attempt in 'awaiting_input'.
@@ -1213,7 +1227,7 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
   // Run with endedAt set (simulating the state left by the prior shutdown).
-  app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
+  app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
   app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   assert.equal(app.store.run("wr_m2")!.endedAt, now, "precondition: run arrived with stale endedAt");
@@ -1241,9 +1255,8 @@ test("shutdown() preserves gate attempts across restart", async () => {
   await mkdir(join(root, "workflows"), { recursive: true });
   await mkdir(join(root, "state"), { recursive: true });
   await writeFile(join(root, "workflows", `${workflow.id}.yaml`), stringify(workflow));
-  const profiles1: Config["executors"] = { local: { type: "process", cwd: root, env: {} }, agent: { type: "acp", cwd: root, env: {}, run: ["unused"] } };
   const store1 = new Store(storePath), transcripts1 = new Transcripts(join(root, "state")), events1 = new EventBus();
-  const scheduler1 = new Scheduler(store1, transcripts1, new WorkflowRepository(join(root, "workflows"), profiles1), events1, profiles1, { process: new ProcessExecutor(), acp: new AcpExecutor() });
+  const scheduler1 = new Scheduler(store1, transcripts1, new WorkflowRepository(join(root, "workflows")), events1, { process: new ProcessExecutor(), acp: new AcpExecutor() });
   const started = await scheduler1.start("gateshutdown", {});
   await waitFor(scheduler1, started.workflowRunId, "waiting");
   await scheduler1.shutdown();
@@ -1256,7 +1269,7 @@ test("shutdown() preserves gate attempts across restart", async () => {
 
   // Second scheduler on the same store — recover() reconstructs the gate.
   const store2 = new Store(storePath), transcripts2 = new Transcripts(join(root, "state")), events2 = new EventBus();
-  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows"), profiles1), events2, profiles1, { process: new ProcessExecutor(), acp: new AcpExecutor() });
+  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows")), events2, { process: new ProcessExecutor(), acp: new AcpExecutor() });
   await scheduler2.recover();
   const after = await scheduler2.get(started.workflowRunId);
   assert.equal(after.tasks.gate!.state, "awaiting_input");
@@ -1305,14 +1318,11 @@ test("gate output is available as $tasks.<gate>.output to downstream tasks", asy
 // checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the variants the
 // plan enumerates. Profiles are passed directly so each rejection pins a specific failure mode.
 test("validateWorkflow accepts when guards and rejects malformed variants", () => {
-  const profiles: Config["executors"] = {
+  const profiles: Record<string, ExecutorProfile> = {
     local: { type: "process", cwd: "/tmp", env: {} },
-    gate: { type: "gate", cwd: "/tmp", env: {} } as never, // gate tasks don't need a profile lookup
-    // Gate tasks short-circuit validation (item.gate branch) before the executor profile lookup, so
-    // we register a "gate" key just so any non-gate test that names it as executor can fail loudly.
   };
   // Accept: ref + equals, dep [decide].
-  const ok1 = validateWorkflow({
+  const ok1 = validate({
     id: "ok1",
     tasks: {
       decide: { executor: "local", inputs: {}, run: ["true"] },
@@ -1324,7 +1334,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
   assert.equal(ok1.tasks.branch!.when![0]!.equals, "a");
 
   // Accept: ref + in.
-  const ok2 = validateWorkflow({
+  const ok2 = validate({
     id: "ok2",
     tasks: {
       decide: { executor: "local", inputs: {}, run: ["true"] },
@@ -1334,14 +1344,14 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
   assert.deepEqual(ok2.tasks.branch!.when![0]!.in, ["a", "b"]);
 
   // Accept: run-input ref with NO deps.
-  const ok3 = validateWorkflow({
+  const ok3 = validate({
     id: "ok3",
     tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", equals: "fast" }] } },
   }, profiles);
   assert.equal(ok3.tasks.t!.when![0]!.ref, "$run.input.mode");
 
   // Accept: multi-clause AND.
-  const ok4 = validateWorkflow({
+  const ok4 = validate({
     id: "ok4",
     tasks: {
       decide: { executor: "local", inputs: {}, run: ["true"] },
@@ -1354,7 +1364,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
   assert.equal(ok4.tasks.branch!.when!.length, 2);
 
   // Accept: when on a gate task (guard evaluated before the gate branch).
-  const ok5 = validateWorkflow({
+  const ok5 = validate({
     id: "ok5",
     tasks: {
       decide: { executor: "local", inputs: {}, run: ["true"] },
@@ -1366,7 +1376,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: clause with neither equals nor in.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode" }] } },
     }, profiles),
@@ -1375,7 +1385,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: clause with BOTH equals and in.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", equals: "a", in: ["a"] }] } },
     }, profiles),
@@ -1384,7 +1394,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: empty in.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$run.input.mode", in: [] }] } },
     }, profiles),
@@ -1393,7 +1403,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: $tasks ref to a non-dependency.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         a: { executor: "local", inputs: {}, run: ["true"] },
@@ -1405,7 +1415,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: plain-string ref (not a $ reference).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "route", equals: "a" }] } },
     }, profiles),
@@ -1414,7 +1424,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
 
   // Reject: malformed $ ref -> invalid_input_reference (propagated from reference()).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: { t: { executor: "local", inputs: {}, run: ["true"], when: [{ ref: "$tasks.", equals: "a" }] } },
     }, profiles),
@@ -1669,12 +1679,12 @@ test("a run-input guard decides on the run input and skips or completes accordin
 // the T4 validateWorkflow matrix at lines 1049-1165: profiles are passed in directly so each
 // case pins a specific failure mode.
 test("validateWorkflow accepts loop on a direct-dependency source and rejects malformed variants", () => {
-  const profiles: Config["executors"] = {
+  const profiles: Record<string, ExecutorProfile> = {
     local: { type: "process", cwd: "/tmp", env: {} },
   };
 
   // Accept: direct-dep target with both when and loop; loop fields flow through onto the TaskDef.
-  const ok1 = validateWorkflow({
+  const ok1 = validate({
     id: "loop-ok1",
     tasks: {
       verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1689,7 +1699,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
   assert.equal(ok1.tasks.fixup!.loop!.maxVisits, 3);
 
   // Accept: a loop source without a `when` guard (topology-only check).
-  const ok2 = validateWorkflow({
+  const ok2 = validate({
     id: "loop-ok2",
     tasks: {
       verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1703,7 +1713,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Reject: loop.to refers to an unknown task.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1715,7 +1725,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Reject: loop.to is not a direct dependency.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1728,7 +1738,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Reject: loop.to === id (self-loop).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         step: { executor: "local", inputs: {}, run: ["true"], loop: { to: "step", maxVisits: 2 } },
@@ -1739,7 +1749,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Reject: maxVisits < 1 (schema rejects 0 with workflow_invalid).
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1751,7 +1761,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Reject: two sources sharing the same loop.to.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         verify: { executor: "local", inputs: {}, run: ["true"] },
@@ -1764,7 +1774,7 @@ test("validateWorkflow accepts loop on a direct-dependency source and rejects ma
 
   // Regression: a raw dependsOn cycle is still rejected as dependency_cycle.
   assert.throws(
-    () => validateWorkflow({
+    () => validate({
       id: "x",
       tasks: {
         a: { executor: "local", inputs: {}, run: ["true"], dependsOn: ["b"] },
@@ -1917,6 +1927,7 @@ test("restart mid-loop: recover() blocks, resume() continues, visit count preser
   await writeFile(echoScript, "for await (const _ of process.stdin) {} console.log(JSON.stringify({outcome:'completed',message:'ok',output:{}}));");
   const workflow = {
     id: "looprestart",
+    executors: defaultExecutors(root),
     tasks: {
       verify: { executor: "local", inputs: {}, run: [process.execPath, verifyScript] },
       fixup: {
@@ -1940,10 +1951,9 @@ test("restart mid-loop: recover() blocks, resume() continues, visit count preser
   await writeFile(counter, "1");
 
   // Pre-insert a mid-loop state: verify#1 was running on a scheduler that has since died.
-  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} } };
   const now = new Date().toISOString();
   const store1 = new Store(storePath);
-  store1.insertRun({ id: "wr_loop_r", workflowId: workflow.id, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  store1.insertRun({ id: "wr_loop_r", workflowId: workflow.id, cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
   store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_loop_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
   store1.close();
 
@@ -1951,7 +1961,7 @@ test("restart mid-loop: recover() blocks, resume() continues, visit count preser
   const store2 = new Store(storePath);
   const transcripts2 = new Transcripts(join(root, "state"));
   const events2 = new EventBus();
-  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows"), profiles), events2, profiles, { process: new ProcessExecutor(), acp: new InteractiveExecutor() });
+  const scheduler2 = new Scheduler(store2, transcripts2, new WorkflowRepository(join(root, "workflows")), events2, { process: new ProcessExecutor(), acp: new InteractiveExecutor() });
   await scheduler2.recover();
   // After recover: in-flight attempt is executor_lost and the run is blocked (the failed
   // task cascades blocked_by_dependency through fixup and review).
@@ -2104,14 +2114,157 @@ test("resume after a failure in a revise round keeps the visit counts", async ()
   app.store.close();
 });
 
+// A process task that reports the directory it runs in.
+async function cwdScript(root: string): Promise<string> {
+  const script = join(root, "cwd.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'cwd',output:{cwd:process.cwd()}}));`);
+  return script;
+}
+
+test("a run's cwd is where its executors without a cwd run; an executor's own cwd wins", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cwd-"))), project = join(root, "project"), fixed = join(root, "fixed");
+  await mkdir(project); await mkdir(fixed);
+  const script = await cwdScript(root);
+  const app = await fixture(root, {
+    id: "cwd",
+    executors: { project: { type: "process" }, fixed: { type: "process", cwd: fixed } },
+    tasks: { a: { executor: "project", inputs: {}, run: [process.execPath, script] }, b: { executor: "fixed", inputs: {}, run: [process.execPath, script] } },
+  });
+  const started = await app.scheduler.start("cwd", {}, project);
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(view.cwd, project);
+  assert.deepEqual(view.tasks.a!.attempts[0]!.result!.output, { cwd: project });
+  assert.deepEqual(view.tasks.b!.attempts[0]!.result!.output, { cwd: fixed });
+  assert.equal(app.scheduler.list()[0]!.cwd, project);
+  app.store.close();
+});
+
+test("run.start checks the run's cwd against the workflow's executors", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cwd-check-"));
+  const app = await fixture(root, { id: "needs", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: ["node"] } } });
+  await writeFile(join(root, "workflows", "own.yaml"), stringify({ id: "own", executors: defaultExecutors(root), tasks: { t: { executor: "local", inputs: {}, run: ["node"] } } }));
+  const rejects = (cwd: string | null, workflowId: string, code: string) => assert.rejects(app.scheduler.start(workflowId, {}, cwd), (error) => error instanceof DagmarError && error.code === code);
+  await rejects(null, "needs", "cwd_required");
+  await rejects("relative", "needs", "invalid_params");
+  await rejects(join(root, "missing"), "needs", "invalid_params");
+  await rejects(join(root, "workflows", "own.yaml"), "needs", "invalid_params"); // a file, not a directory
+  await rejects(root, "own", "cwd_unused");
+  assert.equal(app.scheduler.list().length, 0);
+  app.store.close();
+});
+
+test("one workflow runs on two cwds at once, but once per cwd", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-cwd-active-")), one = join(root, "one"), two = join(root, "two"), wait = join(root, "wait.mjs");
+  await mkdir(one); await mkdir(two);
+  await writeFile(wait, `for await(const _ of process.stdin){};setInterval(()=>{},1000);`);
+  const app = await fixture(root, { id: "long", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: [process.execPath, wait] } } });
+  try {
+    await app.scheduler.start("long", {}, one);
+    await app.scheduler.start("long", {}, two);
+    await assert.rejects(app.scheduler.start("long", {}, one), (error) => error instanceof DagmarError && error.code === "active_run_exists" && error.message.includes(one));
+  } finally { await app.scheduler.shutdown(); app.store.close(); }
+});
+
+test("a database from before run cwds is upgraded in place", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-upgrade-")), path = join(root, "dagmar.sqlite");
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE workflow_runs (
+ id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, input_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','blocked','cancelled')),
+ started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT
+);
+CREATE UNIQUE INDEX one_active_run_per_workflow ON workflow_runs(workflow_id) WHERE status IN ('running','waiting');
+INSERT INTO workflow_runs VALUES('wr_old','w','{"task":"t"}','completed','2026-10-07T00:00:00.000Z','2026-10-07T00:00:00.000Z','2026-10-07T00:00:00.000Z');`);
+  old.close();
+  const store = new Store(path);
+  try {
+    assert.deepEqual(store.run("wr_old"), { id: "wr_old", workflowId: "w", cwd: null, input: { task: "t" }, status: "completed", startedAt: "2026-10-07T00:00:00.000Z", updatedAt: "2026-10-07T00:00:00.000Z", endedAt: "2026-10-07T00:00:00.000Z" });
+    const now = new Date().toISOString(), active = (id: string, cwd: string | null) => store.insertRun({ id, workflowId: "w", cwd, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+    active("wr_a", "/a"); active("wr_b", "/b"); active("wr_none", null);
+    assert.throws(() => active("wr_a2", "/a"), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+    assert.throws(() => active("wr_none2", null), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+  } finally { store.close(); }
+  const reopened = new Store(path); // the upgrade is idempotent
+  assert.equal(reopened.runs().length, 4);
+  reopened.close();
+});
+
+test("a run's cwd survives a daemon restart", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cwd-restart-"))), project = join(root, "project"), storePath = join(root, "state", "dagmar.sqlite");
+  await mkdir(project); await mkdir(join(root, "workflows")); await mkdir(join(root, "state"));
+  const script = await cwdScript(root);
+  await writeFile(join(root, "workflows", "later.yaml"), stringify({
+    id: "later",
+    executors: { project: { type: "process" } },
+    tasks: { gate: { inputs: {}, gate: { prompt: "Go?" } }, after: { executor: "project", dependsOn: ["gate"], inputs: {}, run: [process.execPath, script] } },
+  }));
+  const scheduler = (store: Store) => new Scheduler(store, new Transcripts(join(root, "state")), new WorkflowRepository(join(root, "workflows")), new EventBus(), { process: new ProcessExecutor(), acp: new InteractiveExecutor() });
+  const store1 = new Store(storePath), scheduler1 = scheduler(store1);
+  const started = await scheduler1.start("later", {}, project);
+  await waitFor(scheduler1, started.workflowRunId, "waiting");
+  await scheduler1.shutdown(); store1.close();
+  const store2 = new Store(storePath), scheduler2 = scheduler(store2);
+  await scheduler2.recover();
+  await scheduler2.answer(scheduler2.interactions()[0]!.id, "go");
+  const view = await waitFor(scheduler2, started.workflowRunId, "completed");
+  assert.deepEqual(view.tasks.after!.attempts[0]!.result!.output, { cwd: project });
+  store2.close();
+});
+
+test("the CLI sends --cwd as an absolute path, resolved in the caller's directory", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cli-cwd-"))), project = join(root, "project"), workflows = join(root, "workflows");
+  await mkdir(project); await mkdir(workflows);
+  const script = await cwdScript(root);
+  await writeFile(join(workflows, "here.yaml"), stringify({ id: "here", executors: { project: { type: "process" } }, tasks: { t: { executor: "project", inputs: {}, run: [process.execPath, script] } } }));
+  const port = await freePort(), config = join(root, "config.yaml");
+  await writeFile(config, stringify({ workflowDir: workflows, storageDir: join(root, "state"), listen: { host: "127.0.0.1", port } }));
+  const daemon = await startDaemon(config), client = new RpcClient(`ws://127.0.0.1:${port}`); await client.connect();
+  try {
+    const cli = spawn(process.execPath, ["--import", import.meta.resolve("tsx"), fileURLToPath(new URL("../src/cli.ts", import.meta.url)), "--config", config, "run", "here", "--cwd", "."], { cwd: project });
+    let stdout = ""; cli.stdout.on("data", (chunk) => { stdout += chunk; });
+    assert.equal(await new Promise((resolve) => cli.once("close", resolve)), 0);
+    const { workflowRunId } = JSON.parse(stdout) as { workflowRunId: string };
+    let view: RunView | undefined;
+    for (let i = 0; i < 200; i++) { view = await client.request("run.get", { workflowRunId }) as unknown as RunView; if (view.status === "completed") break; await new Promise((resolve) => setTimeout(resolve, 10)); }
+    assert.equal(view!.cwd, project);
+    assert.deepEqual(view!.tasks.t!.attempts[0]!.result!.output, { cwd: project });
+  } finally { client.close(); await daemon.stop(); }
+});
+
+test("an executor's envFile reaches its task between the daemon's env and its own env", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-envfile-")), script = join(root, "env.mjs"), file = join(root, "secrets.env");
+  await writeFile(script, `for await(const _ of process.stdin){};const {FROM_FILE,OVERRIDDEN,HOME}=process.env;console.log(JSON.stringify({outcome:'completed',message:'env',output:{FROM_FILE,OVERRIDDEN,HOME}}));`);
+  await writeFile(file, "# a comment\nFROM_FILE=file\nOVERRIDDEN=file\nHOME=/from-file\n");
+  const app = await fixture(root, {
+    id: "envfile",
+    executors: { secret: { type: "process", cwd: root, envFile: file, env: { OVERRIDDEN: "literal" } }, broken: { type: "process", cwd: root, envFile: join(root, "missing.env") } },
+    tasks: { ok: { executor: "secret", inputs: {}, run: [process.execPath, script] }, bad: { executor: "broken", inputs: {}, run: [process.execPath, script] } },
+  });
+  const started = await app.scheduler.start("envfile", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.ok!.attempts[0]!.result!.output, { FROM_FILE: "file", OVERRIDDEN: "literal", HOME: "/from-file" });
+  assert.equal(view.tasks.bad!.attempts[0]!.error!.code, "env_file_unreadable");
+  assert.throws(() => validateWorkflow({ id: "x", executors: { e: { type: "process", envFile: "relative.env" } }, tasks: { t: { executor: "e", inputs: {}, run: ["node"] } } }), (error) => error instanceof DagmarError && error.code === "workflow_invalid");
+  app.store.close();
+});
+
+// Writes the workflow with the default `local` and `agent` executors unless it declares its own.
 async function fixture(root: string, workflow: object, acp: Executor<AcpRequest> = new InteractiveExecutor()) {
   const workflowDir = join(root, "workflows"), storageDir = join(root, "state");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflowDir, { recursive: true }));
-  await writeFile(join(workflowDir, `${(workflow as { id: string }).id}.yaml`), stringify(workflow));
-  const profiles: Config["executors"] = { local: { type: "process", cwd: root, env: {} }, agent: { type: "acp", cwd: root, env: {}, run: ["unused"] } };
+  await writeFile(join(workflowDir, `${(workflow as { id: string }).id}.yaml`), stringify({ executors: defaultExecutors(root), ...workflow }));
   const store = new Store(":memory:"), transcripts = new Transcripts(storageDir), events = new EventBus();
-  const scheduler = new Scheduler(store, transcripts, new WorkflowRepository(workflowDir, profiles), events, profiles, { process: new ProcessExecutor(), acp });
+  const scheduler = new Scheduler(store, transcripts, new WorkflowRepository(workflowDir), events, { process: new ProcessExecutor(), acp });
   return { store, transcripts, events, scheduler };
+}
+
+function defaultExecutors(root: string): Record<string, ExecutorProfile> {
+  return { local: { type: "process", cwd: root, env: {} }, agent: { type: "acp", cwd: root, env: {}, run: ["unused"] } };
+}
+
+// Validation tests pass a workflow's executors alongside its tasks.
+function validate(raw: object, executors: Record<string, ExecutorProfile>): Workflow {
+  return validateWorkflow({ ...raw, executors });
 }
 
 class InteractiveExecutor implements Executor<AcpRequest> {

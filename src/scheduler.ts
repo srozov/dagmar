@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { isAbsolute } from "node:path";
+import { parseEnv } from "node:util";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, Config, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
+import type { AttemptRow, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
@@ -25,16 +29,24 @@ export class Scheduler {
     private readonly transcripts: Transcripts,
     private readonly workflows: WorkflowRepository,
     private readonly events: Events,
-    private readonly profiles: Config["executors"],
     private readonly executors: Executors,
     private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
-  async start(workflowId: string, input: Json): Promise<{ workflowRunId: string; status: "running" }> {
+  // `cwd` is the run's working directory, for every executor without a cwd of its own. A workflow with
+  // such an executor needs one; a workflow whose executors all have their own rejects one, since it
+  // would only split the one-active-run rule without changing where anything runs.
+  async start(workflowId: string, input: Json, cwd: string | null = null): Promise<{ workflowRunId: string; status: "running" }> {
     if (this.stopping) throw new DagmarError("daemon_shutting_down", "Daemon is shutting down");
-    await this.workflows.get(workflowId);
+    const workflow = await this.workflows.get(workflowId);
+    const needsCwd = Object.values(workflow.tasks).some((task) => task.executor !== undefined && workflow.executors[task.executor]!.cwd === undefined);
+    if (cwd === null && needsCwd) throw new DagmarError("cwd_required", `Workflow ${workflowId} needs a cwd: one of its executors has none of its own`);
+    if (cwd !== null) {
+      if (!needsCwd) throw new DagmarError("cwd_unused", `Workflow ${workflowId} takes no cwd: each of its executors has its own`);
+      if (!isAbsolute(cwd) || !await stat(cwd).then((x) => x.isDirectory(), () => false)) throw new DagmarError("invalid_params", "cwd must be the absolute path of an existing directory");
+    }
     const id = `wr_${randomUUID()}`, now = timestamp();
-    this.store.insertRun({ id, workflowId, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+    this.store.insertRun({ id, workflowId, cwd, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
     this.emitRun(id, "running");
     this.background(this.serial(id, () => this.advance(id, false, false)));
     return { workflowRunId: id, status: "running" };
@@ -190,7 +202,7 @@ export class Scheduler {
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
         if (!candidate || !this.depsSettled(workflow, task, taskId, latest, loops, existing, run, due)) continue;
-        const item = this.prepare(run, taskId, task, latest, now);
+        const item = this.prepare(run, workflow, taskId, task, latest, now);
         prepared.push(item); latest.set(taskId, item.row); pos.set(item.row.id, pos.size); progressed = true;
       }
       if (!progressed) break;
@@ -221,14 +233,14 @@ export class Scheduler {
     }
   }
 
-  private prepare(run: RunRow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
+  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
     // Guard branch first: a task whose `when` clauses are unsatisfied becomes a terminal, non-launching
     // skipped attempt. The real executorType/executorProfile are preserved so view() surfaces the
     // task's kind accurately. Sits ABOVE the gate branch so a conditional gate is decided by the
     // guard, not parked.
     if (task.when && task.when.length && !this.guardPasses(task, run.input, latest)) {
       const isGate = Boolean(task.gate);
-      const executorType = isGate ? "gate" as const : (this.profiles[task.executor!]?.type ?? "process");
+      const executorType = isGate ? "gate" as const : (workflow.executors[task.executor!]?.type ?? "process");
       const executorProfile = isGate ? "gate" : task.executor!;
       return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: "skipped" as const, result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
     }
@@ -241,12 +253,17 @@ export class Scheduler {
         return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
       }
     }
-    const profile = this.profiles[task.executor!];
+    const profile = workflow.executors[task.executor!];
     const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
+      // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
+      const cwd = profile.cwd ?? run.cwd;
+      if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
       const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest));
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd: profile.cwd, env: { ...this.env, ...profile.env }, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      // The daemon's environment, then the executor's envFile, then its literal env on top.
+      const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
+      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -509,4 +526,9 @@ function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => jsonEqual(x, b[i]));
   const ak = Object.keys(a), bk = Object.keys(b as object);
   return ak.length === bk.length && ak.every((k) => Object.hasOwn(b as object, k) && jsonEqual((a as {[k:string]:Json})[k], (b as {[k:string]:Json})[k]));
+}
+// Read on every task start, so a changed file (a rotated key) applies without a restart.
+function envFile(path: string): NodeJS.Dict<string> {
+  try { return parseEnv(readFileSync(path, "utf8")); }
+  catch { throw new DagmarError("env_file_unreadable", `Cannot read env file ${path}`); }
 }

@@ -10,7 +10,7 @@ import { DagmarError } from "./types.js";
 const shape = new Ajv({ allErrors: true, strict: false }).compile(JSON.parse(readFileSync(new URL("../workflow.schema.json", import.meta.url), "utf8")));
 
 export class WorkflowRepository {
-  constructor(private readonly dir: string, private readonly profiles: Readonly<Record<string, ExecutorProfile>>) {}
+  constructor(private readonly dir: string) {}
 
   async list(): Promise<{ workflows: Array<{ id: string; taskCount: number; file: string }>; errors: WorkflowErrorView[] }> {
     const found = await this.discover();
@@ -31,7 +31,7 @@ export class WorkflowRepository {
     }
     // A duplicated id is excluded from the valid set by discover(), so it is not resolvable here either.
     if (matches.length !== 1) throw new DagmarError("workflow_not_found", `Workflow ${id} was not found`);
-    return validateWorkflow(matches[0], this.profiles);
+    return validateWorkflow(matches[0]);
   }
 
   private async files(): Promise<string[]> {
@@ -48,7 +48,7 @@ export class WorkflowRepository {
         const text = await readFile(join(this.dir, file), "utf8");
         const raw = yaml(text);
         const id = idOf(raw);
-        rows.push({ file, ...(id ? { id } : {}), workflow: validateWorkflow(raw, this.profiles) });
+        rows.push({ file, ...(id ? { id } : {}), workflow: validateWorkflow(raw) });
       } catch (error) {
         const e = error instanceof DagmarError ? error : new DagmarError("workflow_invalid", "Workflow is invalid");
         let id: string | undefined;
@@ -69,9 +69,11 @@ export class WorkflowRepository {
   }
 }
 
-export function validateWorkflow(value: unknown, profiles: Readonly<Record<string, ExecutorProfile>>): Workflow {
+export function validateWorkflow(value: unknown): Workflow {
   if (!shape(value)) throw new DagmarError("workflow_invalid", "Workflow does not match workflow.schema.json");
-  const raw = value as { id: string; tasks: Record<string, Omit<TaskDef, "dependsOn" | "session"> & { dependsOn?: string[]; session?: { mode: string; from?: unknown } }> };
+  const raw = value as { id: string; executors?: Record<string, Omit<ExecutorProfile, "env"> & { env?: Record<string, string> }>; tasks: Record<string, Omit<TaskDef, "dependsOn" | "session"> & { dependsOn?: string[]; session?: { mode: string; from?: unknown } }> };
+  const profiles: Record<string, ExecutorProfile> = {};
+  for (const [name, executor] of Object.entries(raw.executors ?? {})) profiles[name] = { ...executor, env: executor.env ?? {} };
   const tasks: Record<string, TaskDef> = {};
   for (const [id, item] of Object.entries(raw.tasks)) {
     if (item.gate) {
@@ -156,7 +158,7 @@ export function validateWorkflow(value: unknown, profiles: Readonly<Record<strin
     done.add(id);
   };
   for (const id of Object.keys(tasks)) visit(id);
-  return { id: raw.id, tasks };
+  return { id: raw.id, executors: profiles, tasks };
 }
 
 export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>): JsonObject {
