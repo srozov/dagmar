@@ -1,9 +1,8 @@
 # Review-iteration loop: implement → verify → fixup (bounded loop) → review → human gate → done/revise.
 #
 # Template for docs/mvp-acceptance.md. Before use, replace /ABSOLUTE/PATH/TO/dagmar with the
-# absolute path of this checkout, /ABSOLUTE/PATH/TO/claude-agent-acp with the adapter's, and
-# /ABSOLUTE/PATH/TO/target-worktree with the repository the agents work on. The three executors
-# share that one `cwd`:
+# absolute path of this checkout and /ABSOLUTE/PATH/TO/claude-agent-acp with the adapter's. The run
+# gives the repository the agents work on (`--cwd`), and all three executors work there:
 #   builder  — edits without permission asks
 #   reviewer — the same agent (`run` must be byte-identical to builder's, so it can continue the
 #              builder's session), a different model; `mode: default` (on claude-agent-acp 0.84.0
@@ -16,19 +15,16 @@ id: review-iteration-loop
 executors:
   builder:
     type: acp
-    cwd: /ABSOLUTE/PATH/TO/target-worktree
     run: &agent [node, /ABSOLUTE/PATH/TO/claude-agent-acp/dist/index.js]
     model: sonnet
     mode: acceptEdits
   reviewer:
     type: acp
-    cwd: /ABSOLUTE/PATH/TO/target-worktree
     run: *agent
     model: opus
     mode: default
   check:
     type: process
-    cwd: /ABSOLUTE/PATH/TO/target-worktree
 tasks:
   implement:
     executor: builder

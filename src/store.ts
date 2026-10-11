@@ -9,7 +9,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS workflow_runs (
  id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, input_json TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','blocked','cancelled')),
- started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT
+ started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT, cwd TEXT
 );
 CREATE TABLE IF NOT EXISTS task_runs (
  id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), task_id TEXT NOT NULL,
@@ -19,13 +19,16 @@ CREATE TABLE IF NOT EXISTS task_runs (
  result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT,
  UNIQUE(workflow_run_id,task_id,attempt)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_workflow ON workflow_runs(workflow_id) WHERE status IN ('running','waiting');
 CREATE INDEX IF NOT EXISTS task_runs_by_workflow ON task_runs(workflow_run_id,task_id,attempt);`;
 
 type Row = Record<string, unknown>;
 
+// One active run per workflow and working directory. Runs without a cwd share one key per workflow:
+// ifnull, because SQLite treats NULLs as distinct in a unique index.
+const ACTIVE_RUN_INDEX = `CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_workflow_cwd ON workflow_runs(workflow_id,ifnull(cwd,'')) WHERE status IN ('running','waiting')`;
+
 // SQLite extended result code for a UNIQUE-constraint violation. The only such
-// index that can fire on insertRun is one_active_run_per_workflow (run ids are
+// index that can fire on insertRun is one_active_run_per_workflow_cwd (run ids are
 // fresh UUIDs, so the primary key never collides), so this maps to active_run_exists.
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
@@ -35,6 +38,11 @@ export class Store {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SQL);
+    // Upgrade a database from before runs had a cwd: add the column, and replace the old
+    // one-active-run-per-workflow index. Each step is idempotent.
+    if (!(this.db.prepare("PRAGMA table_info(workflow_runs)").all() as Row[]).some((column) => column.name === "cwd")) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN cwd TEXT");
+    this.db.exec("DROP INDEX IF EXISTS one_active_run_per_workflow");
+    this.db.exec(ACTIVE_RUN_INDEX);
   }
   close(): void {
     if (this.db.isOpen) this.db.close();
@@ -53,9 +61,9 @@ export class Store {
 
   insertRun(run: RunRow): void {
     try {
-      this.db.prepare("INSERT INTO workflow_runs VALUES(?,?,?,?,?,?,?)").run(run.id, run.workflowId, JSON.stringify(run.input), run.status, run.startedAt, run.updatedAt, run.endedAt);
+      this.db.prepare("INSERT INTO workflow_runs(id,workflow_id,cwd,input_json,status,started_at,updated_at,ended_at) VALUES(?,?,?,?,?,?,?,?)").run(run.id, run.workflowId, run.cwd, JSON.stringify(run.input), run.status, run.startedAt, run.updatedAt, run.endedAt);
     } catch (error) {
-      if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run`);
+      if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run${run.cwd === null ? "" : ` in ${run.cwd}`}`);
       throw error;
     }
   }
@@ -121,6 +129,7 @@ function run(r: Row): RunRow {
   return {
     id: text(r, "id"),
     workflowId: text(r, "workflow_id"),
+    cwd: nullable(r, "cwd"),
     input: JSON.parse(text(r, "input_json")),
     status: text(r, "status") as RunRow["status"],
     startedAt: text(r, "started_at"),
