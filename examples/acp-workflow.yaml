@@ -3,7 +3,8 @@ id: acp-example
 executors:
   claude-acp:
     type: acp
-    cwd: /absolute/path/to/working/dir
+    # No `cwd`: the agent works in the run's directory (`dagmar run acp-example --cwd <dir>`).
+    # An executor that always works in one place sets `cwd: /absolute/path` instead.
     # The ACP adapters (claude-agent-acp, openclaw) are host-provided executables, NOT dagmar
     # dependencies: install and authenticate them out-of-band and point `run` at them here, e.g.
     #   run: [node, /abs/path/to/@agentclientprotocol/claude-agent-acp/dist/index.js]

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadConfig } from "./config.js";
 import { RpcClient } from "./rpc.js";
@@ -57,15 +58,19 @@ async function main(argv: string[]): Promise<void> {
       case "run": {
         const workflowId = rest.shift();
         if (!workflowId) usage();
-        let input: Json = {};
-        if (rest.length) {
-          if (rest.length !== 2) usage();
-          if (rest[0] === "--input") input = rest[1]!;
-          else if (rest[0] === "--input-json") input = parse(rest[1]!);
+        let input: Json = {}, inputGiven = false;
+        let cwd: string | undefined;
+        while (rest.length) {
+          const [flag, value] = rest.splice(0, 2);
+          if (value === undefined) usage();
+          // The daemon runs elsewhere, so a relative cwd is resolved against this shell's directory.
+          if (flag === "--cwd" && cwd === undefined) cwd = resolve(value);
+          else if (flag === "--input" && !inputGiven) { input = value; inputGiven = true; }
+          else if (flag === "--input-json" && !inputGiven) { input = parse(value); inputGiven = true; }
           else usage();
         }
         method = "run.start";
-        params = { workflowId, input };
+        params = { workflowId, input, ...(cwd === undefined ? {} : { cwd }) };
         break;
       }
       case "answer": {

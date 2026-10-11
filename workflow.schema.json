@@ -56,7 +56,6 @@
           "additionalProperties": false,
           "required": [
             "type",
-            "cwd",
             "run"
           ],
           "properties": {
@@ -91,8 +90,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "type",
-            "cwd"
+            "type"
           ],
           "properties": {
             "type": {
