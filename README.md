@@ -15,7 +15,7 @@ Use Dagmar when you need durable task state, explicit handoffs, and operator con
 ## What Dagmar provides
 
 - A small YAML language for static task graphs, with guards, human gates, and bounded loops.
-- ACP and local-process executors behind named profiles.
+- ACP and local-process executors, declared in each workflow.
 - Concurrent execution of independent ready tasks.
 - A CLI and loopback API for run control, live observation, and ACP interactions.
 - A SQLite run ledger and an append-only JSONL transcript for each task attempt.
@@ -45,32 +45,24 @@ storageDir: /absolute/path/to/dagmar-state
 listen:
   host: 127.0.0.1
   port: 7331
+```
+
+Both directory paths must be absolute. The server accepts only the loopback hosts `127.0.0.1` and `::1`. The daemon reads the config once at start. Executors are not configured here: each workflow declares its own.
+
+## Define a workflow
+
+Place YAML files in `workflowDir`. A workflow has a unique ID, the executors its tasks use, and a non-empty mapping of task IDs to tasks:
+
+```yaml
+id: process-example
 
 executors:
   local-process:
     type: process
-    cwd: /absolute/path/to/working-directory
-    env: {}
-
   claude-acp:
     type: acp
-    cwd: /absolute/path/to/working-directory
     run: [/absolute/path/to/claude-agent-acp]
-    env: {}
-```
-
-All directory paths must be absolute. The server accepts only the loopback hosts `127.0.0.1` and `::1`. Each executor profile provides its working directory and environment overrides; ACP profiles also require the command used to start their agent.
-
-An ACP profile may also set `model`. Dagmar applies it through the agent's ACP model selector (`session/set_config_option`) on every new or loaded session, and fails the attempt if the agent has no model selector (`acp_model_unsupported`), does not offer that exact value (`acp_model_unknown`, the error lists the offered values), or does not switch (`acp_model_not_applied`). Two profiles with the same `run` and different `model` are the same agent, so one can `continue` the other's session.
-
-An ACP profile may likewise set `mode`, applied the same way through the agent's ACP mode selector (the config option with category `mode`), failing with `acp_mode_unsupported`, `acp_mode_unknown` or `acp_mode_not_applied`. For `claude-agent-acp` the mode is its permission mode (for example `acceptEdits` accepts file edits without asking). Profiles that differ only in `model` or `mode` are still the same agent.
-
-## Define a workflow
-
-Place YAML files in `workflowDir`. A workflow has a unique ID and a non-empty mapping of task IDs to tasks:
-
-```yaml
-id: process-example
+    model: sonnet
 
 tasks:
   collect:
@@ -90,7 +82,19 @@ tasks:
       mode: fresh
 ```
 
-`executor` selects a configured profile. A process task requires `run` and cannot use `prompt`, `session` or `interactive`; an ACP task requires `prompt` and cannot use `run`. Dependencies must exist and form an acyclic graph. Independent dependency-ready tasks run concurrently.
+An executor has a `type`, `process` or `acp`, and may set:
+
+- `cwd`, an absolute path where its tasks run. Without one, they run in the run's directory, given when the run starts (`--cwd`). A workflow that leaves `cwd` out can serve any repository of its kind; one that always works in one place sets it.
+- `env`, string values added to the daemon's environment.
+- `envFile`, the absolute path of a `KEY=VALUE` file read each time one of the executor's tasks starts. Its values go between the daemon's environment and `env`, so a secret stays out of the workflow file and reaches only the executors that name the file. An unreadable file fails the task with `env_file_unreadable`.
+
+An ACP executor also requires `run`, the command that starts its agent, and may set `model`. Dagmar applies the model through the agent's ACP model selector (`session/set_config_option`) on every new or loaded session, and fails the attempt if the agent has no model selector (`acp_model_unsupported`), does not offer that exact value (`acp_model_unknown`, the error lists the offered values), or does not switch (`acp_model_not_applied`).
+
+An ACP executor may likewise set `mode`, applied the same way through the agent's ACP mode selector (the config option with category `mode`), failing with `acp_mode_unsupported`, `acp_mode_unknown` or `acp_mode_not_applied`. For `claude-agent-acp` the mode is its permission mode (for example `acceptEdits` accepts file edits without asking). Executors that differ only in `model` or `mode` are the same agent, so one can `continue` the other's session.
+
+To run the same tasks with other executors, for example another provider for the agents that share a session, write a second workflow file. Dagmar reads workflows from disk on every step, so a new or edited workflow needs no restart; an edit also applies to the workflow's active runs from their next task, so do not change a workflow's executors while it has active runs.
+
+A task's `executor` names one of its workflow's executors. A process task requires `run` and cannot use `prompt`, `session` or `interactive`; an ACP task requires `prompt` and cannot use `run`. Dependencies must exist and form an acyclic graph. Independent dependency-ready tasks run concurrently.
 
 Input values may be literals or references:
 
@@ -99,7 +103,7 @@ Input values may be literals or references:
 
 A task may also declare `outputSchema`, a JSON Schema applied to its `output`.
 
-An ACP task starts a new agent session unless it sets `session: { mode: continue, from: <task-id> }`, which loads that task's session through ACP `session/load`. The source must be a dependency (`invalid_dependency`) and an ACP task whose profile has a byte-identical `run` (`invalid_task`); `model` and `mode` may differ. The attempt fails with `acp_load_unsupported` if the agent cannot load sessions, or `continuation_unavailable` if the source has no recorded session (for example, it was skipped). `session: { mode: fork }` is rejected (`unsupported_session_mode`).
+An ACP task starts a new agent session unless it sets `session: { mode: continue, from: <task-id> }`, which loads that task's session through ACP `session/load`. The source must be a dependency (`invalid_dependency`) and an ACP task whose executor has a byte-identical `run` (`invalid_task`); `model` and `mode` may differ. The attempt fails with `acp_load_unsupported` if the agent cannot load sessions, or `continuation_unavailable` if the source has no recorded session (for example, it was skipped). `session: { mode: fork }` is rejected (`unsupported_session_mode`).
 
 An ACP task with `interactive: true` is a human-driven conversation. Each agent reply that is not a result parks the task as `awaiting_input` with a `turn` interaction carrying the reply in `request.message`; answer with the next message as a non-empty JSON string, for example `dagmar answer <interaction-id> --json '"Add a test"'`. The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
 
@@ -158,10 +162,12 @@ Then use the CLI from another terminal:
 ```sh
 pnpm dev:cli -- --config /absolute/path/to/config.yaml ping
 pnpm dev:cli -- --config /absolute/path/to/config.yaml workflows
-pnpm dev:cli -- --config /absolute/path/to/config.yaml run process-example --input-json '{"request":"hello"}'
+pnpm dev:cli -- --config /absolute/path/to/config.yaml run process-example --cwd . --input-json '{"request":"hello"}'
 ```
 
-The CLI also supports `executors`, `workflow <id>`, `runs`, `status <run-id>`, `watch <run-id>`, `resume <run-id>`, `cancel <run-id>`, `cancel-task <task-run-id>`, `pending`, `answer <interaction-id> --json <value>`, and `transcript <task-run-id> [--after-line <number>]`.
+`run <workflow-id> [--cwd <dir>] [--input <text> | --input-json <json>]` starts a run. `--cwd` gives the run's directory for every executor without its own `cwd`; a relative path resolves in the shell's current directory, and the daemon receives an absolute path (`run.start`'s `cwd` param). Starting fails with `cwd_required` if an executor needs a directory and none is given, with `cwd_unused` if every executor has its own, and with `invalid_params` if the path is not an existing directory. A workflow has at most one active run per directory (`active_run_exists`), so it can run on several repositories at once; runs without a directory count as one. `runs` and `status` show each run's `cwd`.
+
+The CLI also supports `workflow <id>`, `runs`, `status <run-id>`, `watch <run-id>`, `resume <run-id>`, `cancel <run-id>`, `cancel-task <task-run-id>`, `pending`, `answer <interaction-id> --json <value>`, and `transcript <task-run-id> [--after-line <number>]`.
 
 The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `storageDir`.
 

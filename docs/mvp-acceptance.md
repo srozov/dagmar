@@ -34,24 +34,24 @@ implement ─► verify ─┬─ passed=false ─► fixup ──(loop, maxVisi
 ## Sharp edges
 
 - **`builder.run` and `reviewer.run` must be byte-identical.** A session can only be continued by the
-  same agent, and dagmar compares the `run` argv exactly. Select the model with the profile's `model`
-  field, never with an argv flag.
+  same agent, and dagmar compares the `run` argv exactly. Select the model with the executor's
+  `model` field, never with an argv flag.
 - **`model` must be a value the agent offers, exactly.** Otherwise the task fails with
   `acp_model_unknown`, which lists the valid values. With `claude-agent-acp` 0.84.0 on this account:
   `default` (Opus 5.5), `opus` (Opus 5.5), `sonnet` (Sonnet 5.5), `haiku` (Haiku 4.5), plus pinned
   IDs such as `claude-fable-5-1`, `claude-sonnet-5` and `claude-opus-4-8`. `default` and `opus` are the
   same model, so the builder uses `sonnet` to keep the reviewer a different model.
-- **All three profiles share one `cwd`**, the target repo, or verify and review won't see the builder's
-  files.
+- **The run's `--cwd` is the target repo.** The workflow's three executors have no `cwd` of their
+  own, so all of them work there, and verify and review see the builder's files.
 - **`revise` is live-only.** Restarting the daemon during `revise` fails it (`executor_lost`); that is
   by design (T2). Do the restart test during the loop.
-- **Use a separate config.** Don't add these profiles to `~/.config/dagmar/config.yaml`; run the
-  acceptance daemon with its own config, storage and port.
+- **Use a separate config.** Don't add this workflow to the production `workflowDir`; run the
+  acceptance daemon with its own config, workflows, storage and port.
 
 ## Setup
 
 Prerequisites: Node 24, `pnpm`, an authenticated `claude-agent-acp` 0.84.0, and dagmar built
-from a branch that has the profile `model` field (`pnpm install --frozen-lockfile && pnpm build`).
+(`pnpm install --frozen-lockfile && pnpm build`).
 
 ```bash
 DAGMAR=/home/agi01/dagmar                      # this checkout
@@ -82,8 +82,8 @@ git -C "$DAGMAR" worktree add "$TARGET" -b claude/t6-acceptance-target main
 ```
 
 **Agent permissions.** `claude-agent-acp` asks before editing files or running commands; each ask
-parks the task as `awaiting_permission` until answered with `dagmar answer`. The builder profile sets
-`mode: acceptEdits` (see Config), so file edits go through without asking. The mode is only the
+parks the task as `awaiting_permission` until answered with `dagmar answer`. The builder executor sets
+`mode: acceptEdits` (see Workflow), so file edits go through without asking. The mode is only the
 baseline: the agent also honors the host's own Claude Code permission rules in `~/.claude/settings.json`
 (deny, then ask, then allow; ask and deny rules apply in every mode). On this host `Bash` is allowed
 and `Bash(rm *)` asks, so builder commands run without asking and an `rm` parks for `dagmar answer`.
@@ -91,7 +91,7 @@ The reviewer pins `mode: default`, so an edit by the reviewer would park as a pe
 attempt is a fresh agent process, and a loaded session starts in the host's `defaultMode`, not the
 builder's mode; pinning it keeps the reviewer independent of host settings.) No
 settings file is written into the target: a target `.claude/settings*.json` would apply to every
-profile working in it.
+executor working in it.
 
 **Config** — `$T6/config.yaml` (machine-local, not committed):
 
@@ -99,31 +99,15 @@ profile working in it.
 workflowDir: /home/agi01/.local/state/dagmar-t6/workflows
 storageDir: /home/agi01/.local/state/dagmar-t6/state
 listen: { host: 127.0.0.1, port: 7341 }
-executors:
-  builder:
-    type: acp
-    cwd: /absolute/path/to/target-worktree
-    run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
-    env: {}
-    model: sonnet
-    mode: acceptEdits
-  reviewer:
-    type: acp
-    cwd: /absolute/path/to/target-worktree
-    run: [node, /home/agi01/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js]
-    env: {}
-    model: opus
-    mode: default
-  check:
-    type: process
-    cwd: /absolute/path/to/target-worktree
-    env: {}
 ```
 
-**Workflow** — copy it and fill in the verify wrapper's absolute path:
+**Workflow** — copy it and fill in the absolute paths of the verify wrapper and the agent. Its
+executors are builder (`sonnet`, `acceptEdits`), reviewer (`opus`, `default`) and check:
 
 ```bash
-sed "s#/ABSOLUTE/PATH/TO/dagmar#$DAGMAR#" "$DAGMAR/examples/review-iteration-loop.yaml" > "$T6/workflows/review-iteration-loop.yaml"
+AGENT=$HOME/.local/share/dagmar-agents/node_modules/@agentclientprotocol/claude-agent-acp
+sed -e "s#/ABSOLUTE/PATH/TO/dagmar#$DAGMAR#" -e "s#/ABSOLUTE/PATH/TO/claude-agent-acp#$AGENT#" \
+  "$DAGMAR/examples/review-iteration-loop.yaml" > "$T6/workflows/review-iteration-loop.yaml"
 ```
 
 Check the wrapper on its own (it prints exactly one envelope on stdout):
@@ -140,7 +124,7 @@ Expect `"passed":false`; with `process.exit(0)` expect `"passed":true`.
 dagmar() { node "$DAGMAR/dist/cli.js" --config "$T6/config.yaml" "$@"; }
 node "$DAGMAR/dist/daemon.js" --config "$T6/config.yaml" >"$T6/daemon.log" 2>&1 & DAEMON=$!
 dagmar workflows                                      # review-iteration-loop listed, no errors
-dagmar run review-iteration-loop --input-json '{"task":"<the coding task>"}'
+dagmar run review-iteration-loop --cwd "$TARGET" --input-json '{"task":"<the coding task>"}'
 dagmar watch <runId>                                  # or: dagmar status <runId>
 dagmar pending                                        # permission asks, the gate, revise turns
 dagmar transcript <taskRunId>                         # full ACP / process traffic for one attempt
@@ -178,18 +162,17 @@ shows `skipped` and the run `completed`.
 
 ## Restart run (criterion 4)
 
-The loop has to iterate. If the task's first verify tends to pass, force one failure by restarting
-the daemon with the seeded-failure env on the `check` profile:
+The loop has to iterate. If the task's first verify tends to pass, force one failure by starting
+the run with the seeded-failure env on the workflow's `check` executor:
 
 ```yaml
   check:
     type: process
-    cwd: /absolute/path/to/target-worktree
     env: { VERIFY_FAIL_FIRST: "1", VERIFY_COUNTER_FILE: /home/agi01/.local/state/dagmar-t6/verify-count }
 ```
 
-The daemon reads its config at start, so restart it after editing, and delete the counter file before
-each seeded run. Then, while `fixup` is running:
+Dagmar reads the workflow on every step, so edit it before starting the seeded run, never while a run
+is active, and delete the counter file before each seeded run. Then, while `fixup` is running:
 
 Dagmar starts agents as separate process groups, so killing the daemon does not necessarily kill the
 running `fixup` agent. Note the agent's PID **before** the kill (the CLI needs a running daemon): it
@@ -221,7 +204,7 @@ Check: the new fixup attempt still loads `implement`'s session; completed fixup 
 |---|---|
 | `acp_model_unknown` | `model` not offered by the agent; the message lists valid values |
 | `acp_model_unsupported` / `acp_model_not_applied` | agent has no model selector / didn't switch |
-| `acp_mode_unknown` / `acp_mode_unsupported` / `acp_mode_not_applied` | the same checks for the profile's `mode` |
+| `acp_mode_unknown` / `acp_mode_unsupported` / `acp_mode_not_applied` | the same checks for the executor's `mode` |
 | `acp_load_unsupported` | agent can't `session/load`, so it can't continue a session |
 | `acp_authentication_required` | authenticate `claude-agent-acp` out-of-band |
 | `continuation_unavailable` | the source task has no persisted session id |
