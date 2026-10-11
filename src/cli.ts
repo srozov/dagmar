@@ -25,9 +25,6 @@ async function main(argv: string[]): Promise<void> {
       case "ping":
         method = "system.ping";
         break;
-      case "executors":
-        method = "executor.list";
-        break;
       case "workflows":
         method = "workflow.list";
         break;
@@ -132,7 +129,7 @@ function signal(): Promise<void> {
 }
 
 function usage(): never {
-  throw new Error("Usage: dagmar [--config <path>] ping|executors|workflows|workflow|run|runs|status|watch|resume|cancel|cancel-task|pending|answer|transcript");
+  throw new Error("Usage: dagmar [--config <path>] ping|workflows|workflow|run|runs|status|watch|resume|cancel|cancel-task|pending|answer|transcript");
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

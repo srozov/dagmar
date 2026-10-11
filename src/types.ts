@@ -10,9 +10,9 @@ export interface WhenClause { ref: string; equals?: Json; in?: Json[] }
 export interface TaskResult { outcome: "completed" | "blocked"; message: string; output: Json }
 export interface TaskError { code: string; message: string; data?: Json }
 export interface ExecutorProfile { type: ExecutorType; cwd: string; env: Record<string, string>; run?: [string, ...string[]]; model?: string; mode?: string }
-export interface Config { workflowDir: string; storageDir: string; listen: { host: "127.0.0.1" | "::1"; port: number }; executors: Record<string, ExecutorProfile> }
+export interface Config { workflowDir: string; storageDir: string; listen: { host: "127.0.0.1" | "::1"; port: number } }
 export interface TaskDef { executor?: string; dependsOn: string[]; inputs: JsonObject; prompt?: string; run?: [string, ...string[]]; outputSchema?: JsonSchema; interactive?: boolean; session?: { mode: "fresh" } | { mode: "continue"; from: string }; gate?: { prompt: string; schema?: JsonSchema }; when?: WhenClause[]; loop?: { to: string; maxVisits: number } }
-export interface Workflow { id: string; tasks: Record<string, TaskDef> }
+export interface Workflow { id: string; executors: Record<string, ExecutorProfile>; tasks: Record<string, TaskDef> }
 export interface WorkflowErrorView { file: string; code: string; message: string }
 export interface RunRow { id: string; workflowId: string; input: Json; status: RunStatus; startedAt: string; updatedAt: string; endedAt: string | null }
 export interface AttemptRow { id: string; workflowRunId: string; taskId: string; attempt: number; executorProfile: string; executorType: ExecutorType; status: AttemptStatus; result: TaskResult | null; error: TaskError | null; acpSessionId: string | null; startedAt: string; updatedAt: string; endedAt: string | null }

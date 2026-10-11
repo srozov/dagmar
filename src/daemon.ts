@@ -22,8 +22,8 @@ export async function startDaemon(configPath?: string): Promise<Daemon> {
   const events = new EventBus();
   const store = new Store(join(config.storageDir, "dagmar.sqlite"));
   const transcripts = new Transcripts(config.storageDir);
-  const workflows = new WorkflowRepository(config.workflowDir, config.executors);
-  const scheduler = new Scheduler(store, transcripts, workflows, events, config.executors, {
+  const workflows = new WorkflowRepository(config.workflowDir);
+  const scheduler = new Scheduler(store, transcripts, workflows, events, {
     process: new ProcessExecutor(),
     acp: new AcpExecutor(),
   });
@@ -36,14 +36,6 @@ export async function startDaemon(configPath?: string): Promise<Daemon> {
         startedAt,
         currentSequence: events.current,
       });
-    },
-    "executor.list": (p: JsonObject) => {
-      empty(p);
-      return json(
-        Object.entries(config.executors)
-          .sort()
-          .map(([name, x]) => ({ name, type: x.type })),
-      );
     },
     "workflow.list": async (p: JsonObject) => {
       empty(p);
