@@ -78,8 +78,8 @@ export function validateWorkflow(value: unknown): Workflow {
   for (const [id, item] of Object.entries(raw.tasks)) {
     if (item.gate) {
       if (item.executor) throw new DagmarError("invalid_task", `Task ${id} cannot have both executor and gate`);
-      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.loop !== undefined)
-        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, or loop`);
+      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.rerun !== undefined)
+        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, or rerun`);
       if (typeof item.gate.prompt !== "string" || !item.gate.prompt.trim())
         throw new DagmarError("invalid_task", `Gate task ${id} requires a non-empty prompt`);
       if (item.gate.schema !== undefined) validateOutputSchema(item.gate.schema);
@@ -113,23 +113,25 @@ export function validateWorkflow(value: unknown): Workflow {
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
     }
-    if (task.when !== undefined) {
-      for (const clause of task.when) {
+    // `when` reads the outputs of the task's dependencies or the run input; `rerun.when` reads only the
+    // task's own output, after it has run.
+    for (const [field, clauses] of [["when", task.when], ["rerun.when", task.rerun?.when]] as const) {
+      for (const clause of clauses ?? []) {
         const hasEquals = Object.hasOwn(clause, "equals");
         const hasIn = clause.in !== undefined;
-        if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} when clause needs exactly one of equals or in`);
-        if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} when in must be a non-empty array`);
+        if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} ${field} clause needs exactly one of equals or in`);
+        if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} ${field} in must be a non-empty array`);
         const ref = reference(clause.ref);
-        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} when ref must be a $tasks or $run reference`);
-        if (ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
+        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run reference`);
+        if (field === "rerun.when" && ref.task !== id) throw new DagmarError("invalid_rerun", `Task ${id} rerun.when must read its own output`);
+        if (field === "when" && ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
       }
     }
-    if (task.loop !== undefined) {
-      const to = task.loop.to;
-      if (to === id) throw new DagmarError("invalid_loop", `Task ${id} loop.to cannot be itself`);
-      if (!tasks[to]) throw new DagmarError("invalid_loop", `Task ${id} loop.to ${to} is not a task`);
-      if (!task.dependsOn.includes(to)) throw new DagmarError("invalid_loop", `Task ${id} loop.to ${to} must be a direct dependency`);
-      if (!Number.isInteger(task.loop.maxVisits) || task.loop.maxVisits < 1) throw new DagmarError("invalid_loop", `Task ${id} loop.maxVisits must be an integer >= 1`);
+    if (task.rerun !== undefined) {
+      const from = task.rerun.from;
+      if (!tasks[from]) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} is not a task`);
+      if (!upstream(tasks, id).has(from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} must be upstream of it`);
+      if (!Number.isInteger(task.rerun.max) || task.rerun.max < 1) throw new DagmarError("invalid_rerun", `Task ${id} rerun.max must be an integer >= 1`);
     }
     if (task.session?.mode === "continue") {
       const from = task.session.from;
@@ -140,12 +142,6 @@ export function validateWorkflow(value: unknown): Workflow {
       const thisProfile = profiles[task.executor!]!;
       if (!sameAgent(thisProfile.run, sourceProfile.run)) throw new DagmarError("invalid_task", `Task ${id} continue must target the same agent`);
     }
-  }
-  // Enforce one source per target — only one task may loop back to a given target.
-  const loopTargets = new Set<string>();
-  for (const [sid, t] of Object.entries(tasks)) if (t.loop) {
-    if (loopTargets.has(t.loop.to)) throw new DagmarError("invalid_loop", `Task ${t.loop.to} is the target of more than one loop`);
-    loopTargets.add(t.loop.to);
   }
   const visiting = new Set<string>();
   const done = new Set<string>();
@@ -178,6 +174,12 @@ export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<R
   return result;
 }
 
+// Every task that `id` depends on, directly or through other tasks.
+function upstream(tasks: Record<string, TaskDef>, id: string): Set<string> {
+  const seen = new Set<string>(), stack = [...tasks[id]!.dependsOn];
+  while (stack.length) { const next = stack.pop()!; if (!seen.has(next)) { seen.add(next); stack.push(...(tasks[next]?.dependsOn ?? [])); } }
+  return seen;
+}
 function idOf(raw: unknown): string | undefined {
   return typeof raw === "object" && raw !== null && !Array.isArray(raw) && typeof (raw as Record<string, unknown>).id === "string" ? (raw as { id: string }).id : undefined;
 }

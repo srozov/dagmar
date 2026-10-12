@@ -6,7 +6,7 @@ end to end on real ACP agents. It proves (or disproves) the review-iteration MVP
 | # | Criterion | Shown by |
 |---|---|---|
 | 1 | A real coding task runs implement → verify → fixup (loop) → review → gate → done; run `completed` | Main run |
-| 2 | The loop iterates (verify fails, fixup, verify again) and exits on pass, or stops at `maxVisits` | Main or seeded run |
+| 2 | The loop iterates (verify fails, fixup, verify again) and exits on pass, or stops at its max | Main or seeded run |
 | 3 | The reviewer (different model) references builder-session content it was never re-fed | Main run, reviewer result |
 | 4 | Killing `dagmard` mid-loop → `blocked` → restart → `resume` → loop continues, visit count kept | Restart run |
 | 5 | Gate `revise` → human-driven multi-turn conversation with the builder → run `completed` | Revise run |
@@ -15,12 +15,11 @@ end to end on real ACP agents. It proves (or disproves) the review-iteration MVP
 ## How the workflow works
 
 ```
-implement ─► verify ─┬─ passed=false ─► fixup ──(loop, maxVisits 3)──► verify
+implement ─► verify ─┬─ passed=false ─► fixup ──(rerun, max 3)──► verify;  still failing ─► run ends blocked
   (builder)  (check) │                  (builder, continues implement)
-                     ├─ passed=true ──► review ─► gate ─┬─ approve ─► done
-                     │                 (reviewer,       └─ revise ──► revise (builder, interactive)
-                     │                  continues implement)
-                     └─ passed=false after last visit ─► exhausted (run ends blocked)
+                     └─ passed=true ──► review ─► gate ─┬─ approve ─► done
+                                       (reviewer,       └─ revise ──► revise (builder, interactive)
+                                        continues implement)
 ```
 
 - **Context** travels through the builder's ACP session: `fixup`, `review` and `revise` all
@@ -28,8 +27,9 @@ implement ─► verify ─┬─ passed=false ─► fixup ──(loop, maxVisi
   shared working tree.
 - `review` gets no builder notes in its prompt or inputs, so whatever it says about the builder's
   reasoning must come from the loaded session (criterion 3).
-- `review`, `gate` and `exhausted` depend on `verify`, the loop target, so dagmar holds them until
-  the loop is final, then decides them once.
+- `review` and `gate` are decided after each verify: skipped while it fails, run once it passes.
+  When verify still fails after the third fixup, fixup is not run again: it ends `blocked` with
+  `rerun_exhausted`, and so does the run.
 
 ## Sharp edges
 
@@ -196,7 +196,7 @@ dagmar resume <runId>                                 # fixup re-runs, verify re
 ```
 
 Check: the new fixup attempt still loads `implement`'s session; completed fixup attempts never exceed
-`maxVisits` (3); the run reaches the gate.
+its `rerun.max` (3); the run reaches the gate.
 
 ## Error codes you may see
 
@@ -209,6 +209,7 @@ Check: the new fixup attempt still loads `implement`'s session; completed fixup 
 | `acp_authentication_required` | authenticate `claude-agent-acp` out-of-band |
 | `continuation_unavailable` | the source task has no persisted session id |
 | `executor_lost` | the daemon died while the attempt ran; `resume` the blocked run |
+| `rerun_exhausted` | verify still fails after the third fixup; fixup is not run again and the run is blocked |
 | `invalid_task` … `continue must target the same agent` | builder/reviewer `run` differ |
 
 ## Results
