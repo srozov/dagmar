@@ -1709,6 +1709,30 @@ test("validateWorkflow accepts rerun from an upstream task and rejects malformed
   }, profiles);
   assert.equal(ok2.tasks.again!.rerun!.atMax, "proceed");
 
+  // Accept: a rerun condition on the source's own output.
+  const okWhen = validate({
+    id: "rerun-ok-when",
+    tasks: {
+      verify: { executor: "local", inputs: {}, run: ["true"] },
+      changed: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], rerun: { from: "verify", max: 2, when: [{ ref: "$tasks.changed.output.changed", equals: true }] } },
+    },
+  }, profiles);
+  assert.deepEqual(okWhen.tasks.changed!.rerun!.when, [{ ref: "$tasks.changed.output.changed", equals: true }]);
+
+  // Reject: rerun.when reads anything but the source's own output.
+  for (const ref of ["$tasks.verify.output.passed", "$run.input.x"]) {
+    assert.throws(
+      () => validate({
+        id: "x",
+        tasks: {
+          verify: { executor: "local", inputs: {}, run: ["true"] },
+          changed: { executor: "local", dependsOn: ["verify"], inputs: {}, run: ["true"], rerun: { from: "verify", max: 2, when: [{ ref, equals: true }] } },
+        },
+      }, profiles),
+      (error: unknown) => error instanceof DagmarError && error.code === "invalid_rerun" && /its own output/.test(error.message),
+    );
+  }
+
   // Accept: several sources rerun from the same task.
   const ok3 = validate({
     id: "rerun-ok3",
@@ -1755,8 +1779,8 @@ test("validateWorkflow accepts rerun from an upstream task and rejects malformed
     (error: unknown) => error instanceof DagmarError && error.code === "invalid_rerun" && /must be upstream/.test(error.message),
   );
 
-  // Reject: max < 1 and an unknown atMax (the schema rejects both with workflow_invalid).
-  for (const rerun of [{ from: "verify", max: 0 }, { from: "verify", max: 1, atMax: "retry" }]) {
+  // Reject: max < 1, an unknown atMax and an empty rerun.when (the schema rejects them with workflow_invalid).
+  for (const rerun of [{ from: "verify", max: 0 }, { from: "verify", max: 1, atMax: "retry" }, { from: "verify", max: 1, when: [] }]) {
     assert.throws(
       () => validate({
         id: "x",
@@ -1986,11 +2010,11 @@ test("restart mid-rerun: recover() blocks, resume() continues, completed count p
 
 
 // Several reruns from one task (a review workflow's shape): fixup reruns from verify while it fails;
-// `again` reruns from verify while the reviewers changed something; revise reruns from verify after
-// the gate. Each rerun decides verify and everything after it again. `verify` reads its pass/fail
+// `changed` reruns from verify when it reports that the reviewers changed something (its rerun.when);
+// revise reruns from verify after the gate. Each rerun decides verify and everything after it again. `verify` reads its pass/fail
 // answers from a list, one per invocation (`crash` makes that invocation exit without a result);
 // `changed` reads its answers from `changes` the same way (false once the list runs out).
-async function sdlcFixture(prefix: string, answers: Array<boolean | "crash">, { reviseMax = 3, changes = [] as boolean[] } = {}) {
+async function sdlcFixture(prefix: string, answers: Array<boolean | "crash">, { reviseMax = 3, changes = [] as boolean[], fixAtMax = "proceed" } = {}) {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const answerScript = async (name: string, list: Array<boolean | "crash">, key: string, missing: string) => {
     const counter = join(root, `${name}.count`), script = join(root, `${name}.mjs`);
@@ -2015,9 +2039,8 @@ console.log(JSON.stringify({outcome:'completed',message:'${name}',output:{${key}
       publish: { executor: "local", dependsOn: ["verify"], inputs: {}, run: echo, when: [passed] },
       review: { executor: "local", dependsOn: ["publish", "verify"], inputs: {}, run: echo, when: [passed] },
       qa: { executor: "local", dependsOn: ["publish", "verify"], inputs: {}, run: echo, when: [passed] },
-      changed: { executor: "local", dependsOn: ["review", "qa", "verify"], inputs: {}, run: await answerScript("changed", changes, "changed", "false"), when: [passed] },
-      again: { executor: "local", dependsOn: ["changed"], inputs: {}, run: echo, when: [{ ref: "$tasks.changed.output.changed", equals: true }], rerun: { from: "verify", max: 2, atMax: "proceed" } },
-      gate: { dependsOn: ["again", "verify"], inputs: {}, when: [passed], gate: { prompt: "approve or revise?", schema: { type: "object", required: ["decision"], properties: { decision: { enum: ["approve", "revise"] } } } } },
+      changed: { executor: "local", dependsOn: ["review", "qa", "verify"], inputs: {}, run: await answerScript("changed", changes, "changed", "false"), when: [passed], rerun: { from: "verify", max: 2, atMax: fixAtMax, when: [{ ref: "$tasks.changed.output.changed", equals: true }] } },
+      gate: { dependsOn: ["changed", "verify"], inputs: {}, when: [passed], gate: { prompt: "approve or revise?", schema: { type: "object", required: ["decision"], properties: { decision: { enum: ["approve", "revise"] } } } } },
       ready: { executor: "local", dependsOn: ["gate"], inputs: {}, run: echo, when: [{ ref: "$tasks.gate.output.decision", equals: "approve" }] },
       revise: { executor: "local", dependsOn: ["gate"], inputs: {}, run: echo, when: [{ ref: "$tasks.gate.output.decision", equals: "revise" }], rerun: { from: "verify", max: reviseMax } },
     },
@@ -2050,7 +2073,6 @@ test("a revise rerun decides verify, the reviews and the gate again, then approv
     review: "skipped,completed,completed",
     qa: "skipped,completed,completed",
     changed: "skipped,completed,completed",
-    again: "skipped,skipped,skipped",
     gate: "skipped,completed,completed",
     ready: "skipped,skipped,completed",
     revise: "skipped,completed,skipped",
@@ -2075,7 +2097,6 @@ test("verify failing inside a revise round goes through fixup and back to the ga
     review: "completed,skipped,completed",
     qa: "completed,skipped,completed",
     changed: "completed,skipped,completed",
-    again: "skipped,skipped,skipped",
     gate: "completed,skipped,completed",
     ready: "skipped,skipped,completed",
     revise: "completed,skipped,skipped",
@@ -2096,7 +2117,6 @@ test("fixup at its max inside a revise round blocks the run", async () => {
     review: "completed,skipped,skipped,skipped",
     qa: "completed,skipped,skipped,skipped",
     changed: "completed,skipped,skipped,skipped",
-    again: "skipped,skipped,skipped,skipped",
     gate: "completed,skipped,skipped,skipped",
     ready: "skipped,skipped,skipped,skipped",
     revise: "completed,skipped,skipped,skipped",
@@ -2118,7 +2138,7 @@ test("revise at its max blocks the run", async () => {
   app.store.close();
 });
 
-test("the reviewers' fixes rerun from verify, and at its max the fix rerun proceeds to the gate", async () => {
+test("changed reruns from verify while the reviewers changed something, and proceeds to the gate at its max", async () => {
   const app = await sdlcFixture("dagmar-sdlc-fixes-", [true, true, true], { changes: [true, true, true] });
   const run = await app.scheduler.start("sdlc", {});
   await answerNextGate(app, run.workflowRunId, "approve", new Set());
@@ -2131,11 +2151,22 @@ test("the reviewers' fixes rerun from verify, and at its max the fix rerun proce
     review: "completed,completed,completed",
     qa: "completed,completed,completed",
     changed: "completed,completed,completed",
-    again: "completed,completed,skipped",
     gate: "completed",
     ready: "completed",
     revise: "skipped",
   });
+  app.store.close();
+});
+
+test("a rerun.when source that asks for a rerun beyond its max blocks the run by default", async () => {
+  const app = await sdlcFixture("dagmar-sdlc-fixes-block-", [true, true, true], { changes: [true, true, true], fixAtMax: "block" });
+  const run = await app.scheduler.start("sdlc", {});
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.changed!.attempts.map((a) => a.status), ["completed", "completed", "blocked"]);
+  assert.equal(view.tasks.changed!.attempts[2]!.error!.code, "rerun_exhausted");
+  assert.deepEqual(view.tasks.changed!.attempts[2]!.result!.output, { changed: true, run: 3 }, "the blocked attempt keeps its output");
+  assert.equal(view.tasks.verify!.attempts.length, 3, "no rerun beyond the max");
+  assert.equal(view.tasks.gate!.state, "blocked_by_dependency");
   app.store.close();
 });
 
