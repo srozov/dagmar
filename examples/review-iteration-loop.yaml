@@ -1,4 +1,4 @@
-# Review-iteration loop: implement → verify → fixup (bounded loop) → review → human gate → done/revise.
+# Review-iteration loop: implement → verify → fixup (bounded rerun) → review → human gate → done/revise.
 #
 # Template for docs/mvp-acceptance.md. Before use, replace /ABSOLUTE/PATH/TO/dagmar with the
 # absolute path of this checkout and /ABSOLUTE/PATH/TO/claude-agent-acp with the adapter's. The run
@@ -45,7 +45,8 @@ tasks:
       required: [passed]
       properties: { passed: { type: boolean } }
 
-  # Loop source: runs while verify fails, re-arms verify, at most maxVisits completed fixups.
+  # Runs while verify fails and reruns from verify, at most 3 completed fixups. Verify still failing
+  # after the third blocks the run (rerun_exhausted).
   fixup:
     executor: builder
     dependsOn: [verify, implement]      # implement: required for `continue from implement`
@@ -54,9 +55,9 @@ tasks:
       Verification failed; the report is in the inputs. Fix the change so the checks pass.
     session: { mode: continue, from: implement }
     when: [{ ref: $tasks.verify.output.passed, equals: false }]
-    loop: { to: verify, maxVisits: 3 }
+    rerun: { from: verify, max: 3 }
 
-  # Exit branch (held until the loop is final). The reviewer gets no builder notes in its
+  # Decided after each verify, run once it passes. The reviewer gets no builder notes in its
   # prompt or inputs: anything it knows about the builder's reasoning comes from the session.
   review:
     executor: reviewer
@@ -69,14 +70,6 @@ tasks:
       agree or disagree with, and why.
     session: { mode: continue, from: implement }
     when: [{ ref: $tasks.verify.output.passed, equals: true }]
-
-  # Loop gave up without passing: end the run blocked, explicitly.
-  exhausted:
-    executor: check
-    dependsOn: [verify]
-    inputs: {}
-    run: [node, -e, "process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({outcome:'blocked',message:'verify still failing after maxVisits',output:{}})))"]
-    when: [{ ref: $tasks.verify.output.passed, equals: false }]
 
   # Guarded on passed so a skipped review can never reach the human as "approve?".
   gate:
