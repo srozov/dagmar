@@ -58,7 +58,7 @@ export class Scheduler {
   async cancelRun(id: string): Promise<RunView> {
     const handles = await this.serial(id, async () => {
       const run = this.requiredRun(id); if (run.status === "cancelled") return [];
-      if (run.status !== "running" && run.status !== "waiting") throw new DagmarError("invalid_run_state", "Run is terminal");
+      if (run.status === "completed") throw new DagmarError("invalid_run_state", "Completed runs cannot be cancelled");
       const attempts = this.store.attempts(id).filter((x) => active.has(x.status)), now = timestamp();
       this.store.transaction(() => { for (const a of attempts) this.store.updateAttempt(a.id, { status: "cancelled", updatedAt: now, endedAt: now }); this.store.updateRun(id, { status: "cancelled", updatedAt: now, endedAt: now }); });
       for (const a of attempts) { this.emitTask(a, "cancelled"); this.dropInteraction(a.id); }
@@ -191,15 +191,16 @@ export class Scheduler {
     // Decide every task whose deps have settled (completed or skipped). A `skipped` decision settles
     // synchronously, so re-scanning lets a skip cascade to its dependants within this same advance;
     // runnable/gate tasks are prepared once and their dependants wait for the async settle. Terminates:
-    // a decided row is no longer a candidate (its status is not in `blocking`), EXCEPT when a rerun makes
-    // it due again (a terminal completed/skipped attempt is re-prepared, see dueTasks).
+    // a decided row is no longer a candidate (a resume retries only rows from before this advance, so a
+    // row prepared already blocked or failed stays decided), EXCEPT when a rerun makes it due again (a
+    // terminal completed/skipped attempt is re-prepared, see dueTasks).
     const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [];
     for (;;) {
       let progressed = false;
       const due = dueTasks(workflow, latest, pos, reruns, existing);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        let candidate = !current || (retry && blocking.has(current.status));
+        let candidate = !current || (retry && blocking.has(current.status) && pos.get(current.id)! < existing.length);
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
         if (!candidate || !depsSettled(task, latest, due)) continue;
