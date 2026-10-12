@@ -113,15 +113,18 @@ export function validateWorkflow(value: unknown): Workflow {
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
     }
-    if (task.when !== undefined) {
-      for (const clause of task.when) {
+    // `when` reads the outputs of the task's dependencies or the run input; `rerun.when` reads only the
+    // task's own output, after it has run.
+    for (const [field, clauses] of [["when", task.when], ["rerun.when", task.rerun?.when]] as const) {
+      for (const clause of clauses ?? []) {
         const hasEquals = Object.hasOwn(clause, "equals");
         const hasIn = clause.in !== undefined;
-        if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} when clause needs exactly one of equals or in`);
-        if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} when in must be a non-empty array`);
+        if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} ${field} clause needs exactly one of equals or in`);
+        if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} ${field} in must be a non-empty array`);
         const ref = reference(clause.ref);
-        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} when ref must be a $tasks or $run reference`);
-        if (ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
+        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run reference`);
+        if (field === "rerun.when" && ref.task !== id) throw new DagmarError("invalid_rerun", `Task ${id} rerun.when must read its own output`);
+        if (field === "when" && ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
       }
     }
     if (task.rerun !== undefined) {
