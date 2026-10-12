@@ -173,6 +173,8 @@ pnpm dev:cli -- --config /absolute/path/to/config.yaml run process-example --cwd
 
 The CLI also supports `workflow <id>`, `runs`, `status <run-id>`, `watch <run-id>`, `resume <run-id>`, `cancel <run-id>`, `cancel-task <task-run-id>`, `pending`, `answer <interaction-id> --json <value>`, and `transcript <task-run-id> [--after-line <number>]`.
 
+`cancel <run-id>` ends a `running`, `waiting` or `blocked` run as `cancelled`, for example a run blocked at a rerun's max. It stops the run's active attempts, keeps its other attempts as they are, and shows the tasks that never started as `cancelled`. A cancelled run cannot resume, and a completed run cannot be cancelled.
+
 The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `storageDir`.
 
 ## v0 scope
