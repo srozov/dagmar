@@ -182,27 +182,28 @@ export class Scheduler {
     catch (error) { await this.blockDefinition(id, error); return; }
     const existing = this.store.attempts(id);
     const latest = latestAttempts(existing);
-    // Loop machinery: build the per-workflow loops map (keyed by target) once and an insertion-order
-    // position map from the rowid-ordered `existing`; rows prepared this pass are appended to it.
-    const loops = loopsOf(workflow);
+    // Rerun machinery: build the per-workflow reruns map (keyed by the task rerun from) once and an
+    // insertion-order position map from the rowid-ordered `existing`; rows prepared this pass are
+    // appended to it.
+    const reruns = rerunsOf(workflow);
     const pos = new Map(existing.map((r, i) => [r.id, i]));
     const now = timestamp();
     // Decide every task whose deps have settled (completed or skipped). A `skipped` decision settles
     // synchronously, so re-scanning lets a skip cascade to its dependants within this same advance;
     // runnable/gate tasks are prepared once and their dependants wait for the async settle. Terminates:
-    // a decided row is no longer a candidate (its status is not in `blocking`), EXCEPT when a loop makes
+    // a decided row is no longer a candidate (its status is not in `blocking`), EXCEPT when a rerun makes
     // it due again (a terminal completed/skipped attempt is re-prepared, see dueTasks).
     const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [];
     for (;;) {
       let progressed = false;
-      const due = dueTasks(workflow, latest, pos, existing, loops);
+      const due = dueTasks(workflow, latest, pos, reruns);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
         let candidate = !current || (retry && blocking.has(current.status));
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
-        if (!candidate || !this.depsSettled(workflow, task, taskId, latest, loops, existing, run, due)) continue;
-        const item = this.prepare(run, workflow, taskId, task, latest, now);
+        if (!candidate || !depsSettled(task, latest, due)) continue;
+        const item = this.prepare(run, workflow, taskId, task, latest, existing, now);
         prepared.push(item); latest.set(taskId, item.row); pos.set(item.row.id, pos.size); progressed = true;
       }
       if (!progressed) break;
@@ -233,16 +234,21 @@ export class Scheduler {
     }
   }
 
-  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
+  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
     // Guard branch first: a task whose `when` clauses are unsatisfied becomes a terminal, non-launching
     // skipped attempt. The real executorType/executorProfile are preserved so view() surfaces the
     // task's kind accurately. Sits ABOVE the gate branch so a conditional gate is decided by the
-    // guard, not parked.
-    if (task.when && task.when.length && !this.guardPasses(task, run.input, latest)) {
+    // guard, not parked. A rerun source that has completed `max` times and would run again is not run:
+    // it blocks the run (rerun_exhausted), or, with `atMax: proceed`, it is skipped and the run goes on.
+    const skip = !this.guardPasses(task, run.input, latest);
+    const exhausted = !skip && task.rerun !== undefined && completedCount(taskId, rows) >= task.rerun.max;
+    if (skip || exhausted) {
       const isGate = Boolean(task.gate);
       const executorType = isGate ? "gate" as const : (workflow.executors[task.executor!]?.type ?? "process");
       const executorProfile = isGate ? "gate" : task.executor!;
-      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: "skipped" as const, result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
+      const block = exhausted && task.rerun!.atMax !== "proceed";
+      const error = block ? { code: "rerun_exhausted", message: `Task ${taskId} would run again after completing ${task.rerun!.max} times` } : null;
+      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: block ? "blocked" as const : "skipped" as const, result: null, error, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
     }
     if (task.gate) {
       const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
@@ -297,9 +303,7 @@ export class Scheduler {
   // ref is a declared dependency; depsSettled() guarantees those deps are terminal (completed or
   // skipped) before we get here. A clause whose $tasks ref points to a skipped dep returns false
   // immediately (the output can never exist). Missing paths return undefined -> clause false -> skip.
-  // A guardless task (no `when`) is vacuously satisfied: every guard clause passes, so the guard
-  // evaluator returns true. This matches the documented "guardless source loops to the cap" assumption
-  // used by `loopFinal` (the only caller that does not already short-circuit on empty `when`).
+  // A guardless task (no `when`) is vacuously satisfied.
   private guardPasses(task: TaskDef, runInput: Json, latest: Map<string, AttemptRow>): boolean {
     const clauses = task.when;
     if (!clauses || clauses.length === 0) return true;
@@ -310,35 +314,6 @@ export class Scheduler {
       else value = walk(runInput, ref.path);
       const ok = clause.in !== undefined ? clause.in.some((v) => jsonEqual(value, v)) : jsonEqual(value, clause.equals!);
       if (!ok) return false;
-    }
-    return true;
-  }
-
-  // Loop-final predicate. The loop is final when the target has a completed attempt and either the
-  // source has already exhausted its cap OR the source's exit guard would fire on the latest outputs
-  // (target passed; source's `when` is now false). The guard is read only once every task it reads is
-  // decided for this round (an outer loop's guard reads a gate further down). A guardless source (no
-  // `when`) only exits at the cap (guardPasses returns true vacuously, so !guardPasses is false).
-  private loopFinal(workflow: Workflow, target: string, loop: Loop, latest: Map<string, AttemptRow>, rows: AttemptRow[], run: RunRow, due: Set<string>): boolean {
-    const t = latest.get(target);
-    if (!t || t.status !== "completed") return false;
-    if (completedCount(loop.source, rows) >= loop.maxVisits) return true;
-    const sourceTask = workflow.tasks[loop.source]!;
-    if (sourceTask.when?.some((c) => { const read = reference(c.ref)!.task; return read !== undefined && (!latest.has(read) || due.has(read)); })) return false;
-    return !this.guardPasses(sourceTask, run.input, latest);
-  }
-
-  // Loop-aware depsSettled. A dependency that is due again (a loop is re-running it) is not settled.
-  // A dependency that closes a loop (its target or its source) settles for the loop's body as soon
-  // as it completes; tasks outside the body (the loop's exit branch) wait until the loop is final.
-  // When `loops` is empty the loop checks never fire.
-  private depsSettled(workflow: Workflow, task: TaskDef, taskId: string, latest: Map<string, AttemptRow>, loops: Map<string, Loop>, rows: AttemptRow[], run: RunRow, due: Set<string>): boolean {
-    for (const dep of task.dependsOn) {
-      const d = latest.get(dep);
-      if (!d || !(d.status === "completed" || d.status === "skipped") || due.has(dep)) return false;
-      const target = loops.has(dep) ? dep : workflow.tasks[dep]?.loop?.to;
-      const loop = target === undefined ? undefined : loops.get(target);
-      if (loop && !loop.body.has(taskId) && !this.loopFinal(workflow, target!, loop, latest, rows, run, due)) return false;
     }
     return true;
   }
@@ -440,52 +415,40 @@ export class Scheduler {
 }
 
 function latestAttempts(rows: AttemptRow[]): Map<string, AttemptRow> { const map = new Map<string, AttemptRow>(); for (const row of rows) map.set(row.taskId, row); return map; }
-// Per-workflow loops, keyed by target. The source carries `loop: { to, maxVisits }`. A loop's body is
-// every task on a dependency path from its target to its source: they re-run inside the loop, so they
-// don't wait for it to be final. Empty for loop-free workflows (no behavioral change).
-type Loop = { source: string; maxVisits: number; body: Set<string> };
-function loopsOf(workflow: Workflow): Map<string, Loop> {
-  const dependants = new Map<string, string[]>();
-  for (const [id, t] of Object.entries(workflow.tasks)) for (const d of t.dependsOn) dependants.set(d, [...(dependants.get(d) ?? []), id]);
-  const reach = (from: string, next: (id: string) => readonly string[]): Set<string> => {
-    const seen = new Set([from]), stack = [from];
-    while (stack.length) for (const n of next(stack.pop()!)) if (!seen.has(n)) { seen.add(n); stack.push(n); }
-    return seen;
-  };
-  const m = new Map<string, Loop>();
-  for (const [id, t] of Object.entries(workflow.tasks)) if (t.loop) {
-    const down = reach(t.loop.to, (x) => dependants.get(x) ?? []), up = reach(id, (x) => workflow.tasks[x]!.dependsOn);
-    m.set(t.loop.to, { source: id, maxVisits: t.loop.maxVisits, body: new Set([...down].filter((x) => up.has(x))) });
-  }
+// Per-workflow reruns: for each task rerun from, the tasks (sources) that carry `rerun: { from }`.
+function rerunsOf(workflow: Workflow): Map<string, string[]> {
+  const m = new Map<string, string[]>();
+  for (const [id, t] of Object.entries(workflow.tasks)) if (t.rerun) m.set(t.rerun.from, [...(m.get(t.rerun.from) ?? []), id]);
   return m;
 }
-// Tasks that need a (new) decision. A task is due when it has no attempt; when it is a loop target and
-// its loop's source completed after it (the loop's back edge); or when one of its dependencies is due
-// or was decided after it. So a loop re-runs everything downstream of its target, and a nested loop
-// (e.g. fixup on verify inside a revise loop on an earlier task) runs again in every outer round. A
-// loop source that has used up its visits is never due again. `pos` orders attempts by insertion.
-function dueTasks(workflow: Workflow, latest: Map<string, AttemptRow>, pos: Map<string, number>, rows: AttemptRow[], loops: Map<string, Loop>): Set<string> {
+// Tasks that need a (new) decision. A task is due when it has no attempt; when a task that reruns from
+// it completed after it; or when one of its dependencies is due or was decided after it. So a rerun
+// decides its `from` task and everything downstream of it again, the source included. `pos` orders
+// attempts by insertion.
+function dueTasks(workflow: Workflow, latest: Map<string, AttemptRow>, pos: Map<string, number>, reruns: Map<string, string[]>): Set<string> {
   const memo = new Map<string, boolean>();
   const due = (id: string): boolean => {
     const known = memo.get(id);
     if (known !== undefined) return known;
     const task = workflow.tasks[id]!, own = latest.get(id);
     const after = (other: AttemptRow): boolean => pos.get(other.id)! > pos.get(own!.id)!;
-    const source = latest.get(loops.get(id)?.source ?? "");
-    let value = !own
-      || (source?.status === "completed" && after(source))
+    const value = !own
+      || (reruns.get(id) ?? []).some((s) => { const source = latest.get(s); return source?.status === "completed" && after(source); })
       || task.dependsOn.some((d) => due(d) || after(latest.get(d)!));
-    if (value && own && task.loop && completedCount(id, rows) >= task.loop.maxVisits) value = false;
     memo.set(id, value);
     return value;
   };
   return new Set(Object.keys(workflow.tasks).filter(due));
 }
 function dueOf(workflow: Workflow, rows: AttemptRow[]): Set<string> {
-  return dueTasks(workflow, latestAttempts(rows), new Map(rows.map((r, i) => [r.id, i])), rows, loopsOf(workflow));
+  return dueTasks(workflow, latestAttempts(rows), new Map(rows.map((r, i) => [r.id, i])), rerunsOf(workflow));
+}
+// A task is decided once every dependency is completed or skipped and none is due again.
+function depsSettled(task: TaskDef, latest: Map<string, AttemptRow>, due: Set<string>): boolean {
+  return task.dependsOn.every((dep) => { const d = latest.get(dep); return d !== undefined && (d.status === "completed" || d.status === "skipped") && !due.has(dep); });
 }
 // Counts `completed` attempts of a task across ALL its rows (not just latest). Only `completed`
-// counts toward the loop cap (a failed+retried or skipped attempt does not consume a visit).
+// counts toward `rerun.max` (a failed+retried or skipped attempt does not count).
 function completedCount(taskId: string, rows: AttemptRow[]): number {
   let n = 0;
   for (const r of rows) if (r.taskId === taskId && r.status === "completed") n++;
@@ -493,7 +456,7 @@ function completedCount(taskId: string, rows: AttemptRow[]): number {
 }
 function replace(rows: AttemptRow[], changed: AttemptRow): AttemptRow[] { return rows.map((x) => x.id === changed.id ? changed : x); }
 function aggregate(workflow: Workflow, rows: AttemptRow[]): RunStatus { const states = taskStates(workflow, latestAttempts(rows), "running", dueOf(workflow, rows)), values = [...states.values()]; if (values.every((x) => x === "completed" || x === "skipped")) return "completed"; if (values.some((x) => x === "running" || x === "ready")) return "running"; if (values.some((x) => x === "awaiting_input" || x === "awaiting_permission")) return "waiting"; return "blocked"; }
-// A task that a loop made due again reports the state of its next decision, not of its old attempt.
+// A task that a rerun made due again reports the state of its next decision, not of its old attempt.
 function taskStates(workflow: Workflow, latest: Map<string, AttemptRow>, runStatus: RunStatus, due: Set<string>): Map<string, TaskState> {
   const states = new Map<string, TaskState>();
   const state = (id: string): TaskState => {

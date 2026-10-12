@@ -14,7 +14,7 @@ Use Dagmar when you need durable task state, explicit handoffs, and operator con
 
 ## What Dagmar provides
 
-- A small YAML language for static task graphs, with guards, human gates, and bounded loops.
+- A small YAML language for static task graphs, with guards, human gates, and bounded reruns.
 - ACP and local-process executors, declared in each workflow.
 - Concurrent execution of independent ready tasks.
 - A CLI and loopback API for run control, live observation, and ACP interactions.
@@ -107,15 +107,17 @@ An ACP task starts a new agent session unless it sets `session: { mode: continue
 
 An ACP task with `interactive: true` is a human-driven conversation. Each agent reply that is not a result parks the task as `awaiting_input` with a `turn` interaction carrying the reply in `request.message`; answer with the next message as a non-empty JSON string, for example `dagmar answer <interaction-id> --json '"Add a test"'`. The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
 
-A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema` or `loop`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
+A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema` or `rerun`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
 
 `when` guards a task with a list of clauses, all of which must hold. Each clause has a `ref` to `$run.input…` or `$tasks.<dependency>.output…` and exactly one of `equals` (a JSON value) or `in` (a non-empty array of JSON values), compared by JSON equality; other shapes fail validation with `invalid_guard`. If a clause is false when the task's dependencies settle, the task is `skipped` instead of run. A missing path, or a reference to a skipped task, makes a clause false. A skipped task counts as settled for its dependants, but an unguarded input reference to its output fails with `input_resolution_failed`. A run completes when every task is `completed` or `skipped`.
 
-`loop: { to, maxVisits }` makes a task (the source) loop back to `to` (the target), which must be one of its direct dependencies; a target has at most one source (`invalid_loop`). The loop-back is not a dependency edge, so the graph stays acyclic. Each time the source completes, the target runs again, and every task downstream of it that was already decided is decided again, in dependency order, on the new outputs. The source itself is decided again only while it has fewer than `maxVisits` completed attempts. The loop's body is every task on a dependency path from the target to the source. The loop is final when the target has completed and either the source's `when` no longer holds or the source has completed `maxVisits` times; the `when` is read only once the tasks it refers to are decided for the current round. Only completed source attempts count as visits, across the whole run, and `resume` continues the count. Tasks outside the body that depend on the target or the source wait until the loop is final.
+`rerun: { from, max, atMax? }` makes a task (the source) rerun the run from `from`, a task upstream of it (`invalid_rerun` otherwise). The rerun is not a dependency edge, so the graph stays acyclic. Each time the source completes, `from` runs again, and every task downstream of it that was already decided is decided again, in dependency order, on the new outputs, the source included. Nothing waits for a rerun: a task is decided as soon as its dependencies are, and decided again after each rerun, so guard the tasks after `from` that must not run on an intermediate result (for example `passed = true` after a `verify` that `fixup` reruns from). Several tasks may rerun from the same task.
 
-Loops can nest. Give the outer loop its own target upstream of the inner one, for example a no-op `round` task that `verify` depends on. When a `revise` task after the gate loops back to `round`, `verify` and its `fixup` loop run again, then the tasks after them, up to the gate. A task outside both loops that depends on `round`, such as one that blocks the run once `revise` has used up its visits, waits until the outer loop is final.
+A source completes at most `max` times per run; only completed attempts count, and `resume` continues the count. When a source that has completed `max` times would run again (its `when` holds), it is not run: by default its attempt ends `blocked` with `rerun_exhausted`, and so does the run. With `atMax: proceed` it is `skipped` instead, and the run goes on to the tasks after it.
 
-In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s session and loops back to `verify` while verification fails, at most three times:
+In a review workflow, `fixup` reruns from `verify` while verification fails, a task after the reviews reruns from `verify` while they changed something (`atMax: proceed`, so the gate gets the change at the max), and `revise` after the gate reruns from `verify` too. Each new commit goes through verification and the reviews again.
+
+In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s session and reruns from `verify` while verification fails, at most three times:
 
 ```yaml
   fixup:
@@ -126,7 +128,7 @@ In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s sessio
       Verification failed; the report is in the inputs. Fix the change so the checks pass.
     session: { mode: continue, from: implement }
     when: [{ ref: $tasks.verify.output.passed, equals: false }]
-    loop: { to: verify, maxVisits: 3 }
+    rerun: { from: verify, max: 3 }
 ```
 
 The same workflow also uses a gate and an interactive task. `docs/mvp-acceptance.md` is its runbook, including its sharp edges.
@@ -173,4 +175,4 @@ The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `st
 
 ## v0 scope
 
-Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks and bounded loops; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits, dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
+Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks and bounded reruns; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits, dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
