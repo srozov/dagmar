@@ -238,6 +238,9 @@
                 "block",
                 "proceed"
               ]
+            },
+            "when": {
+              "$ref": "#/$defs/task/properties/when"
             }
           }
         }
