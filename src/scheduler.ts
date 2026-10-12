@@ -58,7 +58,7 @@ export class Scheduler {
   async cancelRun(id: string): Promise<RunView> {
     const handles = await this.serial(id, async () => {
       const run = this.requiredRun(id); if (run.status === "cancelled") return [];
-      if (run.status !== "running" && run.status !== "waiting") throw new DagmarError("invalid_run_state", "Run is terminal");
+      if (run.status === "completed") throw new DagmarError("invalid_run_state", "Completed runs cannot be cancelled");
       const attempts = this.store.attempts(id).filter((x) => active.has(x.status)), now = timestamp();
       this.store.transaction(() => { for (const a of attempts) this.store.updateAttempt(a.id, { status: "cancelled", updatedAt: now, endedAt: now }); this.store.updateRun(id, { status: "cancelled", updatedAt: now, endedAt: now }); });
       for (const a of attempts) { this.emitTask(a, "cancelled"); this.dropInteraction(a.id); }
