@@ -218,20 +218,26 @@
             }
           }
         },
-        "loop": {
+        "rerun": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "to",
-            "maxVisits"
+            "from",
+            "max"
           ],
           "properties": {
-            "to": {
+            "from": {
               "$ref": "#/$defs/id"
             },
-            "maxVisits": {
+            "max": {
               "type": "integer",
               "minimum": 1
+            },
+            "atMax": {
+              "enum": [
+                "block",
+                "proceed"
+              ]
             }
           }
         }
