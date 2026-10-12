@@ -98,6 +98,7 @@ test("blocked runs resume only the blocker and cancellation is terminal", async 
       ? completed
       : await waitFor(app.scheduler, started.workflowRunId, "completed");
   assert.equal(resumed.tasks.step!.attempts.length, 2);
+  await assert.rejects(app.scheduler.cancelRun(started.workflowRunId), (error) => error instanceof DagmarError && error.code === "invalid_run_state");
 
   await writeFile(
     join(root, "workflows", "resume.yaml"),
@@ -2127,7 +2128,7 @@ test("fixup at its max inside a revise round blocks the run", async () => {
   app.store.close();
 });
 
-test("revise at its max blocks the run, and a resume blocks it again at once", async (t) => {
+test("revise at its max blocks the run, a resume blocks it again at once, and cancel ends it", async (t) => {
   const app = await sdlcFixture("dagmar-sdlc-revise-max-", [true, true, true], { reviseMax: 2 });
   const run = await app.scheduler.start("sdlc", {});
   const answered = new Set<string>();
@@ -2141,6 +2142,10 @@ test("revise at its max blocks the run, and a resume blocks it again at once", a
   const resumed = await app.scheduler.resume(run.workflowRunId);
   assert.deepEqual(resumed.tasks.revise!.attempts.map((a) => a.status), ["completed", "completed", "blocked", "blocked"]);
   assert.ok(publish.mock.calls.some(({ arguments: [event] }) => event.type === "workflow.status_changed" && event.data.status === "blocked"), "clients learn that the resume blocked again");
+  const cancelled = await app.scheduler.cancelRun(run.workflowRunId);
+  assert.equal(cancelled.status, "cancelled");
+  assert.deepEqual(publish.mock.calls.at(-1)!.arguments[0].data, { status: "cancelled" });
+  await assert.rejects(app.scheduler.resume(run.workflowRunId), (error) => error instanceof DagmarError && error.code === "invalid_run_state");
   app.store.close();
 });
 
