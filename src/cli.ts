@@ -40,10 +40,14 @@ async function main(argv: string[]): Promise<void> {
         method = "run.get";
         params = { workflowRunId: one(rest) };
         break;
-      case "resume":
+      case "resume": {
+        const workflowRunId = rest.shift();
+        if (!workflowRunId) usage();
+        if (rest.length && (rest[0] !== "--from" || rest.length !== 2)) usage();
         method = "run.resume";
-        params = { workflowRunId: one(rest) };
+        params = { workflowRunId, ...(rest.length ? { from: rest[1]! } : {}) };
         break;
+      }
       case "cancel":
         method = "run.cancel";
         params = { workflowRunId: one(rest) };

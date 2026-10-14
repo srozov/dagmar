@@ -75,7 +75,7 @@ console.log(JSON.stringify({outcome:'completed',message:lane,output:{lane,input:
   app.store.close();
 });
 
-test("blocked runs resume only the blocker and cancellation is terminal", async () => {
+test("blocked runs resume only the blocker and cancellation ends a running run", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-resume-"));
   const marker = join(root, "marker");
   const block = join(root, "block.mjs");
@@ -349,6 +349,81 @@ test("a cancelled run exposes unstarted tasks as cancelled", async () => {
   assert.equal(cancelled.tasks.first!.state, "cancelled");
   assert.equal(cancelled.tasks.second!.state, "cancelled"); // was undefined before the fix
   assert.equal(cancelled.tasks.second!.attempts.length, 0);
+  app.store.close();
+});
+
+// `step <name> [wait]` logs its name, then, given a wait file, waits for it before completing.
+async function resumeFixture(prefix: string) {
+  const root = await mkdtemp(join(tmpdir(), prefix)), step = join(root, "step.mjs"), log = join(root, "log"), go = join(root, "go");
+  await writeFile(step, `import{appendFileSync,existsSync}from'node:fs';for await(const _ of process.stdin){};const[name,wait]=process.argv.slice(2);appendFileSync(${JSON.stringify(log)},name+'\\n');while(wait&&!existsSync(wait))await new Promise(r=>setTimeout(r,10));console.log(JSON.stringify({outcome:'completed',message:name,output:{name}}));`);
+  const app = await fixture(root, { id: "chain", tasks: {
+    first: { executor: "local", inputs: {}, run: [process.execPath, step, "first"] },
+    second: { executor: "local", dependsOn: ["first"], inputs: {}, run: [process.execPath, step, "second", go] },
+    third: { executor: "local", dependsOn: ["second"], inputs: {}, run: [process.execPath, step, "third"] },
+    side: { executor: "local", dependsOn: ["first"], inputs: {}, run: [process.execPath, step, "side"] },
+  } });
+  const ran = async (): Promise<Record<string, number>> => {
+    const counts: Record<string, number> = {};
+    for (const name of (await readFile(log, "utf8")).split("\n").filter(Boolean)) counts[name] = (counts[name] ?? 0) + 1;
+    return counts;
+  };
+  return { ...app, go, ran };
+}
+
+async function waitForTask(scheduler: Scheduler, id: string, taskId: string, state: string): Promise<void> {
+  for (let i = 0; i < 500; i++) {
+    if ((await scheduler.get(id)).tasks[taskId]!.state === state) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Task ${taskId} did not reach ${state}`);
+}
+
+test("a cancelled run resumes where it stopped, unless its workflow has another active run", async () => {
+  const app = await resumeFixture("dagmar-resume-cancelled-");
+  const run = await app.scheduler.start("chain", {});
+  await waitForTask(app.scheduler, run.workflowRunId, "second", "running");
+  await waitForTask(app.scheduler, run.workflowRunId, "side", "completed");
+  const cancelled = await app.scheduler.cancelRun(run.workflowRunId);
+  assert.equal(cancelled.tasks.third!.state, "cancelled");
+  await assert.rejects(app.scheduler.resume(run.workflowRunId, "third"), (error) => error instanceof DagmarError && error.code === "invalid_run_state", "third's dependency was cancelled");
+
+  const other = await app.scheduler.start("chain", {});
+  await waitForTask(app.scheduler, other.workflowRunId, "second", "running");
+  await waitForTask(app.scheduler, other.workflowRunId, "side", "completed");
+  await assert.rejects(app.scheduler.resume(run.workflowRunId), (error) => error instanceof DagmarError && error.code === "active_run_exists");
+  assert.equal((await app.scheduler.get(run.workflowRunId)).status, "cancelled");
+  await app.scheduler.cancelRun(other.workflowRunId);
+
+  await writeFile(app.go, "");
+  const before = await app.ran();
+  await app.scheduler.resume(run.workflowRunId);
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(view.tasks.second!.attempts.map((a) => a.status), ["cancelled", "completed"]);
+  assert.equal(view.tasks.first!.attempts.length, 1);
+  assert.equal(view.tasks.side!.attempts.length, 1);
+  assert.equal(view.tasks.third!.attempts.length, 1);
+  assert.equal(view.endedAt !== null, true);
+  const after = await app.ran();
+  assert.deepEqual({ first: after.first! - before.first!, second: after.second! - before.second!, side: after.side! - before.side!, third: after.third ?? 0 }, { first: 0, second: 1, side: 0, third: 1 });
+  await assert.rejects(app.scheduler.resume(run.workflowRunId), (error) => error instanceof DagmarError && error.code === "invalid_run_state", "a completed run resumes only from a task");
+  app.store.close();
+});
+
+test("a completed run resumes from a task: that task and its downstream run again, the rest keep their results", async () => {
+  const app = await resumeFixture("dagmar-resume-from-");
+  await writeFile(app.go, "");
+  const run = await app.scheduler.start("chain", {});
+  await waitFor(app.scheduler, run.workflowRunId, "completed");
+  await assert.rejects(app.scheduler.resume(run.workflowRunId, "nope"), (error) => error instanceof DagmarError && error.code === "invalid_params");
+  await app.scheduler.resume(run.workflowRunId, "second");
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(Object.fromEntries(Object.entries(view.tasks).map(([id, x]) => [id, x.attempts.map((a) => a.status).join(",")])), {
+    first: "completed",
+    second: "completed,completed",
+    third: "completed,completed",
+    side: "completed",
+  });
+  assert.deepEqual(await app.ran(), { first: 1, second: 2, third: 2, side: 1 });
   app.store.close();
 });
 
@@ -2128,7 +2203,7 @@ test("fixup at its max inside a revise round blocks the run", async () => {
   app.store.close();
 });
 
-test("revise at its max blocks the run, a resume blocks it again at once, and cancel ends it", async (t) => {
+test("revise at its max blocks the run, a resume blocks it again at once, and so does a resume after cancel", async (t) => {
   const app = await sdlcFixture("dagmar-sdlc-revise-max-", [true, true, true], { reviseMax: 2 });
   const run = await app.scheduler.start("sdlc", {});
   const answered = new Set<string>();
@@ -2145,7 +2220,9 @@ test("revise at its max blocks the run, a resume blocks it again at once, and ca
   const cancelled = await app.scheduler.cancelRun(run.workflowRunId);
   assert.equal(cancelled.status, "cancelled");
   assert.deepEqual(publish.mock.calls.at(-1)!.arguments[0].data, { status: "cancelled" });
-  await assert.rejects(app.scheduler.resume(run.workflowRunId), (error) => error instanceof DagmarError && error.code === "invalid_run_state");
+  const again = await app.scheduler.resume(run.workflowRunId);
+  assert.equal(again.status, "blocked");
+  assert.deepEqual(again.tasks.revise!.attempts.map((a) => a.status), ["completed", "completed", "blocked", "blocked", "blocked"]);
   app.store.close();
 });
 
