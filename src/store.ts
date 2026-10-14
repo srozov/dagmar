@@ -28,8 +28,8 @@ type Row = Record<string, unknown>;
 const ACTIVE_RUN_INDEX = `CREATE UNIQUE INDEX IF NOT EXISTS one_active_run_per_workflow_cwd ON workflow_runs(workflow_id,ifnull(cwd,'')) WHERE status IN ('running','waiting')`;
 
 // SQLite extended result code for a UNIQUE-constraint violation. The only such
-// index that can fire on insertRun is one_active_run_per_workflow_cwd (run ids are
-// fresh UUIDs, so the primary key never collides), so this maps to active_run_exists.
+// index that can fire on insertRun or updateRun is one_active_run_per_workflow_cwd (run ids
+// are fresh UUIDs, so the primary key never collides), so this maps to active_run_exists.
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export class Store {
@@ -92,7 +92,14 @@ export class Store {
   }
 
   updateRun(id: string, patch: Partial<Pick<RunRow, "status" | "updatedAt" | "endedAt">>): RunRow {
-    update(this.db, "workflow_runs", id, patch, { status: "status", updatedAt: "updated_at", endedAt: "ended_at" });
+    try {
+      update(this.db, "workflow_runs", id, patch, { status: "status", updatedAt: "updated_at", endedAt: "ended_at" });
+    } catch (error) {
+      // A resumed run becoming active again while its workflow has another active run in its cwd.
+      const run = this.run(id);
+      if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE && run) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run${run.cwd === null ? "" : ` in ${run.cwd}`}`);
+      throw error;
+    }
     const value = this.run(id);
     if (!value) throw new DagmarError("run_not_found", `Run ${id} was not found`);
     return value;
