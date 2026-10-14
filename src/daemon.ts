@@ -50,7 +50,7 @@ export async function startDaemon(configPath?: string): Promise<Daemon> {
     },
     "run.get": async (p: JsonObject) => json(await scheduler.get(string(p, "workflowRunId"))),
     "run.resume": async (p: JsonObject) =>
-      json(await scheduler.resume(string(p, "workflowRunId"))),
+      json(await scheduler.resume(string(p, "workflowRunId"), p.from === undefined ? null : string(p, "from"))),
     "run.cancel": async (p: JsonObject) =>
       json(await scheduler.cancelRun(string(p, "workflowRunId"))),
     "task.cancel": async (p: JsonObject) =>
