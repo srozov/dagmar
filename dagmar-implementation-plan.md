@@ -415,10 +415,17 @@ Workflow status derivation:
 
 ### Resume
 
-Accept `run.resume` only for a blocked workflow. Clear `endedAt`, return the run
-to `running`, and create a new attempt for every currently blocking task whose
-dependencies completed. Completed tasks and successful sibling branches are
-not replayed. There is no selective task resume and no automatic retry.
+Accept `run.resume` for a blocked or cancelled workflow. Clear `endedAt`, return
+the run to `running`, and create a new attempt for every currently blocking task
+whose dependencies completed, and start the tasks that never ran. Completed
+tasks and successful sibling branches are not replayed. There is no automatic
+retry.
+
+`run.resume` with `from` also accepts a completed workflow and creates a new
+attempt for that task, whatever its state, once its dependencies are completed
+or skipped. The tasks downstream of it are decided again, as after a rerun.
+A resume that would make the workflow active while it has another active run
+in the same directory fails with `active_run_exists`.
 
 Resume reads the current workflow YAML. Exact historical workflow definitions
 are not retained in v0.
