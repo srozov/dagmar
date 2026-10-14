@@ -53,7 +53,23 @@ export class Scheduler {
   }
   list(): Omit<RunRow, "input">[] { return this.store.runs().map(({ input: _, ...run }) => run); }
   get(id: string): Promise<RunView> { return this.serial(id, async () => this.view(id, await this.definition(id))); }
-  resume(id: string): Promise<RunView> { return this.serial(id, async () => { const run = this.requiredRun(id); if (run.status !== "blocked") throw new DagmarError("invalid_run_state", "Only blocked runs can resume"); await this.advance(id, true, true); return this.view(id, await this.definition(id)); }); }
+  // A blocked or cancelled run resumes where it stopped: its blocked, failed and cancelled tasks run
+  // again and its unstarted tasks start. `from` also runs that task again, whatever its state, so a
+  // completed run can redo a task, and the tasks downstream of it follow as after a rerun.
+  resume(id: string, from: string | null = null): Promise<RunView> {
+    return this.serial(id, async () => {
+      const run = this.requiredRun(id);
+      if (!(run.status === "blocked" || run.status === "cancelled" || (from !== null && run.status === "completed"))) throw new DagmarError("invalid_run_state", from === null ? "Only blocked or cancelled runs can resume" : "Only completed, blocked or cancelled runs can resume from a task");
+      if (from !== null) {
+        const workflow = await this.definition(id), task = workflow.tasks[from];
+        if (!task) throw new DagmarError("invalid_params", `Task ${from} is not in workflow ${run.workflowId}`);
+        const attempts = this.store.attempts(id);
+        if (!depsSettled(task, latestAttempts(attempts), dueOf(workflow, attempts))) throw new DagmarError("invalid_run_state", `Task ${from} cannot run: not all its dependencies are completed or skipped`);
+      }
+      await this.advance(id, true, true, from);
+      return this.view(id, await this.definition(id));
+    });
+  }
 
   async cancelRun(id: string): Promise<RunView> {
     const handles = await this.serial(id, async () => {
@@ -174,7 +190,7 @@ export class Scheduler {
     })();
   }
 
-  private async advance(id: string, retry: boolean, resuming: boolean): Promise<void> {
+  private async advance(id: string, retry: boolean, resuming: boolean, from: string | null = null): Promise<void> {
     const run = this.requiredRun(id);
     if (this.stopping || (!resuming && run.status !== "running" && run.status !== "waiting")) return;
     let workflow: Workflow;
@@ -200,7 +216,7 @@ export class Scheduler {
       const due = dueTasks(workflow, latest, pos, reruns, existing);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        let candidate = !current || (retry && blocking.has(current.status) && pos.get(current.id)! < existing.length);
+        let candidate = !current || (retry && blocking.has(current.status) && pos.get(current.id)! < existing.length) || (taskId === from && pos.get(current.id)! < existing.length);
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
         if (!candidate || !depsSettled(task, latest, due)) continue;
