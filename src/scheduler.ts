@@ -8,7 +8,7 @@ import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
 import type { AttemptRow, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, WhenClause, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
-import { WorkflowRepository, resolveInputs, reference } from "./workflow.js";
+import { WorkflowRepository, mapItems, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
 
 type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
@@ -90,6 +90,7 @@ export class Scheduler {
     let cancelId: string | undefined;
     await this.serial(first.workflowRunId, async () => {
       const attempt = this.store.attempt(taskRunId); if (!attempt || !active.has(attempt.status)) return;
+      if (attempt.item === null && attempt.roundId !== null) throw new DagmarError("invalid_task_state", "Cancel the map task's items or its run");
       const workflow = await this.definition(first.workflowRunId), now = timestamp();
       const changed = { ...attempt, status: "cancelled" as const, updatedAt: now, endedAt: now };
       const status = aggregate(workflow, replace(this.store.attempts(first.workflowRunId), changed));
@@ -210,31 +211,55 @@ export class Scheduler {
     // a decided row is no longer a candidate (a resume retries only rows from before this advance, so a
     // row prepared already blocked or failed stays decided), EXCEPT when a rerun makes it due again (a
     // terminal completed/skipped attempt is re-prepared, see dueTasks).
-    const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [];
+    // `all`: every row in insertion order, this advance's included; `updated`: map attempts settled in this advance.
+    const prepared: Array<{ row: AttemptRow; request?: ProcessRequest | AcpRequest }> = [], all = [...existing], updated: AttemptRow[] = [];
     for (;;) {
       let progressed = false;
       const due = dueTasks(workflow, latest, pos, reruns, existing);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        let candidate = !current || (retry && blocking.has(current.status) && pos.get(current.id)! < existing.length) || (taskId === from && pos.get(current.id)! < existing.length);
+        const retried = current !== undefined && retry && blocking.has(current.status) && pos.get(current.id)! < existing.length;
+        let candidate = !current || retried || (taskId === from && pos.get(current.id)! < existing.length);
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
         if (!candidate || !depsSettled(task, latest, due)) continue;
-        const item = this.prepare(run, workflow, taskId, task, latest, existing, now);
-        prepared.push(item); latest.set(taskId, item.row); pos.set(item.row.id, pos.size); progressed = true;
+        // A map task retried by a plain resume continues its round, so only its unfinished items run again.
+        const item = this.prepare(run, workflow, taskId, task, latest, all, now, retried && taskId !== from && !due.has(taskId) ? current?.roundId ?? undefined : undefined);
+        prepared.push(item); all.push(item.row); latest.set(taskId, item.row); pos.set(item.row.id, pos.size); progressed = true;
+      }
+      // A running map attempt starts its waiting items into its free slots, in list order, and settles once none is
+      // active or waiting; its dependants are then decided in the next pass.
+      for (const [taskId, task] of Object.entries(workflow.tasks)) {
+        const parent = latest.get(taskId);
+        if (!task.map || parent?.status !== "running" || parent.roundId === null) continue;
+        let settled: AttemptRow | undefined;
+        try {
+          const round = roundOf(parent, mapItems(task, run.input, this.depOutputs(task, latest)), all);
+          for (const [key, value] of round.waiting.slice(0, Math.max(0, task.map.concurrency - round.active))) {
+            const next = this.executorRow(run, workflow, taskId, task, latest, all, now, { key, value, roundId: parent.roundId });
+            prepared.push(next); all.push(next.row); pos.set(next.row.id, pos.size); progressed = true;
+          }
+          if (!round.waiting.length && !round.active) settled = round.failed.length
+            ? { ...parent, status: "blocked", error: { code: "map_items_incomplete", message: `Items did not complete: ${round.failed.join(", ")}` } }
+            : { ...parent, status: "completed", result: { outcome: "completed", message: `${round.outputs.length} items completed`, output: Object.fromEntries(round.outputs) } };
+        } catch (error) { settled = { ...parent, status: "failed", error: taskError("map_items_invalid", error) }; }
+        if (!settled) continue;
+        settled = { ...settled, updatedAt: now, endedAt: now };
+        all[all.findIndex((x) => x.id === parent.id)] = settled; latest.set(taskId, settled); updated.push(settled); progressed = true;
       }
       if (!progressed) break;
     }
-    const combined = [...existing, ...prepared.map((x) => x.row)];
-    const status = aggregate(workflow, combined);
-    if (prepared.length || resuming || status !== run.status) {
+    const status = aggregate(workflow, all);
+    if (prepared.length || updated.length || resuming || status !== run.status) {
       this.store.transaction(() => {
         for (const item of prepared) this.store.insertAttempt(item.row);
+        for (const row of updated) this.store.updateAttempt(row.id, { status: row.status, result: row.result, error: row.error, updatedAt: now, endedAt: now });
         this.store.updateRun(id, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : { endedAt: null }) });
       });
     }
     for (const item of prepared) this.emitTask(item.row, item.row.status);
-    if (prepared.length || status !== run.status) this.emitRun(id, status);
+    for (const row of updated) this.emitTask(row, row.status);
+    if (prepared.length || updated.length || status !== run.status) this.emitRun(id, status);
     const launchable = [];
     for (const item of prepared) {
       if (!item.request) continue;
@@ -251,7 +276,7 @@ export class Scheduler {
     }
   }
 
-  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
+  private prepare(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string, round?: string): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
     // Guard branch first: a task whose `when` clauses are unsatisfied becomes a terminal, non-launching
     // skipped attempt. The real executorType/executorProfile are preserved so view() surfaces the
     // task's kind accurately. Sits ABOVE the gate branch so a conditional gate is decided by the
@@ -266,10 +291,10 @@ export class Scheduler {
       const executorProfile = isGate ? "gate" : task.executor!;
       const block = exhausted && task.rerun!.atMax !== "proceed";
       const error = block ? rerunExhausted(taskId, task) : null;
-      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: block ? "blocked" as const : "skipped" as const, result: null, error, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now, item: null, roundId: null } };
+      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile, executorType, status: block ? "blocked" as const : "skipped" as const, result: null, error, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now, item: null, roundId: null } };
     }
     if (task.gate) {
-      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
+      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
       try {
         resolveInputs(task, run.input, this.depOutputs(task, latest));
         return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
@@ -277,14 +302,21 @@ export class Scheduler {
         return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
       }
     }
+    // A map task's attempt runs nothing itself: advance() starts its items. A resumed attempt continues its round.
+    if (task.map) { const id = `tr_${randomUUID()}`; return { row: { id, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: workflow.executors[task.executor!]?.type ?? "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: round ?? id } }; }
+    return this.executorRow(run, workflow, taskId, task, latest, rows, now);
+  }
+
+  // An attempt that runs the task's executor: the task's own, or one item of a map task.
+  private executorRow(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string, item?: { key: string; value: JsonObject; roundId: string }): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
     const profile = workflow.executors[task.executor!];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: item?.key ?? null, roundId: item?.roundId ?? null } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
       const cwd = profile.cwd ?? run.cwd;
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
-      const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest));
+      const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest), item?.value);
       // The daemon's environment, then the executor's envFile, then its literal env on top.
       const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
       const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
@@ -374,7 +406,7 @@ export class Scheduler {
       const old = this.store.attempt(row.id); if (!old || old.status !== "running") throw new DagmarError("invalid_task_state", "Task cannot request interaction");
       const id = `ix_${randomUUID()}`, now = timestamp(), status = request.kind === "permission" ? "awaiting_permission" : "awaiting_input";
       let resolve!: (value: Json) => void, reject!: (error: Error) => void; answer = new Promise<Json>((a, b) => { resolve = a; reject = b; }); answer.catch(() => undefined);
-      const view: Interaction = { id, workflowRunId: row.workflowRunId, taskRunId: row.id, kind: request.kind, method: request.method, request: request.request, createdAt: now };
+      const view: Interaction = { id, workflowRunId: row.workflowRunId, taskRunId: row.id, ...(row.item === null ? {} : { item: row.item }), kind: request.kind, method: request.method, request: request.request, createdAt: now };
       const workflow = await this.definition(row.workflowRunId), changed = { ...old, status, updatedAt: now } as AttemptRow, runStatus = aggregate(workflow, replace(this.store.attempts(row.workflowRunId), changed));
       this.store.transaction(() => { this.store.updateAttempt(row.id, { status, updatedAt: now }); this.store.updateRun(row.workflowRunId, { status: runStatus, updatedAt: now }); });
       this.pending.set(id, { view, request, resolve, reject }); this.emitTask(old, status); this.events.publish({ type: "interaction.changed", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { interactionId: id, state: "pending" } }); this.emitRun(row.workflowRunId, runStatus);
@@ -422,7 +454,7 @@ export class Scheduler {
   private append(row: AttemptRow, record: Parameters<Hooks["transcript"]>[0]): Promise<number> { return this.transcripts.append(row.workflowRunId, row.id, record).then((line) => { this.events.publish({ type: "transcript.appended", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { line } }); return line; }); }
   private async cancelLive(taskRunId: string): Promise<void> { const live = this.live.get(taskRunId); if (!live) return; try { await (await live.ready).cancel(); } catch {} }
   private emitRun(id: string, status: RunStatus): void { this.events.publish({ type: "workflow.status_changed", workflowRunId: id, data: { status } }); }
-  private emitTask(a: AttemptRow, status: AttemptRow["status"]): void { this.events.publish({ type: "task.status_changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { taskId: a.taskId, attempt: a.attempt, status } }); }
+  private emitTask(a: AttemptRow, status: AttemptRow["status"]): void { this.events.publish({ type: "task.status_changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { taskId: a.taskId, attempt: a.attempt, status, ...(a.item === null ? {} : { item: a.item }) } }); }
   private dropInteraction(taskRunId: string): void { for (const [id, item] of this.pending) if (item.view.taskRunId === taskRunId) { this.pending.delete(id); item.reject(new Error("Interaction cancelled")); this.events.publish({ type: "interaction.changed", workflowRunId: item.view.workflowRunId, taskRunId, data: { interactionId: id, state: "cancelled" } }); } }
   private serial<T>(id: string, fn: () => Promise<T> | T): Promise<T> {
     const previous = this.tails.get(id) ?? Promise.resolve();
@@ -437,7 +469,9 @@ export class Scheduler {
   private background(promise: Promise<unknown>): void { void promise.catch((error) => process.emitWarning(error instanceof Error ? error.message : String(error))); }
 }
 
-function latestAttempts(rows: AttemptRow[]): Map<string, AttemptRow> { const map = new Map<string, AttemptRow>(); for (const row of rows) map.set(row.taskId, row); return map; }
+// A task's latest attempt; a map task's items are not attempts of the task itself.
+function latestAttempts(rows: AttemptRow[]): Map<string, AttemptRow> { const map = new Map<string, AttemptRow>(); for (const row of rows) if (row.item === null) map.set(row.taskId, row); return map; }
+function nextAttempt(rows: AttemptRow[], taskId: string): number { return 1 + Math.max(0, ...rows.filter((r) => r.taskId === taskId).map((r) => r.attempt)); }
 // Per-workflow reruns: for each task rerun from, the tasks (sources) that carry `rerun: { from }`.
 function rerunsOf(workflow: Workflow): Map<string, string[]> {
   const m = new Map<string, string[]>();
@@ -484,6 +518,21 @@ function rerunCount(taskId: string, task: TaskDef, rows: AttemptRow[]): number {
 }
 function rerunExhausted(taskId: string, task: TaskDef): TaskError {
   return { code: "rerun_exhausted", message: `Task ${taskId} asked to rerun from ${task.rerun!.from} after its max of ${task.rerun!.max} reruns` };
+}
+// A map attempt's round: each item is decided by its latest attempt in the round. One that ended before this map
+// attempt was created (a resumed round) waits to run again unless it completed.
+function roundOf(parent: AttemptRow, items: Array<[string, JsonObject]>, rows: AttemptRow[]) {
+  const at = (row: AttemptRow) => rows.findIndex((x) => x.id === row.id), last = new Map<string, AttemptRow>();
+  for (const r of rows) if (r.taskId === parent.taskId && r.roundId === parent.roundId && r.item !== null) last.set(r.item, r);
+  const round = { waiting: [] as Array<[string, JsonObject]>, active: 0, failed: [] as string[], outputs: [] as Array<[string, Json]> };
+  for (const [key, item] of items) {
+    const r = last.get(key);
+    if (!r || (blocking.has(r.status) && at(r) < at(parent))) round.waiting.push([key, item]);
+    else if (active.has(r.status)) round.active++;
+    else if (r.status === "completed") round.outputs.push([key, r.result!.output]);
+    else round.failed.push(key);
+  }
+  return round;
 }
 function matches(clause: WhenClause, value: Json | undefined): boolean {
   return clause.in !== undefined ? clause.in.some((v) => jsonEqual(value, v)) : jsonEqual(value, clause.equals!);

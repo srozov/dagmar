@@ -90,9 +90,6 @@ export class Store {
   activeAttempts(): AttemptRow[] {
     return (this.db.prepare("SELECT * FROM task_runs WHERE status IN ('running','awaiting_permission','awaiting_input')").all() as Row[]).map(attempt);
   }
-  nextAttempt(runId: string, taskId: string): number {
-    return Number((this.db.prepare("SELECT COALESCE(MAX(attempt),0)+1 n FROM task_runs WHERE workflow_run_id=? AND task_id=?").get(runId, taskId) as Row).n);
-  }
 
   updateRun(id: string, patch: Partial<Pick<RunRow, "status" | "updatedAt" | "endedAt">>): RunRow {
     try {
