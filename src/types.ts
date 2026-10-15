@@ -11,13 +11,13 @@ export interface TaskResult { outcome: "completed" | "blocked"; message: string;
 export interface TaskError { code: string; message: string; data?: Json }
 export interface ExecutorProfile { type: ExecutorType; cwd?: string; env: Record<string, string>; envFile?: string; run?: [string, ...string[]]; model?: string; mode?: string }
 export interface Config { workflowDir: string; storageDir: string; listen: { host: "127.0.0.1" | "::1"; port: number } }
-export interface TaskDef { executor?: string; dependsOn: string[]; inputs: JsonObject; prompt?: string; run?: [string, ...string[]]; outputSchema?: JsonSchema; interactive?: boolean; session?: { mode: "fresh" } | { mode: "continue"; from: string }; gate?: { prompt: string; schema?: JsonSchema }; when?: WhenClause[]; rerun?: { from: string; max: number; atMax?: "block" | "proceed"; when?: WhenClause[] } }
+export interface TaskDef { executor?: string; dependsOn: string[]; inputs: JsonObject; prompt?: string; run?: [string, ...string[]]; outputSchema?: JsonSchema; interactive?: boolean; session?: { mode: "fresh" } | { mode: "continue"; from: string }; gate?: { prompt: string; schema?: JsonSchema }; when?: WhenClause[]; rerun?: { from: string; max: number; atMax?: "block" | "proceed"; when?: WhenClause[] }; map?: { over: string; key: string; concurrency: number } }
 export interface Workflow { id: string; executors: Record<string, ExecutorProfile>; tasks: Record<string, TaskDef> }
 export interface WorkflowErrorView { file: string; code: string; message: string }
 export interface RunRow { id: string; workflowId: string; cwd: string | null; input: Json; status: RunStatus; startedAt: string; updatedAt: string; endedAt: string | null }
 export interface AttemptRow { id: string; workflowRunId: string; taskId: string; attempt: number; executorProfile: string; executorType: ExecutorType; status: AttemptStatus; result: TaskResult | null; error: TaskError | null; acpSessionId: string | null; startedAt: string; updatedAt: string; endedAt: string | null; item: string | null; roundId: string | null }
 export interface RunView extends RunRow { sequence: number; tasks: Record<string, { dependsOn: string[]; executor: string; state: TaskState; attempts: Omit<AttemptRow, "workflowRunId" | "taskId" | "executorProfile" | "executorType">[] }> }
-export interface Interaction { id: string; workflowRunId: string; taskRunId: string; kind: "permission" | "input" | "turn" | "gate"; method: "session/request_permission" | "elicitation/create" | "turn/next" | "gate/answer"; request: Json; createdAt: string }
+export interface Interaction { id: string; workflowRunId: string; taskRunId: string; item?: string; kind: "permission" | "input" | "turn" | "gate"; method: "session/request_permission" | "elicitation/create" | "turn/next" | "gate/answer"; request: Json; createdAt: string }
 export type TranscriptInput =
   | { type: "lifecycle"; direction: "internal"; event: string; data?: Json }
   | { type: "stdio"; direction: "to_executor" | "from_executor"; stream: "stdin" | "stdout" | "stderr"; data: string }
