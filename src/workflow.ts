@@ -78,8 +78,8 @@ export function validateWorkflow(value: unknown): Workflow {
   for (const [id, item] of Object.entries(raw.tasks)) {
     if (item.gate) {
       if (item.executor) throw new DagmarError("invalid_task", `Task ${id} cannot have both executor and gate`);
-      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.rerun !== undefined)
-        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, or rerun`);
+      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.rerun !== undefined || item.map !== undefined)
+        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, rerun, or map`);
       if (typeof item.gate.prompt !== "string" || !item.gate.prompt.trim())
         throw new DagmarError("invalid_task", `Gate task ${id} requires a non-empty prompt`);
       if (item.gate.schema !== undefined) validateOutputSchema(item.gate.schema);
@@ -112,6 +112,7 @@ export function validateWorkflow(value: unknown): Workflow {
       if (typeof value !== "string") continue;
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
+      if (ref?.item && !task.map) throw new DagmarError("invalid_input_reference", `Task ${id} reads $item but has no map`);
     }
     // `when` reads the outputs of the task's dependencies or the run input; `rerun.when` reads only the
     // task's own output, after it has run.
@@ -122,7 +123,7 @@ export function validateWorkflow(value: unknown): Workflow {
         if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} ${field} clause needs exactly one of equals or in`);
         if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} ${field} in must be a non-empty array`);
         const ref = reference(clause.ref);
-        if (!ref) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run reference`);
+        if (!ref || ref.item) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run reference`);
         if (field === "rerun.when" && ref.task !== id) throw new DagmarError("invalid_rerun", `Task ${id} rerun.when must read its own output`);
         if (field === "when" && ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
       }
@@ -133,10 +134,16 @@ export function validateWorkflow(value: unknown): Workflow {
       if (!upstream(tasks, id).has(from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} must be upstream of it`);
       if (!Number.isInteger(task.rerun.max) || task.rerun.max < 1) throw new DagmarError("invalid_rerun", `Task ${id} rerun.max must be an integer >= 1`);
     }
+    if (task.map) {
+      const ref = reference(task.map.over);
+      if (!ref || ref.item || (ref.task && !task.dependsOn.includes(ref.task))) throw new DagmarError("invalid_map", `Task ${id} map.over must read the run input or a dependency's output`);
+      if (task.rerun || task.session?.mode === "continue") throw new DagmarError("invalid_map", `Map task ${id} cannot rerun or continue a session`);
+    }
     if (task.session?.mode === "continue") {
       const from = task.session.from;
       if (!task.dependsOn.includes(from)) throw new DagmarError("invalid_dependency", `Task ${id} continue from ${from} must be a dependency`);
       const source = tasks[from]!;
+      if (source.map) throw new DagmarError("invalid_map", `Task ${id} cannot continue map task ${from}`);
       const sourceProfile = source.executor ? profiles[source.executor] : undefined;
       if (!sourceProfile || sourceProfile.type !== "acp") throw new DagmarError("invalid_task", `Task ${id} continue from ${from} must target an ACP task`);
       const thisProfile = profiles[task.executor!]!;
@@ -157,13 +164,13 @@ export function validateWorkflow(value: unknown): Workflow {
   return { id: raw.id, executors: profiles, tasks };
 }
 
-export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>): JsonObject {
+export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>, item?: JsonObject): JsonObject {
   const result: JsonObject = {};
   for (const [name, value] of Object.entries(task.inputs)) {
     if (typeof value !== "string") { result[name] = value; continue; }
     const ref = reference(value);
     if (!ref) { result[name] = value; continue; }
-    let current: Json = ref.task ? outputs[ref.task] as Json : runInput;
+    let current: Json = ref.item ? item as Json : ref.task ? outputs[ref.task] as Json : runInput;
     if (current === undefined) throw new DagmarError("input_resolution_failed", `Missing input ${value}`);
     for (const key of ref.path) {
       if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
@@ -172,6 +179,17 @@ export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<R
     result[name] = current;
   }
   return result;
+}
+
+// The keyed items a map task runs over, in list order; a list it cannot run fails the task before any item starts.
+export function mapItems(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>): Array<[string, JsonObject]> {
+  const { over, key } = task.map!, list = resolveInputs({ ...task, inputs: { list: over } }, runInput, outputs).list, keys = new Set<string>();
+  if (!Array.isArray(list)) throw new DagmarError("map_items_invalid", `${over} is not a list`);
+  return list.map((item, i) => {
+    const value = item && typeof item === "object" && !Array.isArray(item) ? item[key] : undefined;
+    if (typeof value !== "string" || !value || keys.has(value)) throw new DagmarError("map_items_invalid", `Item ${i} of ${over} is not an object with a unique non-empty string ${key}`);
+    keys.add(value); return [value, item as JsonObject];
+  });
 }
 
 // Every task that `id` depends on, directly or through other tasks.
@@ -188,7 +206,9 @@ function yaml(text: string): unknown {
   if (doc.errors.length) throw new DagmarError("invalid_yaml", "Workflow is not valid YAML");
   return doc.toJS({ maxAliasCount: 100 });
 }
-export function reference(value: string): { task?: string; path: string[] } | undefined {
+export function reference(value: string): { task?: string; item?: true; path: string[] } | undefined {
+  if (value === "$item") return { item: true, path: [] };
+  if (value.startsWith("$item.")) return { item: true, path: value.slice(6).split(".") };
   if (value === "$run.input") return { path: [] };
   if (value.startsWith("$run.input.")) return { path: value.slice(11).split(".") };
   const match = /^\$tasks\.([A-Za-z0-9_-]+)\.output(?:\.(.+))?$/.exec(value);
