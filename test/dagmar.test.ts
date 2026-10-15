@@ -220,7 +220,7 @@ test("startup recovery blocks persisted active attempts", async () => {
   const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   assert.equal(app.store.run("wr_recovery")!.status, "blocked");
   assert.equal(app.store.attempt("tr_recovery")!.error!.code, "executor_lost");
@@ -1208,7 +1208,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   // Gate survives.
   const attempt = app.store.attempt("tr_g")!;
@@ -1243,9 +1243,9 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_m", workflowId: "gatemix", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   // Non-gate (process) attempt in 'running'.
-  app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   // Gate attempt in 'awaiting_input'.
-  app.store.insertAttempt({ id: "tr_m_gate", workflowRunId: "wr_m", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m_gate", workflowRunId: "wr_m", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   // Non-gate: failed with executor_lost.
   const dep = app.store.attempt("tr_m_dep")!;
@@ -1304,8 +1304,8 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   const now = new Date().toISOString();
   // Run with endedAt set (simulating the state left by the prior shutdown).
   app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
-  app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
+  app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   assert.equal(app.store.run("wr_m2")!.endedAt, now, "precondition: run arrived with stale endedAt");
   await app.scheduler.recover();
   const run = app.store.run("wr_m2")!;
@@ -2051,7 +2051,7 @@ test("restart mid-rerun: recover() blocks, resume() continues, completed count p
   const now = new Date().toISOString();
   const store1 = new Store(storePath);
   store1.insertRun({ id: "wr_rerun_r", workflowId: workflow.id, cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
-  store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_rerun_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_rerun_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   store1.close();
 
   // Second scheduler on the same store — recovers the in-flight attempt then resumes.
@@ -2350,6 +2350,36 @@ INSERT INTO workflow_runs VALUES('wr_old','w','{"task":"t"}','completed','2026-1
   reopened.close();
 });
 
+test("a database from before map tasks is upgraded in place", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-upgrade-map-")), path = join(root, "dagmar.sqlite"), at = "2026-10-15T00:00:00.000Z";
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE workflow_runs (
+ id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, input_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','blocked','cancelled')),
+ started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT, cwd TEXT
+);
+CREATE TABLE task_runs (
+ id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), task_id TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt>=1), executor_profile TEXT NOT NULL,
+ executor_type TEXT NOT NULL CHECK(executor_type IN ('acp','process','gate')),
+ status TEXT NOT NULL CHECK(status IN ('running','awaiting_permission','awaiting_input','completed','blocked','failed','cancelled','skipped')),
+ result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT,
+ UNIQUE(workflow_run_id,task_id,attempt)
+);
+INSERT INTO workflow_runs VALUES('wr_old','w','{}','completed','${at}','${at}','${at}',NULL);
+INSERT INTO task_runs VALUES('tr_old','wr_old','t',1,'local','process','completed',NULL,NULL,NULL,'${at}','${at}','${at}');`);
+  old.close();
+  const store = new Store(path);
+  try {
+    assert.deepEqual([store.attempt("tr_old")!.item, store.attempt("tr_old")!.roundId], [null, null]);
+    store.insertAttempt({ id: "tr_item", workflowRunId: "wr_old", taskId: "t", attempt: 2, executorProfile: "local", executorType: "process", status: "completed", result: null, error: null, acpSessionId: null, startedAt: at, updatedAt: at, endedAt: at, item: "a", roundId: "tr_old" });
+    assert.deepEqual([store.attempt("tr_item")!.item, store.attempt("tr_item")!.roundId], ["a", "tr_old"]);
+  } finally { store.close(); }
+  const reopened = new Store(path); // the upgrade is idempotent
+  assert.equal(reopened.attempts("wr_old").length, 2);
+  reopened.close();
+});
+
 test("a run's cwd survives a daemon restart", async () => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "dagmar-cwd-restart-"))), project = join(root, "project"), storePath = join(root, "state", "dagmar.sqlite");
   await mkdir(project); await mkdir(join(root, "workflows")); await mkdir(join(root, "state"));
@@ -2406,6 +2436,175 @@ test("an executor's envFile reaches its task between the daemon's env and its ow
   assert.deepEqual(view.tasks.ok!.attempts[0]!.result!.output, { FROM_FILE: "file", OVERRIDDEN: "literal", HOME: "/from-file" });
   assert.equal(view.tasks.bad!.attempts[0]!.error!.code, "env_file_unreadable");
   assert.throws(() => validateWorkflow({ id: "x", executors: { e: { type: "process", envFile: "relative.env" } }, tasks: { t: { executor: "e", inputs: {}, run: ["node"] } } }), (error) => error instanceof DagmarError && error.code === "workflow_invalid");
+  app.store.close();
+});
+
+test("validateWorkflow accepts map tasks and rejects malformed ones", () => {
+  const profiles: Record<string, ExecutorProfile> = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
+  const list = { executor: "agent", inputs: {}, prompt: "list" };
+  const map = { over: "$tasks.list.output.docs", key: "id", concurrency: 3 };
+  const review = { executor: "agent", dependsOn: ["list"], map, inputs: { doc: "$item", title: "$item.title" }, prompt: "review" };
+  const check = (tasks: object) => validate({ id: "m", tasks }, profiles);
+  const rejects = (tasks: object, code: string) => assert.throws(() => check(tasks), (error) => error instanceof DagmarError && error.code === code, JSON.stringify(tasks));
+  assert.deepEqual(check({ list, review }).tasks.review!.map, map);
+  check({ review: { ...review, dependsOn: [], map: { ...map, over: "$run.input.docs" } } });
+  for (const bad of [{ over: map.over, key: "id" }, { ...map, concurrency: 0 }, { ...map, key: "" }, { ...map, extra: 1 }]) rejects({ list, review: { ...review, map: bad } }, "workflow_invalid");
+  rejects({ list, gate: { dependsOn: ["list"], inputs: {}, gate: { prompt: "ok?" }, map } }, "invalid_task");
+  for (const over of ["docs", "$item", "$tasks.other.output"]) rejects({ list, other: list, review: { ...review, map: { ...map, over } } }, "invalid_map");
+  rejects({ list, review: { ...review, rerun: { from: "list", max: 1 } } }, "invalid_map");
+  rejects({ list, review: { ...review, session: { mode: "continue", from: "list" } } }, "invalid_map");
+  rejects({ list, review, next: { executor: "agent", dependsOn: ["review"], inputs: {}, prompt: "next", session: { mode: "continue", from: "review" } } }, "invalid_map");
+  rejects({ list: { ...list, inputs: { doc: "$item" } } }, "invalid_input_reference");
+  rejects({ list, review: { ...review, when: [{ ref: "$item.title", equals: "x" }] } }, "invalid_guard");
+});
+
+test("a map task runs 36 items 3 at a time, keeps the others when one fails, and a resume reruns only that one", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-"));
+  const ids = Array.from({ length: 36 }, (_, i) => `doc${String(i + 1).padStart(2, "0")}`), runs: Record<string, number> = {};
+  let inflight = 0, most = 0, summary: Json = null;
+  const stub = new StubAcpExecutor(async (request) => {
+    if (request.taskId === "list") return { result: { outcome: "completed", message: "list", output: { docs: ids.map((id) => ({ id })) } } };
+    if (request.taskId === "summary") { summary = request.inputs.reviews!; return { result: { outcome: "completed", message: "summary", output: {} } }; }
+    const id = (request.inputs.doc as { id: string }).id;
+    runs[id] = (runs[id] ?? 0) + 1; inflight++; most = Math.max(most, inflight);
+    await new Promise((resolve) => setTimeout(resolve, 5)); inflight--;
+    if (id === "doc17" && runs[id] === 1) return { error: { code: "boom", message: "boom" } };
+    return { result: { outcome: "completed", message: id, output: { id, ok: true } } };
+  });
+  const app = await fixture(root, { id: "map", tasks: {
+    list: { executor: "agent", inputs: {}, prompt: "list" },
+    review: { executor: "agent", dependsOn: ["list"], map: { over: "$tasks.list.output.docs", key: "id", concurrency: 3 }, inputs: { doc: "$item" }, prompt: "review" },
+    summary: { executor: "agent", dependsOn: ["review"], inputs: { reviews: "$tasks.review.output" }, prompt: "summary" },
+  } }, stub);
+  const seen: Array<{ type: string; data: Record<string, Json> }> = [];
+  app.events.subscribe({ readyState: 1, send: (text: string) => seen.push(JSON.parse(text).params) } as never, {}).activate();
+  const run = await app.scheduler.start("map", {});
+  const blocked = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  const items = (view: RunView) => view.tasks.review!.attempts.filter((a) => a.item !== null);
+  assert.equal(most, 3);
+  assert.equal(items(blocked).length, 36);
+  assert.deepEqual(items(blocked).filter((a) => a.status !== "completed").map((a) => [a.item, a.status, a.error?.code]), [["doc17", "failed", "boom"]]);
+  assert.deepEqual([blocked.tasks.review!.state, blocked.tasks.review!.attempts[0]!.error!.code], ["blocked", "map_items_incomplete"]);
+  assert.deepEqual([blocked.tasks.summary!.state, blocked.tasks.summary!.attempts.length], ["blocked_by_dependency", 0]);
+  assert.deepEqual(seen.filter((e) => e.type === "task.status_changed" && e.data.item === "doc17").map((e) => e.data.status), ["running", "failed"]);
+
+  await app.scheduler.resume(run.workflowRunId);
+  const done = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual([Object.keys(runs).length, Object.entries(runs).filter(([, n]) => n !== 1)], [36, [["doc17", 2]]]);
+  assert.equal(most, 3);
+  assert.deepEqual(done.tasks.review!.attempts.filter((a) => a.item === null).map((a) => a.status), ["blocked", "completed"]);
+  assert.deepEqual(items(done).filter((a) => a.item === "doc17").map((a) => a.status), ["failed", "completed"]);
+  assert.equal(items(done).length, 37);
+  assert.deepEqual(Object.keys(summary as object), ids);
+  assert.deepEqual((summary as Record<string, Json>).doc17, { id: "doc17", ok: true });
+  app.store.close();
+});
+
+test("a map over the run input: an empty list completes at once, an invalid one fails before any item, a false guard skips it", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-lists-")), echo = join(root, "echo.mjs");
+  await writeFile(echo, `const c=[];for await(const x of process.stdin)c.push(x);console.log(JSON.stringify({outcome:'completed',message:'echo',output:JSON.parse(c.join(''))}));`);
+  const app = await fixture(root, { id: "lists", tasks: {
+    review: { executor: "local", map: { over: "$run.input.docs", key: "id", concurrency: 2 }, inputs: { doc: "$item" }, run: [process.execPath, echo], when: [{ ref: "$run.input.go", equals: true }] },
+    after: { executor: "local", dependsOn: ["review"], inputs: { reviews: "$tasks.review.output" }, run: [process.execPath, echo] },
+  } });
+  const empty = await app.scheduler.start("lists", { go: true, docs: [] });
+  const done = await waitFor(app.scheduler, empty.workflowRunId, "completed");
+  assert.deepEqual(done.tasks.review!.attempts.map((a) => [a.status, a.result?.output]), [["completed", {}]]);
+  assert.deepEqual(done.tasks.after!.attempts[0]!.result!.output, { reviews: {} });
+  for (const docs of [{}, [1], [{}], [{ id: "" }], [{ id: "a" }, { id: "a" }]]) {
+    const started = await app.scheduler.start("lists", { go: true, docs });
+    const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+    assert.deepEqual(view.tasks.review!.attempts.map((a) => [a.status, a.item, a.error?.code]), [["failed", null, "map_items_invalid"]], JSON.stringify(docs));
+  }
+  const skipped = await app.scheduler.start("lists", { go: false, docs: [{ id: "a" }] });
+  const view = await waitFor(app.scheduler, skipped.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.review!.attempts.map((a) => a.status), ["skipped"]);
+  app.store.close();
+});
+
+test("after a restart, a resume reruns only the items that did not complete", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-restart-")), runs: string[] = [];
+  const stub = new StubAcpExecutor(async (request) => { const id = (request.inputs.doc as { id: string }).id; runs.push(id); return { result: { outcome: "completed", message: id, output: { id, again: true } } }; });
+  const app = await fixture(root, { id: "restart", tasks: {
+    list: { executor: "agent", inputs: {}, prompt: "list" },
+    review: { executor: "agent", dependsOn: ["list"], map: { over: "$tasks.list.output.docs", key: "id", concurrency: 3 }, inputs: { doc: "$item" }, prompt: "review" },
+  } }, stub);
+  const now = new Date().toISOString(), row = { workflowRunId: "wr_map", executorProfile: "agent", executorType: "acp" as const, error: null, acpSessionId: null, startedAt: now, updatedAt: now };
+  app.store.insertRun({ id: "wr_map", workflowId: "restart", cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ ...row, id: "tr_list", taskId: "list", attempt: 1, status: "completed", result: { outcome: "completed", message: "list", output: { docs: [{ id: "a" }, { id: "b" }, { id: "c" }] } }, endedAt: now, item: null, roundId: null });
+  app.store.insertAttempt({ ...row, id: "tr_map", taskId: "review", attempt: 1, status: "running", result: null, endedAt: null, item: null, roundId: "tr_map" });
+  app.store.insertAttempt({ ...row, id: "tr_a", taskId: "review", attempt: 2, status: "completed", result: { outcome: "completed", message: "a", output: { id: "a" } }, endedAt: now, item: "a", roundId: "tr_map" });
+  app.store.insertAttempt({ ...row, id: "tr_b", taskId: "review", attempt: 3, status: "running", result: null, endedAt: null, item: "b", roundId: "tr_map" });
+  await app.scheduler.recover();
+  assert.equal(app.store.run("wr_map")!.status, "blocked");
+  assert.deepEqual(["tr_map", "tr_b"].map((id) => app.store.attempt(id)!.error!.code), ["executor_lost", "executor_lost"]);
+  await app.scheduler.resume("wr_map");
+  const view = await waitFor(app.scheduler, "wr_map", "completed");
+  assert.deepEqual(runs.sort(), ["b", "c"]);
+  const maps = view.tasks.review!.attempts.filter((a) => a.item === null);
+  assert.deepEqual(maps.map((a) => [a.status, a.roundId]), [["failed", "tr_map"], ["completed", "tr_map"]]);
+  assert.deepEqual(maps[1]!.result!.output, { a: { id: "a" }, b: { id: "b", again: true }, c: { id: "c", again: true } });
+  app.store.close();
+});
+
+test("cancelling one item leaves its siblings running and a resume reruns only it; the map attempt itself cannot be cancelled", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-cancel-")), step = join(root, "step.mjs"), log = join(root, "log"), go = join(root, "go-");
+  await writeFile(step, `import{appendFileSync,existsSync}from'node:fs';const c=[];for await(const x of process.stdin)c.push(x);const{doc}=JSON.parse(c.join(''));appendFileSync(${JSON.stringify(log)},doc.id+'\\n');while(!existsSync(${JSON.stringify(go)}+doc.id))await new Promise(r=>setTimeout(r,10));console.log(JSON.stringify({outcome:'completed',message:doc.id,output:{id:doc.id}}));`);
+  const app = await fixture(root, { id: "cancel", tasks: {
+    review: { executor: "local", map: { over: "$run.input.docs", key: "id", concurrency: 3 }, inputs: { doc: "$item" }, run: [process.execPath, step] },
+  } });
+  const run = await app.scheduler.start("cancel", { docs: [{ id: "a" }, { id: "b" }, { id: "c" }] });
+  const running = await waitFor(app.scheduler, run.workflowRunId, "running");
+  const attempt = (item: string | null) => running.tasks.review!.attempts.find((a) => a.item === item)!;
+  await assert.rejects(app.scheduler.cancelTask(attempt(null).id), (error) => error instanceof DagmarError && error.code === "invalid_task_state");
+  const logged = async () => (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean).sort();
+  for (let i = 0; i < 500 && (await logged()).length < 3; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  await app.scheduler.cancelTask(attempt("b").id);
+  await writeFile(go + "a", ""); await writeFile(go + "c", "");
+  const blocked = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(blocked.tasks.review!.attempts.map((a) => [a.item, a.status]), [[null, "blocked"], ["a", "completed"], ["b", "cancelled"], ["c", "completed"]]);
+  await writeFile(go + "b", "");
+  await app.scheduler.resume(run.workflowRunId);
+  const done = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(done.tasks.review!.attempts.filter((a) => a.item === "b").map((a) => a.status), ["cancelled", "completed"]);
+  assert.deepEqual(await logged(), ["a", "b", "b", "c"]);
+  app.store.close();
+});
+
+test("resume --from a map task runs every item again in a new round", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-from-")), runs: string[] = [];
+  const stub = new StubAcpExecutor(async (request) => {
+    if (request.taskId === "summary") return { result: { outcome: "completed", message: "summary", output: {} } };
+    const id = (request.inputs.doc as { id: string }).id; runs.push(id);
+    return { result: { outcome: "completed", message: id, output: { id } } };
+  });
+  const app = await fixture(root, { id: "again", tasks: {
+    review: { executor: "agent", map: { over: "$run.input.docs", key: "id", concurrency: 2 }, inputs: { doc: "$item" }, prompt: "review" },
+    summary: { executor: "agent", dependsOn: ["review"], inputs: { reviews: "$tasks.review.output" }, prompt: "summary" },
+  } }, stub);
+  const run = await app.scheduler.start("again", { docs: [{ id: "a" }, { id: "b" }] });
+  await waitFor(app.scheduler, run.workflowRunId, "completed");
+  await app.scheduler.resume(run.workflowRunId, "review");
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(runs.sort(), ["a", "a", "b", "b"]);
+  const maps = view.tasks.review!.attempts.filter((a) => a.item === null);
+  assert.deepEqual([maps.length, maps[0]!.roundId === maps[1]!.roundId, view.tasks.summary!.attempts.length], [2, false, 2]);
+  assert.equal(new Set(view.tasks.review!.attempts.map((a) => a.attempt)).size, 6);
+  app.store.close();
+});
+
+test("an item's permission request names its item", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-map-ask-"));
+  const app = await fixture(root, { id: "ask", tasks: {
+    review: { executor: "agent", map: { over: "$run.input.docs", key: "id", concurrency: 2 }, inputs: { doc: "$item" }, prompt: "review" },
+  } }, new InteractiveExecutor());
+  const run = await app.scheduler.start("ask", { docs: [{ id: "a" }, { id: "b" }] });
+  for (let i = 0; i < 500 && app.scheduler.interactions().length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(app.scheduler.interactions().map((x) => x.item).sort(), ["a", "b"]);
+  assert.equal((await app.scheduler.get(run.workflowRunId)).status, "running"); // a running map keeps its run running
+  for (const x of app.scheduler.interactions()) await app.scheduler.answer(x.id, { outcome: { outcome: "selected", optionId: "yes" } });
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  assert.deepEqual(Object.keys(view.tasks.review!.attempts[0]!.result!.output as object), ["a", "b"]);
   app.store.close();
 });
 

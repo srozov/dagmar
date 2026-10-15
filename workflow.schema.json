@@ -218,6 +218,29 @@
             }
           }
         },
+        "map": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "over",
+            "key",
+            "concurrency"
+          ],
+          "properties": {
+            "over": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            },
+            "concurrency": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
         "rerun": {
           "type": "object",
           "additionalProperties": false,
