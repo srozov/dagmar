@@ -27,8 +27,8 @@ Do not implement:
 
 - cron or scheduling;
 - automatic retries or task timeouts;
-- conditions, dynamic tasks, loops, or fan-out;
-- concurrency limits;
+- conditions, dynamic tasks, loops, or fan-out other than a map task's items;
+- concurrency limits other than a map task's own `concurrency`;
 - workflow definition snapshots;
 - artifacts, workflow memory, or mutable shared context;
 - session continuation/forking;
@@ -256,6 +256,11 @@ Use UTC RFC 3339 timestamps and serialized JSON in `_json` columns. A
 `task_runs` row represents one attempt and is updated as that attempt changes
 state. Never overwrite a previous attempt when resuming.
 
+A map task's items are `task_runs` rows of that task too. `item_key` holds an
+item attempt's key; `round_id` holds the id of the map task's attempt that
+started the round, on the map attempt and its items alike. Both are null on
+every other attempt. Attempt numbers stay unique per task, items included.
+
 Keep mutations that jointly change attempt and workflow state in SQLite
 transactions.
 
@@ -291,7 +296,12 @@ $run.input
 $run.input.<path>
 $tasks.<dependency-id>.output
 $tasks.<dependency-id>.output.<path>
+$item
+$item.<path>
 ```
+
+`$item` forms are allowed only in the `inputs` of a map task, and read the item
+that attempt runs.
 
 Resolve references only after the referenced dependency completed. Missing
 runtime paths fail the attempt with a structured input-resolution error.
@@ -426,6 +436,10 @@ attempt for that task, whatever its state, once its dependencies are completed
 or skipped. The tasks downstream of it are decided again, as after a rerun.
 A resume that would make the workflow active while it has another active run
 in the same directory fails with `active_run_exists`.
+
+A map task resumed without `from` continues its round: its new attempt runs
+only the items whose latest attempt in the round did not complete. With `from`
+on the map task, or after a rerun upstream of it, a new round runs every item.
 
 Resume reads the current workflow YAML. Exact historical workflow definitions
 are not retained in v0.

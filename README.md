@@ -100,6 +100,7 @@ Input values may be literals or references:
 
 - `$run.input` and `$run.input.key` read the input supplied when the run starts.
 - `$tasks.<task-id>.output` and `$tasks.<task-id>.output.key` read a dependency's output.
+- `$item` and `$item.key` read the item of a map task (see `map` below).
 
 A task may also declare `outputSchema`, a JSON Schema applied to its `output`.
 
@@ -107,7 +108,7 @@ An ACP task starts a new agent session unless it sets `session: { mode: continue
 
 An ACP task with `interactive: true` is a human-driven conversation. Each agent reply that is not a result parks the task as `awaiting_input` with a `turn` interaction carrying the reply in `request.message`; answer with the next message as a non-empty JSON string, for example `dagmar answer <interaction-id> --json '"Add a test"'`. The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
 
-A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema` or `rerun`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
+A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema`, `rerun` or `map`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
 
 `when` guards a task with a list of clauses, all of which must hold. Each clause has a `ref` to `$run.input…` or `$tasks.<dependency>.output…` and exactly one of `equals` (a JSON value) or `in` (a non-empty array of JSON values), compared by JSON equality; other shapes fail validation with `invalid_guard`. If a clause is false when the task's dependencies settle, the task is `skipped` instead of run. A missing path, or a reference to a skipped task, makes a clause false. A skipped task counts as settled for its dependants, but an unguarded input reference to its output fails with `input_resolution_failed`. A run completes when every task is `completed` or `skipped`.
 
@@ -134,6 +135,22 @@ In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s sessio
 ```
 
 The same workflow also uses a gate and an interactive task. `docs/mvp-acceptance.md` is its runbook, including its sharp edges.
+
+`map: { over, key, concurrency }` runs a task once per item of a list known only at run time, for example one review per document:
+
+```yaml
+  review:
+    executor: reviewer
+    dependsOn: [list]
+    map: { over: $tasks.list.output.docs, key: id, concurrency: 3 }
+    inputs: { doc: $item }
+    prompt: |
+      Review the document in your inputs.
+```
+
+All three fields are required. `over` reads `$tasks.<dependency>.output…` or `$run.input…` and must resolve to a list of objects whose `key` field is a non-empty string, unique in the list; otherwise the task fails before any item starts, with `map_items_invalid`. `$item` and `$item.<path>` read the item, in a map task's `inputs` only. Each item runs as an attempt of its own, with its own session, transcript and status, and `outputSchema` applies to each item's output. At most `concurrency` items are active at once, those waiting for an answer included; they start in list order, the next one whenever one ends. The task's output is `{ "<key>": <item output> }`, so a later task reads every item's result from `$tasks.review.output`. An empty list completes the task at once with `{}`. `when` guards the whole task.
+
+An item that fails, blocks or is cancelled (`cancel-task` on its attempt) leaves the others running. Once every item has ended, the task completes, or ends `blocked` with `map_items_incomplete` if any item did not complete. The task keeps one attempt of its own per round, with `item: null`; its items' attempts are listed with it in the task's `attempts`, each with its `item` key and the round's `roundId`, and take the task's next attempt numbers. `resume` continues the round and runs only the items that did not complete, also after a daemon restart or a cancelled run; `resume --from <map task>`, or a rerun from upstream of it, starts a new round with every item. The task's own attempt cannot be cancelled (`invalid_task_state`): cancel its items or the run. While a map runs, its run is `running`, even when its active items wait for answers; an item's interactions and `task.status_changed` events carry its `item`. A map task cannot `rerun` or `continue` a session, and no task can continue a map task's session (`invalid_map`). Maps do not nest.
 
 ## Process task contract
 
@@ -181,4 +198,4 @@ The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `st
 
 ## v0 scope
 
-Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks and bounded reruns; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits, dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
+Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks, bounded reruns and map tasks; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, automatic retries or timeouts, concurrency limits across tasks, nested maps or other dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
