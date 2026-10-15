@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
  attempt INTEGER NOT NULL CHECK(attempt>=1), executor_profile TEXT NOT NULL,
  executor_type TEXT NOT NULL CHECK(executor_type IN ('acp','process','gate')),
  status TEXT NOT NULL CHECK(status IN ('running','awaiting_permission','awaiting_input','completed','blocked','failed','cancelled','skipped')),
- result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT,
+ result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT, item_key TEXT, round_id TEXT,
  UNIQUE(workflow_run_id,task_id,attempt)
 );
 CREATE INDEX IF NOT EXISTS task_runs_by_workflow ON task_runs(workflow_run_id,task_id,attempt);`;
@@ -43,6 +43,9 @@ export class Store {
     if (!(this.db.prepare("PRAGMA table_info(workflow_runs)").all() as Row[]).some((column) => column.name === "cwd")) this.db.exec("ALTER TABLE workflow_runs ADD COLUMN cwd TEXT");
     this.db.exec("DROP INDEX IF EXISTS one_active_run_per_workflow");
     this.db.exec(ACTIVE_RUN_INDEX);
+    // Upgrade a database from before map tasks: add each attempt's item and round.
+    const columns = (this.db.prepare("PRAGMA table_info(task_runs)").all() as Row[]).map((column) => column.name);
+    for (const name of ["item_key", "round_id"]) if (!columns.includes(name)) this.db.exec(`ALTER TABLE task_runs ADD COLUMN ${name} TEXT`);
   }
   close(): void {
     if (this.db.isOpen) this.db.close();
@@ -68,7 +71,7 @@ export class Store {
     }
   }
   insertAttempt(a: AttemptRow): void {
-    this.db.prepare("INSERT INTO task_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)").run(a.id, a.workflowRunId, a.taskId, a.attempt, a.executorProfile, a.executorType, a.status, encode(a.result), encode(a.error), a.acpSessionId, a.startedAt, a.updatedAt, a.endedAt);
+    this.db.prepare("INSERT INTO task_runs(id,workflow_run_id,task_id,attempt,executor_profile,executor_type,status,result_json,error_json,acp_session_id,started_at,updated_at,ended_at,item_key,round_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(a.id, a.workflowRunId, a.taskId, a.attempt, a.executorProfile, a.executorType, a.status, encode(a.result), encode(a.error), a.acpSessionId, a.startedAt, a.updatedAt, a.endedAt, a.item, a.roundId);
   }
   run(id: string): RunRow | undefined {
     const row = this.db.prepare("SELECT * FROM workflow_runs WHERE id=?").get(id) as Row | undefined;
@@ -86,9 +89,6 @@ export class Store {
   }
   activeAttempts(): AttemptRow[] {
     return (this.db.prepare("SELECT * FROM task_runs WHERE status IN ('running','awaiting_permission','awaiting_input')").all() as Row[]).map(attempt);
-  }
-  nextAttempt(runId: string, taskId: string): number {
-    return Number((this.db.prepare("SELECT COALESCE(MAX(attempt),0)+1 n FROM task_runs WHERE workflow_run_id=? AND task_id=?").get(runId, taskId) as Row).n);
   }
 
   updateRun(id: string, patch: Partial<Pick<RunRow, "status" | "updatedAt" | "endedAt">>): RunRow {
@@ -160,5 +160,7 @@ function attempt(r: Row): AttemptRow {
     startedAt: text(r, "started_at"),
     updatedAt: text(r, "updated_at"),
     endedAt: nullable(r, "ended_at"),
+    item: nullable(r, "item_key"),
+    roundId: nullable(r, "round_id"),
   };
 }
