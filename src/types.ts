@@ -15,7 +15,7 @@ export interface TaskDef { executor?: string; dependsOn: string[]; inputs: JsonO
 export interface Workflow { id: string; executors: Record<string, ExecutorProfile>; tasks: Record<string, TaskDef> }
 export interface WorkflowErrorView { file: string; code: string; message: string }
 export interface RunRow { id: string; workflowId: string; cwd: string | null; input: Json; status: RunStatus; startedAt: string; updatedAt: string; endedAt: string | null }
-export interface AttemptRow { id: string; workflowRunId: string; taskId: string; attempt: number; executorProfile: string; executorType: ExecutorType; status: AttemptStatus; result: TaskResult | null; error: TaskError | null; acpSessionId: string | null; startedAt: string; updatedAt: string; endedAt: string | null }
+export interface AttemptRow { id: string; workflowRunId: string; taskId: string; attempt: number; executorProfile: string; executorType: ExecutorType; status: AttemptStatus; result: TaskResult | null; error: TaskError | null; acpSessionId: string | null; startedAt: string; updatedAt: string; endedAt: string | null; item: string | null; roundId: string | null }
 export interface RunView extends RunRow { sequence: number; tasks: Record<string, { dependsOn: string[]; executor: string; state: TaskState; attempts: Omit<AttemptRow, "workflowRunId" | "taskId" | "executorProfile" | "executorType">[] }> }
 export interface Interaction { id: string; workflowRunId: string; taskRunId: string; kind: "permission" | "input" | "turn" | "gate"; method: "session/request_permission" | "elicitation/create" | "turn/next" | "gate/answer"; request: Json; createdAt: string }
 export type TranscriptInput =

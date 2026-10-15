@@ -266,10 +266,10 @@ export class Scheduler {
       const executorProfile = isGate ? "gate" : task.executor!;
       const block = exhausted && task.rerun!.atMax !== "proceed";
       const error = block ? rerunExhausted(taskId, task) : null;
-      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: block ? "blocked" as const : "skipped" as const, result: null, error, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now } };
+      return { row: { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile, executorType, status: block ? "blocked" as const : "skipped" as const, result: null, error, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: now, item: null, roundId: null } };
     }
     if (task.gate) {
-      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+      const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
       try {
         resolveInputs(task, run.input, this.depOutputs(task, latest));
         return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
@@ -278,7 +278,7 @@ export class Scheduler {
       }
     }
     const profile = workflow.executors[task.executor!];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now } as const;
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: this.store.nextAttempt(run.id, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
     try {
       if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
