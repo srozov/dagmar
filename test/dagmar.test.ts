@@ -220,7 +220,7 @@ test("startup recovery blocks persisted active attempts", async () => {
   const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_recovery", workflowId: "recovery", cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_recovery", workflowRunId: "wr_recovery", taskId: "task", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   assert.equal(app.store.run("wr_recovery")!.status, "blocked");
   assert.equal(app.store.attempt("tr_recovery")!.error!.code, "executor_lost");
@@ -1208,7 +1208,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   const app = await fixture(root, workflow);
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_g", workflowId: "gaterecover", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_g", workflowRunId: "wr_g", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   // Gate survives.
   const attempt = app.store.attempt("tr_g")!;
@@ -1243,9 +1243,9 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   const now = new Date().toISOString();
   app.store.insertRun({ id: "wr_m", workflowId: "gatemix", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: null });
   // Non-gate (process) attempt in 'running'.
-  app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m_dep", workflowRunId: "wr_m", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   // Gate attempt in 'awaiting_input'.
-  app.store.insertAttempt({ id: "tr_m_gate", workflowRunId: "wr_m", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m_gate", workflowRunId: "wr_m", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   await app.scheduler.recover();
   // Non-gate: failed with executor_lost.
   const dep = app.store.attempt("tr_m_dep")!;
@@ -1304,8 +1304,8 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   const now = new Date().toISOString();
   // Run with endedAt set (simulating the state left by the prior shutdown).
   app.store.insertRun({ id: "wr_m2", workflowId: "gatemix2", cwd: null, input: {}, status: "waiting", startedAt: now, updatedAt: now, endedAt: now });
-  app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
-  app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  app.store.insertAttempt({ id: "tr_m2_dep", workflowRunId: "wr_m2", taskId: "dep", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
+  app.store.insertAttempt({ id: "tr_m2_gate", workflowRunId: "wr_m2", taskId: "gate", attempt: 1, executorProfile: "gate", executorType: "gate", status: "awaiting_input", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   assert.equal(app.store.run("wr_m2")!.endedAt, now, "precondition: run arrived with stale endedAt");
   await app.scheduler.recover();
   const run = app.store.run("wr_m2")!;
@@ -2051,7 +2051,7 @@ test("restart mid-rerun: recover() blocks, resume() continues, completed count p
   const now = new Date().toISOString();
   const store1 = new Store(storePath);
   store1.insertRun({ id: "wr_rerun_r", workflowId: workflow.id, cwd: null, input: {}, status: "running", startedAt: now, updatedAt: now, endedAt: null });
-  store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_rerun_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null });
+  store1.insertAttempt({ id: "tr_v1", workflowRunId: "wr_rerun_r", taskId: "verify", attempt: 1, executorProfile: "local", executorType: "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: null });
   store1.close();
 
   // Second scheduler on the same store — recovers the in-flight attempt then resumes.
@@ -2347,6 +2347,36 @@ INSERT INTO workflow_runs VALUES('wr_old','w','{"task":"t"}','completed','2026-1
   } finally { store.close(); }
   const reopened = new Store(path); // the upgrade is idempotent
   assert.equal(reopened.runs().length, 4);
+  reopened.close();
+});
+
+test("a database from before map tasks is upgraded in place", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-upgrade-map-")), path = join(root, "dagmar.sqlite"), at = "2026-10-15T00:00:00.000Z";
+  const old = new DatabaseSync(path);
+  old.exec(`CREATE TABLE workflow_runs (
+ id TEXT PRIMARY KEY, workflow_id TEXT NOT NULL, input_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('running','waiting','completed','blocked','cancelled')),
+ started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT, cwd TEXT
+);
+CREATE TABLE task_runs (
+ id TEXT PRIMARY KEY, workflow_run_id TEXT NOT NULL REFERENCES workflow_runs(id), task_id TEXT NOT NULL,
+ attempt INTEGER NOT NULL CHECK(attempt>=1), executor_profile TEXT NOT NULL,
+ executor_type TEXT NOT NULL CHECK(executor_type IN ('acp','process','gate')),
+ status TEXT NOT NULL CHECK(status IN ('running','awaiting_permission','awaiting_input','completed','blocked','failed','cancelled','skipped')),
+ result_json TEXT, error_json TEXT, acp_session_id TEXT, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, ended_at TEXT,
+ UNIQUE(workflow_run_id,task_id,attempt)
+);
+INSERT INTO workflow_runs VALUES('wr_old','w','{}','completed','${at}','${at}','${at}',NULL);
+INSERT INTO task_runs VALUES('tr_old','wr_old','t',1,'local','process','completed',NULL,NULL,NULL,'${at}','${at}','${at}');`);
+  old.close();
+  const store = new Store(path);
+  try {
+    assert.deepEqual([store.attempt("tr_old")!.item, store.attempt("tr_old")!.roundId], [null, null]);
+    store.insertAttempt({ id: "tr_item", workflowRunId: "wr_old", taskId: "t", attempt: 2, executorProfile: "local", executorType: "process", status: "completed", result: null, error: null, acpSessionId: null, startedAt: at, updatedAt: at, endedAt: at, item: "a", roundId: "tr_old" });
+    assert.deepEqual([store.attempt("tr_item")!.item, store.attempt("tr_item")!.roundId], ["a", "tr_old"]);
+  } finally { store.close(); }
+  const reopened = new Store(path); // the upgrade is idempotent
+  assert.equal(reopened.attempts("wr_old").length, 2);
   reopened.close();
 });
 
