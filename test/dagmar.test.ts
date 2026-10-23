@@ -280,19 +280,32 @@ test("transcript.read drops an incomplete final line", async () => {
   assert.deepEqual(read.records.map((x) => (x as { event: string }).event), ["a", "b"]);
 });
 
-// Regression: once a transcript path goes idle its cached line count is evicted; the next
-// append must re-derive the count from disk rather than restarting numbering at 1.
-test("transcript line numbering survives idle eviction of cached counts", async () => {
+// Regression: a writer without a cached count (a restarted daemon) must re-derive it from
+// disk rather than restarting numbering at 1, and must drop an incomplete final line first.
+test("transcript line numbering continues from disk without a cached count", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-evict-"));
   const transcripts = new Transcripts(join(root, "state"));
   const n1 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "a" });
   const n2 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "b" });
   assert.deepEqual([n1, n2], [1, 2]);
-  await new Promise((resolve) => setTimeout(resolve, 20)); // let idle eviction run
-  const n3 = await transcripts.append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "c" });
+  await appendFile(transcripts.path("wr_evict", "tr_evict"), '{"type":"lifecycle"');
+  const n3 = await new Transcripts(join(root, "state")).append("wr_evict", "tr_evict", { type: "lifecycle", direction: "internal", event: "c" });
   assert.equal(n3, 3);
   const read = await transcripts.read("wr_evict", "tr_evict");
   assert.equal(read.records.length, 3);
+});
+
+// Regression: an append after an idle gap must not re-read the file (that made a streamed
+// reply cost O(file size) per chunk). Shown by a line written behind the cache's back: a
+// re-derived count would include it.
+test("transcript append keeps its line count across idle gaps", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-idle-"));
+  const transcripts = new Transcripts(join(root, "state"));
+  await transcripts.append("wr_idle", "tr_idle", { type: "lifecycle", direction: "internal", event: "a" });
+  await new Promise((resolve) => setTimeout(resolve, 20)); // the path goes idle
+  await appendFile(transcripts.path("wr_idle", "tr_idle"), '{"type":"lifecycle","direction":"internal","event":"x"}\n');
+  const n = await transcripts.append("wr_idle", "tr_idle", { type: "lifecycle", direction: "internal", event: "b" });
+  assert.equal(n, 2);
 });
 
 // Regression: WorkflowRepository.get resolves only the requested workflow, so an invalid
