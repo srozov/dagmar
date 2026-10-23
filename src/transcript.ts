@@ -3,6 +3,8 @@ import { dirname, join } from "node:path";
 import type { TranscriptInput, TranscriptRecord } from "./types.js";
 import { DagmarError } from "./types.js";
 
+const MAX_CACHED_COUNTS = 256;
+
 export class Transcripts {
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly counts = new Map<string, number>();
@@ -28,19 +30,24 @@ export class Transcripts {
         await handle.close();
       }
       count += 1;
+      // Keep the count across idle gaps: re-deriving it reads the whole file, and an agent
+      // streaming one small chunk at a time leaves the file idle between almost every append.
+      // The most recently written paths are kept, so the map stays bounded.
+      this.counts.delete(path);
       this.counts.set(path, count);
+      if (this.counts.size > MAX_CACHED_COUNTS) this.counts.delete(this.counts.keys().next().value!);
       this.appended?.(runId, taskRunId, count);
       return count;
     });
-    const guarded = job.catch(() => undefined);
+    // A failed write may leave a partial line: forget the count so the next append repairs it.
+    const guarded = job.catch(() => {
+      this.counts.delete(path);
+    });
     this.tails.set(path, guarded);
-    // Evict per-path state once this file's writes are idle (a later append re-derives the
-    // count from disk) so tails/counts do not grow one entry per attempt forever.
+    // Evict the serialization tail once this file's writes are idle, so tails do not grow one
+    // entry per attempt forever.
     void guarded.then(() => {
-      if (this.tails.get(path) === guarded) {
-        this.tails.delete(path);
-        this.counts.delete(path);
-      }
+      if (this.tails.get(path) === guarded) this.tails.delete(path);
     });
     return job;
   }
@@ -85,7 +92,9 @@ async function repair(path: string): Promise<number> {
   const newline = data.lastIndexOf(10);
   const size = newline < 0 ? 0 : newline + 1;
   if (size !== data.length) await truncate(path, size);
-  return data.subarray(0, size).reduce((n, byte) => n + (byte === 10 ? 1 : 0), 0);
+  let lines = 0;
+  for (let i = data.indexOf(10); i >= 0; i = data.indexOf(10, i + 1)) lines += 1;
+  return lines;
 }
 
 function safe(value: string): void {
