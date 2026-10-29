@@ -45,6 +45,9 @@ implement ─► verify ─┬─ passed=false ─► fixup ──(rerun, max 3)
   own, so all of them work there, and verify and review see the builder's files.
 - **`revise` is live-only.** Restarting the daemon during `revise` fails it (`executor_lost`); that is
   by design (T2). Do the restart test during the loop.
+- **Continuing tasks with project MCP servers need `loadSettleMs`.** `claude-agent-acp` answers
+  `session/load` while the servers of a project `.mcp.json` are still connecting. Without a settle
+  wait, the first prompt can report their tools as removed (see the README).
 - **Use a separate config.** Don't add this workflow to the production `workflowDir`; run the
   acceptance daemon with its own config, workflows, storage and port.
 

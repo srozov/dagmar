@@ -43,6 +43,7 @@ class Attempt {
   private text = "";
   private messageId?: string;
   private cancelled = false;
+  private readonly abort = new AbortController();
   private cancelPromise?: Promise<void>;
   private cleanupPromise?: Promise<void>;
   private stderrDone: Promise<void> = Promise.resolve();
@@ -141,6 +142,14 @@ class Attempt {
         configOptions = session.configOptions;
       }
       await this.hooks.session(this.sessionId);
+      // An agent may answer session/load before its own MCP servers have connected
+      // (claude-agent-acp connects project `.mcp.json` servers in the background), and a
+      // first prompt sent in that window can tell the model those tools are gone. ACP has no
+      // readiness signal, so the profile may set a bounded wait here; cancel interrupts it.
+      if (this.request.loadSessionId && this.request.loadSettleMs !== undefined) {
+        await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_load_settle", data: { ms: this.request.loadSettleMs } });
+        await delay(this.request.loadSettleMs, undefined, { signal: this.abort.signal });
+      }
       if (this.request.model !== undefined) {
         const error = await this.selectOption("model", this.request.model, configOptions);
         if (error) return { error };
@@ -318,6 +327,8 @@ class Attempt {
           await this.agent.notify(methods.agent.session.cancel, { sessionId: this.sessionId });
         }
       } catch {}
+      // Abort the settle wait only now, so the cancel path (not run's `finally`) owns cleanup.
+      this.abort.abort();
       await this.cleanup(true);
       await this.done;
     })());

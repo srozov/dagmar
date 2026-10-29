@@ -554,6 +554,30 @@ test("scheduler resolves loadSessionId from a completed dependency's persisted a
   app.store.close();
 });
 
+test("scheduler forwards the executor's loadSettleMs only to a continuing task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-settle-"));
+  const workflow = {
+    id: "settle",
+    executors: { agent: { type: "acp", cwd: root, run: ["unused"], loadSettleMs: 5000 } },
+    tasks: {
+      A: { executor: "agent", inputs: {}, prompt: "a" },
+      B: { executor: "agent", dependsOn: ["A"], inputs: {}, prompt: "b", session: { mode: "continue", from: "A" } },
+    },
+  };
+  const requests: Record<string, AcpRequest> = {};
+  const stub = new StubAcpExecutor(async (request, hooks) => {
+    requests[request.taskId] = request;
+    if (request.taskId === "A") await hooks.session("sid-A");
+    return { result: { outcome: "completed", message: request.taskId, output: {} } };
+  });
+  const app = await fixture(root, workflow, stub);
+  const started = await app.scheduler.start("settle", {});
+  await waitFor(app.scheduler, started.workflowRunId, "completed");
+  assert.equal(requests.A?.loadSettleMs, undefined);
+  assert.equal(requests.B?.loadSettleMs, 5000);
+  app.store.close();
+});
+
 // T1 (ACP load branch): when loadSessionId is set and the agent advertises loadSession,
 // AcpExecutor calls session/load (not session/new) and then one session/prompt, settling
 // with the parsed TaskResult. Inspect the captured transcript for both the load method
@@ -577,6 +601,65 @@ if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',para
   const methods = records.filter((r) => (r as { type?: string }).type === "acp").map((r) => (r as { message?: { method?: string } }).message?.method);
   assert.ok(methods.includes("session/load"), "expected session/load to be issued");
   assert.ok(!methods.includes("session/new"), "session/new must not be issued on a load path");
+});
+
+// Slow MCP on load: the fake agent answers session/load at once but reports its MCP servers
+// connected only `readyMs` later; a prompt sent before then gets a "blocked" result citing
+// disconnected tools, as claude-agent-acp's model does. The margins (a 200 ms settle against
+// 50 ms, or no settle against 60 s) keep both outcomes independent of scheduling jitter.
+async function slowMcpAgent(readyMs: number): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-settle-")), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+let loadedAt;
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});
+if(m.method==='session/load'){loadedAt=Date.now();send({jsonrpc:'2.0',id:m.id,result:{}})}
+if(m.method==='session/prompt'){const ready=Date.now()-loadedAt>=${readyMs};const r=ready?{outcome:'completed',message:'tools ready',output:{}}:{outcome:'blocked',message:'MCP tools disconnected',output:{}};send({jsonrpc:'2.0',method:'session/update',params:{sessionId:m.params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:JSON.stringify(r)}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  return { root, script };
+}
+
+test("AcpExecutor without loadSettleMs prompts a loaded session before its MCP servers connect", async () => {
+  const { root, script } = await slowMcpAgent(60_000);
+  const { settled, records } = await runModelAgent(root, script, { loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "blocked");
+  assert.ok(!records.some((r) => (r as { event?: string }).event === "acp_load_settle"));
+});
+
+test("AcpExecutor waits loadSettleMs after session/load before the first prompt", async () => {
+  const { root, script } = await slowMcpAgent(50);
+  const { settled, records, sent } = await runModelAgent(root, script, { loadSessionId: "sid-X", loadSettleMs: 200 });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const settle = records.findIndex((r) => (r as { event?: string }).event === "acp_load_settle");
+  assert.deepEqual((records[settle] as { data?: unknown }).data, { ms: 200 });
+  const prompt = records.findIndex((r) => (r as { type?: string; message?: { method?: string } }).type === "acp" && (r as { message: { method?: string } }).message.method === "session/prompt");
+  assert.ok(settle >= 0 && settle < prompt, "the settle event precedes the first prompt");
+  assert.equal(sent.filter((m) => m.method === "session/prompt").length, 1);
+});
+
+test("AcpExecutor ignores loadSettleMs on a new session", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-settle-new-", null);
+  const { settled, records } = await runModelAgent(root, script, { loadSettleMs: 60_000 });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.ok(!records.some((r) => (r as { event?: string }).event === "acp_load_settle"));
+});
+
+test("AcpExecutor cancel interrupts the loadSettleMs wait without prompting", async () => {
+  const { root, script } = await slowMcpAgent(0);
+  const records: unknown[] = [];
+  let settling!: () => void;
+  const waiting = new Promise<void>((resolve) => { settling = resolve; });
+  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_c", taskRunId: "tr_c", taskId: "c", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", loadSessionId: "sid-X", loadSettleMs: 60_000 }, { transcript: async (record) => { records.push(record); if ((record as { event?: string }).event === "acp_load_settle") settling(); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  await waiting;
+  const started = Date.now();
+  await execution.cancel();
+  const settled = await execution.done;
+  assert.ok(Date.now() - started < 30_000, "cancel must not wait out the settle period");
+  assert.equal("error" in settled && settled.error.code, "acp_cancelled");
+  assert.ok(!records.some((r) => (r as { type?: string; message?: { method?: string } }).type === "acp" && (r as { message: { method?: string } }).message.method === "session/prompt"));
 });
 
 // T1 (acp_load_unsupported): when loadSessionId is set but the agent does not advertise
@@ -713,6 +796,11 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent, proc: { ...proc, mode: "acceptEdits" } });
   invalid({ agent: { ...agent, model: "" }, proc });
   invalid({ agent: { ...agent, mode: "" }, proc });
+  assert.equal(validateWorkflow({ id: "x", executors: { agent: { ...agent, loadSettleMs: 120000 }, proc }, tasks }).executors.agent?.loadSettleMs, 120000);
+  invalid({ agent, proc: { ...proc, loadSettleMs: 1000 } }); // loadSettleMs is ACP-only
+  invalid({ agent: { ...agent, loadSettleMs: 0 }, proc });
+  invalid({ agent: { ...agent, loadSettleMs: 120001 }, proc });
+  invalid({ agent: { ...agent, loadSettleMs: 1.5 }, proc });
   invalid({ agent: { ...agent, extra: true }, proc });
   invalid({ agent: { type: "acp", cwd: "/tmp" }, proc }); // an ACP executor needs run
   invalid({ agent: { ...agent, run: [""] }, proc });
