@@ -57,8 +57,8 @@ Prerequisites: Node 24, `pnpm`, an authenticated `claude-agent-acp` 0.84.0, and 
 (`pnpm install --frozen-lockfile && pnpm build`).
 
 ```bash
-DAGMAR=/home/agi01/dagmar                      # this checkout
-T6=$HOME/.local/state/dagmar-t6                 # acceptance config, workflows, state
+DAGMAR=/absolute/path/to/dagmar-checkout        # this checkout
+T6=$HOME/.local/state/dagmar-t6                 # <state dir>: acceptance config, workflows, state
 TARGET=/absolute/path/to/target-worktree        # repo the agents will change
 mkdir -p "$T6/workflows" "$T6/state"
 ```
@@ -96,11 +96,12 @@ builder's mode; pinning it keeps the reviewer independent of host settings.) No
 settings file is written into the target: a target `.claude/settings*.json` would apply to every
 executor working in it.
 
-**Config** — `$T6/config.yaml` (machine-local, not committed):
+**Config** — `$T6/config.yaml` (machine-local, not committed; `<state dir>` is `$T6` as an
+absolute path):
 
 ```yaml
-workflowDir: /home/agi01/.local/state/dagmar-t6/workflows
-storageDir: /home/agi01/.local/state/dagmar-t6/state
+workflowDir: <state dir>/workflows
+storageDir: <state dir>/state
 listen: { host: 127.0.0.1, port: 7341 }
 ```
 
@@ -171,7 +172,7 @@ the run with the seeded-failure env on the workflow's `check` executor:
 ```yaml
   check:
     type: process
-    env: { VERIFY_FAIL_FIRST: "1", VERIFY_COUNTER_FILE: /home/agi01/.local/state/dagmar-t6/verify-count }
+    env: { VERIFY_FAIL_FIRST: "1", VERIFY_COUNTER_FILE: <state dir>/verify-count }
 ```
 
 Dagmar reads the workflow on every step, so edit it before starting the seeded run, never while a run
@@ -218,15 +219,15 @@ its `rerun.max` (3); the run reaches the gate.
 ## Results
 
 Run 2026-09-28 to 2026-09-30 on `claude-agent-acp` 0.84.0: builder `sonnet` + `acceptEdits`, reviewer
-`opus` + `default`. The target was OpsDash's T6 integration plan, one milestone slice per run, in a
-worktree on branch `claude/t6-integration`, with verify = `bun run typecheck && bun run build && bun
-test --pass-with-no-tests`. Raw transcripts are in `~/.local/state/dagmar-t6/state`.
+`opus` + `default`. The target was a private web dashboard's T6 integration plan, one milestone
+slice per run, in a worktree on branch `claude/t6-integration`, with verify = `bun run typecheck &&
+bun run build && bun test --pass-with-no-tests`. Raw transcripts are in `~/.local/state/dagmar-t6/state`.
 
 | Run | Task | Outcome |
 |---|---|---|
-| `wr_65aa29e4-8937-426a-b645-a17ad0f2f9b6` | OpsDash M1 | `completed` via gate → revise (1 human turn) |
-| `wr_9dac61cb-53fe-455b-b188-e08d1a72508e` | OpsDash M2 | `completed` via gate → revise (1 human turn) |
-| `wr_1d091387-70bb-4b9b-b006-ca37e2b32fdc` | OpsDash M3, first commit; seeded verify failure + restart | `completed` via gate → revise (2 human turns) |
+| `wr_65aa29e4-8937-426a-b645-a17ad0f2f9b6` | Dashboard M1 | `completed` via gate → revise (1 human turn) |
+| `wr_9dac61cb-53fe-455b-b188-e08d1a72508e` | Dashboard M2 | `completed` via gate → revise (1 human turn) |
+| `wr_1d091387-70bb-4b9b-b006-ca37e2b32fdc` | Dashboard M3, first commit; seeded verify failure + restart | `completed` via gate → revise (2 human turns) |
 
 | # | Result | Run id | Evidence |
 |---|---|---|---|
@@ -235,7 +236,7 @@ test --pass-with-no-tests`. Raw transcripts are in `~/.local/state/dagmar-t6/sta
 | 3 | Pass | all three | The reviewer's prompt had no builder notes, yet it answered them point by point. M1: it took a position on the builder's doubt about S2's counts, which appears in no file or commit. M3: it found a real bug the builder's tests hid (skipped tasks always have attempt rows, so the inspector never showed their note). |
 | 4 | Pass | `wr_1d091387…` | `kill -9` of the daemon one loop step in: the interrupted verify #2 became `failed (executor_lost)` and the run `blocked`. After restart, `resume` re-ran only verify; fixup's completed visit was kept, the loop exited, and the run went on to review and gate. No orphaned agent or verify process remained. |
 | 5 | Pass | all three | `revise` parked as `turn` interactions answered with `dagmar answer`. In M3 the builder asked for scope, made five commits, then asked "Are you satisfied?" before finishing. |
-| 6 | Pass | — | `src` is 2,308 lines (budget 3–4k); dagmar `pnpm check` / `test` (66 pass) / `build` green. OpsDash after M3a: typecheck, build and 19 tests green, re-run independently of the builder. |
+| 6 | Pass | — | `src` is 2,308 lines (budget 3–4k); dagmar `pnpm check` / `test` (66 pass) / `build` green. The dashboard after M3a: typecheck, build and 19 tests green, re-run independently of the builder. |
 
 Findings, surprises and fold-backs:
 
@@ -257,5 +258,5 @@ Findings, surprises and fold-backs:
   close. The restart step still checks the recorded agent PID.
 - The fixup for a seeded failure took 7 s, so a kill timed "5 s into fixup" hit the next verify
   instead. That is still a crash mid-loop.
-- Not done: no browser check of the OpsDash pages (the fixture is only reachable over `wss://` with
-  a `tailscale serve` mapping, which the task forbade).
+- Not done: no browser check of the dashboard's pages (the fixture is only reachable over `wss://`
+  with a `tailscale serve` mapping, which the task forbade).

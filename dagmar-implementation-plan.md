@@ -8,7 +8,7 @@ Dagmar loads static YAML workflows, runs dependency-ready tasks concurrently,
 executes tasks through either ACP or a direct local process, validates a
 universal task result, and persists run and attempt state in SQLite. A
 JSON-RPC 2.0 API over one loopback WebSocket exposes everything needed by the
-CLI and a future OpsDash DAG view.
+CLI and a future dashboard's DAG view.
 
 ## v0 boundaries
 
@@ -34,7 +34,7 @@ Do not implement:
 - session continuation/forking;
 - reconnecting to ACP sessions after daemon restart;
 - tmux, containers, workers, queues, or distributed locking;
-- an OpenClaw plugin, OpsDash UI, or domain-specific integration;
+- an OpenClaw plugin, dashboard UI, or domain-specific integration;
 - automatic secret redaction of child-process output.
 
 ## 1. Create the package
@@ -617,7 +617,7 @@ the cursor is unavailable after a restart or buffer rollover, return
 ## 10. Implement the CLI as an API client
 
 The CLI contains no scheduler or executor logic. It connects to `dagmard` and
-uses the same JSON-RPC methods as future OpsDash clients.
+uses the same JSON-RPC methods as future dashboard clients.
 
 Provide minimal commands:
 
@@ -706,4 +706,4 @@ Dagmar v0 is complete when:
   graceful shutdown follow this plan;
 - the complete JSON-RPC surface and thin CLI work;
 - both target ACP servers and the local-process smokes pass;
-- no deferred v0 features or career-pipeline-specific behavior were added.
+- no deferred v0 features or domain-specific behavior were added.
