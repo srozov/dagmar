@@ -1,6 +1,6 @@
-# Codex remote development workflow
+# Codex development workflow
 
-These instructions apply **only to Codex running from this Mac**. They do not apply to Claude or other agents already running locally on `agi01`; those agents should use their own local working directory and command environment.
+These instructions are for Codex. Machine-specific setup, such as editing a checkout that lives on another host, belongs in Codex's own instructions on that machine (`~/.codex/AGENTS.md`), not in this file.
 
 ## Project overview
 
@@ -21,53 +21,26 @@ These are implementation constraints, not slogans. Apply them by default.
 - **Think before coding:** State material assumptions and tradeoffs. Do not silently choose between interpretations that would materially change the design; surface the ambiguity and ask.
 - **Verifiable goals:** Define concrete success criteria before a multi-step change and verify each meaningful step rather than declaring the task done on plausibility alone.
 
-This repository lives on the remote host **agi01**. Its local SSHFS mount is:
-
-```text
-/Users/semion/Volumes/agi01/dagmar
-```
-
-## Files
-
-- Read and edit repository files through the local mounted path above.
-- Use the normal local editing workflow (for example, `apply_patch`) against that path.
-- Do not write repository files through an SSH shell unless the user explicitly asks for that.
-
 ## Package management
 
 - Use `pnpm` for dagmar dependency management and project scripts.
 - Commit and maintain `pnpm-lock.yaml`; do not create or update `package-lock.json` or use Yarn.
-- Run project dependency and test commands on `agi01` through Tailscale SSH.
 - Use `pnpm install` when intentionally changing dependencies; use
   `pnpm install --frozen-lockfile` for verification after the lockfile exists.
 - Do not install dagmar dependencies globally. Host-provided executables such
   as `openclaw` and `claude-agent-acp` are configured by absolute path in
   dagmar’s machine-local config.
 
-## Commands
-
-- Run project commands on the remote host, not on the Mac.
-- Connect with Tailscale SSH as `agi01`:
-
-  ```sh
-  tailscale ssh agi01@100.70.202.1 -- 'cd /home/agi01/dagmar && <command>'
-  ```
-
-- Use `/home/agi01/dagmar` as the remote working directory. It is the same repository exposed locally at `/Users/semion/Volumes/agi01/dagmar`.
-- Before testing, inspecting dependencies, or running Git commands, ensure the command is executed on `agi01` through Tailscale SSH.
-
 ## Parallel feature work and Git
 
-- Treat `/home/agi01/dagmar` (branch `main`) as the clean integration checkout. Do not implement features directly in it.
-- Give every independent Codex feature task its own remote Git worktree and feature branch:
+- Treat the main checkout (branch `main`) as the clean integration checkout. Do not implement features directly in it.
+- Give every independent Codex feature task its own Git worktree, under the `<worktrees dir>` that the machine's own instructions name, and feature branch:
 
   ```text
-  Remote worktree: /home/agi01/worktrees/dagmar/<feature>
-  Local mount path: /Users/semion/Volumes/agi01/worktrees/dagmar/<feature>
+  Worktree: <worktrees dir>/dagmar/<feature>
   Branch: codex/<feature>
   ```
 
-- Create and manage worktrees with Git commands on `agi01`; read and edit their files through the corresponding local mounted path.
 - Before editing, run `git status --short` in the relevant worktree. Preserve any changes that do not belong to the current task.
 - Avoid assigning separate agents to overlapping files. Agree on shared interfaces before implementing dependent features.
 
