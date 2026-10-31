@@ -803,7 +803,8 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent: { ...agent, loadSettleMs: 1.5 }, proc });
   assert.deepEqual(validateWorkflow({ id: "x", executors: { agent: { ...agent, retry: { max: 2, delaySeconds: 0 } }, proc }, tasks }).executors.agent?.retry, { max: 2, delaySeconds: 0 });
   invalid({ agent, proc: { ...proc, retry: { max: 2, delaySeconds: 300 } } }); // retry is ACP-only
-  invalid({ agent: { ...agent, retry: { max: 0, delaySeconds: 300 } }, proc });
+  assert.deepEqual(validateWorkflow({ id: "x", executors: { agent: { ...agent, retry: { max: 0, delaySeconds: 0 } }, proc }, tasks }).executors.agent?.retry, { max: 0, delaySeconds: 0 });
+  invalid({ agent: { ...agent, retry: { max: -1, delaySeconds: 300 } }, proc });
   invalid({ agent: { ...agent, retry: { max: 2, delaySeconds: -1 } }, proc });
   invalid({ agent: { ...agent, retry: { max: 2 } }, proc });
   invalid({ agent: { ...agent, retry: { max: 2, delaySeconds: 300, on: "any" } }, proc });
@@ -1038,8 +1039,9 @@ send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'t-1',update:{sess
 `);
   return { root, script };
 }
-function retryWorkflow(root: string, script: string, delaySeconds = 0) {
-  return { id: "retry", executors: { agent: { type: "acp", cwd: root, run: [process.execPath, script], model: "opus", retry: { max: 2, delaySeconds } } }, tasks: { a: { executor: "agent", inputs: {}, prompt: "Go" } } };
+// `retry` null leaves the executor on Dagmar's default retry.
+function retryWorkflow(root: string, script: string, retry: { max: number; delaySeconds: number } | null = { max: 2, delaySeconds: 0 }) {
+  return { id: "retry", executors: { agent: { type: "acp", cwd: root, run: [process.execPath, script], model: "opus", ...(retry ? { retry } : {}) } }, tasks: { a: { executor: "agent", inputs: {}, prompt: "Go" } } };
 }
 
 test("AcpExecutor marks an error the agent answers before any work as retryable", async () => {
@@ -1086,19 +1088,30 @@ test("scheduler does not retry an ACP attempt that failed after a tool call", as
   app.store.close();
 });
 
-test("cancelling a task interrupts its retry's delay", async () => {
+test("an ACP executor without retry gets the default retry, and cancelling a task interrupts its delay", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-retry-cancel-"));
   let starts = 0;
   const stub = new StubAcpExecutor(async () => { starts++; return { error: { code: "acp_failed", message: "Internal error" }, retryable: true }; });
-  const app = await fixture(root, retryWorkflow(root, "unused", 3600), stub);
+  const app = await fixture(root, retryWorkflow(root, "unused", null), stub);
   const run = await app.scheduler.start("retry", {});
   for (let i = 0; i < 500 && (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
   const waiting = (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts;
   assert.deepEqual(waiting.map((x) => x.status), ["failed", "running"]);
+  const { records } = await app.transcripts.read(run.workflowRunId, waiting[1]!.id);
+  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: waiting[0]!.id, retry: 1, max: 2, delaySeconds: 300 });
   await app.scheduler.cancelTask(waiting[1]!.id);
   const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
   assert.deepEqual(view.tasks.a!.attempts.map((x) => x.status), ["failed", "cancelled"]);
   assert.equal(starts, 1);
+  app.store.close();
+});
+
+test("retry max 0 turns the ACP retry off", async () => {
+  const { root, script } = await retryAgent("dagmar-retry-off-", "model", 1);
+  const app = await fixture(root, retryWorkflow(root, script, { max: 0, delaySeconds: 0 }), new AcpExecutor());
+  const run = await app.scheduler.start("retry", {});
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.a!.attempts.map((x) => [x.status, x.error?.code]), [["failed", "acp_failed"]]);
   app.store.close();
 });
 
