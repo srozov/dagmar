@@ -91,6 +91,24 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 120000
+            },
+            "retry": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "max",
+                "delaySeconds"
+              ],
+              "properties": {
+                "max": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "delaySeconds": {
+                  "type": "integer",
+                  "minimum": 0
+                }
+              }
             }
           }
         },

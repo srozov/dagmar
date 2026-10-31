@@ -801,6 +801,12 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent: { ...agent, loadSettleMs: 0 }, proc });
   invalid({ agent: { ...agent, loadSettleMs: 120001 }, proc });
   invalid({ agent: { ...agent, loadSettleMs: 1.5 }, proc });
+  assert.deepEqual(validateWorkflow({ id: "x", executors: { agent: { ...agent, retry: { max: 2, delaySeconds: 0 } }, proc }, tasks }).executors.agent?.retry, { max: 2, delaySeconds: 0 });
+  invalid({ agent, proc: { ...proc, retry: { max: 2, delaySeconds: 300 } } }); // retry is ACP-only
+  invalid({ agent: { ...agent, retry: { max: 0, delaySeconds: 300 } }, proc });
+  invalid({ agent: { ...agent, retry: { max: 2, delaySeconds: -1 } }, proc });
+  invalid({ agent: { ...agent, retry: { max: 2 } }, proc });
+  invalid({ agent: { ...agent, retry: { max: 2, delaySeconds: 300, on: "any" } }, proc });
   invalid({ agent: { ...agent, extra: true }, proc });
   invalid({ agent: { type: "acp", cwd: "/tmp" }, proc }); // an ACP executor needs run
   invalid({ agent: { ...agent, run: [""] }, proc });
@@ -1006,6 +1012,94 @@ test("AcpExecutor does not repair a task whose own outputSchema is invalid", asy
   const { settled, prompts } = await runRepairAgent(root, script, { type: 123 });
   assert.equal("error" in settled && settled.error.message, "Task outputSchema is invalid");
   assert.equal(prompts.length, 1);
+});
+
+// Transient-error retry: each attempt spawns a new agent process, so the fake agent counts its
+// processes in a file. The first `failures` of them answer `failAt` with a JSON-RPC error: the
+// model selection (as claude-agent-acp does when it cannot confirm the model), the prompt, or the
+// prompt after a tool call. Later processes complete the task.
+async function retryAgent(prefix: string, failAt: "model" | "prompt" | "tool", failures: number): Promise<{ root: string; script: string }> {
+  const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
+  await writeFile(script, `
+import{createInterface}from'node:readline';import{appendFileSync,readFileSync}from'node:fs';
+appendFileSync(${JSON.stringify(join(root, "count"))},'x');const failing=readFileSync(${JSON.stringify(join(root, "count"))},'utf8').length<=${failures};
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+const fail=id=>send({jsonrpc:'2.0',id,error:{code:-32603,message:'Internal error',data:{details:'Try again'}}});
+const options=${JSON.stringify([MODEL_OPTION])};
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'t-1',configOptions:options}});
+if(m.method==='session/set_config_option'){if(failing&&${JSON.stringify(failAt)}==='model')fail(m.id);else send({jsonrpc:'2.0',id:m.id,result:{configOptions:options.map(o=>({...o,currentValue:m.params.value}))}})}
+if(m.method==='session/prompt'){
+if(failing&&${JSON.stringify(failAt)}==='tool')send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'t-1',update:{sessionUpdate:'tool_call',toolCallId:'c-1',title:'Edit'}}});
+if(failing&&${JSON.stringify(failAt)}!=='model'){fail(m.id);return}
+send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'t-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'{"outcome":"completed","message":"ok","output":{}}'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
+});
+`);
+  return { root, script };
+}
+function retryWorkflow(root: string, script: string, delaySeconds = 0) {
+  return { id: "retry", executors: { agent: { type: "acp", cwd: root, run: [process.execPath, script], model: "opus", retry: { max: 2, delaySeconds } } }, tasks: { a: { executor: "agent", inputs: {}, prompt: "Go" } } };
+}
+
+test("AcpExecutor marks an error the agent answers before any work as retryable", async () => {
+  for (const failAt of ["model", "prompt"] as const) {
+    const { root, script } = await retryAgent(`dagmar-acp-retryable-${failAt}-`, failAt, 1);
+    const { settled } = await runModelAgent(root, script, { model: "opus" });
+    assert.deepEqual(settled, { error: { code: "acp_failed", message: "Internal error" }, retryable: true }, failAt);
+  }
+  const { root, script } = await retryAgent("dagmar-acp-retryable-tool-", "tool", 1);
+  const { settled } = await runModelAgent(root, script, { model: "opus" });
+  assert.deepEqual(settled, { error: { code: "acp_failed", message: "Internal error" } });
+});
+
+test("scheduler retries an ACP attempt that failed before any work as a new attempt", async () => {
+  const { root, script } = await retryAgent("dagmar-retry-", "model", 1);
+  const app = await fixture(root, retryWorkflow(root, script), new AcpExecutor());
+  const seen: Array<{ data: { attempt?: number; status?: string } }> = [];
+  app.events.subscribe({ readyState: 1, send: (text: string) => seen.push(JSON.parse(text).params) } as never, {}).activate();
+  const run = await app.scheduler.start("retry", {});
+  const view = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  const attempts = view.tasks.a!.attempts;
+  assert.deepEqual(attempts.map((x) => [x.attempt, x.status, x.error?.code ?? null]), [[1, "failed", "acp_failed"], [2, "completed", null]]);
+  assert.deepEqual(seen.filter((x) => x.data.attempt !== undefined).map((x) => `${x.data.attempt}:${x.data.status}`), ["1:running", "1:failed", "2:running", "2:completed"]);
+  const { records } = await app.transcripts.read(run.workflowRunId, attempts[1]!.id);
+  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: attempts[0]!.id, retry: 1, max: 2, delaySeconds: 0 });
+  app.store.close();
+});
+
+test("scheduler fails an ACP task as before once its retries reach max", async () => {
+  const { root, script } = await retryAgent("dagmar-retry-max-", "prompt", 99);
+  const app = await fixture(root, retryWorkflow(root, script), new AcpExecutor());
+  const run = await app.scheduler.start("retry", {});
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.a!.attempts.map((x) => x.status), ["failed", "failed", "failed"]);
+  app.store.close();
+});
+
+test("scheduler does not retry an ACP attempt that failed after a tool call", async () => {
+  const { root, script } = await retryAgent("dagmar-retry-tool-", "tool", 1);
+  const app = await fixture(root, retryWorkflow(root, script), new AcpExecutor());
+  const run = await app.scheduler.start("retry", {});
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.a!.attempts.map((x) => [x.status, x.error?.code]), [["failed", "acp_failed"]]);
+  app.store.close();
+});
+
+test("cancelling a task interrupts its retry's delay", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-retry-cancel-"));
+  let starts = 0;
+  const stub = new StubAcpExecutor(async () => { starts++; return { error: { code: "acp_failed", message: "Internal error" }, retryable: true }; });
+  const app = await fixture(root, retryWorkflow(root, "unused", 3600), stub);
+  const run = await app.scheduler.start("retry", {});
+  for (let i = 0; i < 500 && (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+  const waiting = (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts;
+  assert.deepEqual(waiting.map((x) => x.status), ["failed", "running"]);
+  await app.scheduler.cancelTask(waiting[1]!.id);
+  const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  assert.deepEqual(view.tasks.a!.attempts.map((x) => x.status), ["failed", "cancelled"]);
+  assert.equal(starts, 1);
+  app.store.close();
 });
 
 // T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session

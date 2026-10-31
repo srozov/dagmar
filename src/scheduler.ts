@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { parseEnv } from "node:util";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
@@ -13,7 +14,7 @@ import { gateValidator } from "./result.js";
 
 type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
 type Executors = { process: Executor<ProcessRequest>; acp: Executor<AcpRequest> };
-type Live = { runId: string; handle?: Execution; ready: Promise<Execution>; finished: Promise<void> };
+type Live = { runId: string; handle?: Execution; ready: Promise<Execution>; finished: Promise<void>; wait: AbortController };
 type Pending = { view: Interaction; request: InteractionRequest; resolve(value: Json): void; reject(error: Error): void };
 const active = new Set(["running", "awaiting_permission", "awaiting_input"]);
 const blocking = new Set(["failed", "blocked", "cancelled"]);
@@ -367,21 +368,24 @@ export class Scheduler {
     return true;
   }
 
-  private launch(row: AttemptRow, request: ProcessRequest | AcpRequest): void {
+  // `retries`: how many retries of this task's attempt came before this one; a retry waits `delayMs` before it starts.
+  private launch(row: AttemptRow, request: ProcessRequest | AcpRequest, retries = 0, delayMs = 0): void {
     let ready!: (handle: Execution) => void, failed!: (error: unknown) => void;
     const readyPromise = new Promise<Execution>((resolve, reject) => { ready = resolve; failed = reject; }); readyPromise.catch(() => undefined);
-    const live: Live = { runId: row.workflowRunId, ready: readyPromise, finished: Promise.resolve() }; this.live.set(row.id, live);
+    const live: Live = { runId: row.workflowRunId, ready: readyPromise, finished: Promise.resolve(), wait: new AbortController() }; this.live.set(row.id, live);
     live.finished = (async () => {
       try {
+        // Cancelling the attempt aborts the wait, and the settle below finds it no longer active.
+        if (delayMs) await delay(delayMs, undefined, { signal: live.wait.signal });
         const hooks: Hooks = { transcript: (record) => this.append(row, record), session: (session) => this.serial(row.workflowRunId, async () => { if (this.store.attempt(row.id) && active.has(this.store.attempt(row.id)!.status)) this.store.updateAttempt(row.id, { acpSessionId: session, updatedAt: timestamp() }); }), interact: (item) => this.requestInteraction(row, item) };
         live.handle = request.type === "process" ? await this.executors.process.start(request, hooks) : await this.executors.acp.start(request, hooks); ready(live.handle);
-        await live.handle.done.then((value) => this.serial(row.workflowRunId, () => this.settle(row.id, value)));
+        await live.handle.done.then((value) => this.serial(row.workflowRunId, () => this.settle(row.id, value, request, retries)));
       } catch (error) { failed(error); await this.serial(row.workflowRunId, () => this.settle(row.id, { error: taskError("executor_failed", error) })); }
     })();
     this.background(live.finished);
   }
 
-  private async settle(id: string, value: Settlement): Promise<void> {
+  private async settle(id: string, value: Settlement, request?: ProcessRequest | AcpRequest, retries = 0): Promise<void> {
     const old = this.store.attempt(id); if (!old || !active.has(old.status)) { this.live.delete(id); return; }
     let workflow: Workflow; try { workflow = await this.definition(old.workflowRunId); } catch (error) { await this.blockDefinition(old.workflowRunId, error); return; }
     const now = timestamp(), task = workflow.tasks[old.taskId];
@@ -391,9 +395,22 @@ export class Scheduler {
     // is not done, and unless `atMax: proceed` its attempt is blocked (rerun_exhausted), so the run is.
     if (task?.rerun?.when && task.rerun.atMax !== "proceed" && fires(task, changed) && rerunCount(old.taskId, task, rows) > task.rerun.max)
       changed = { ...changed, status: "blocked", error: rerunExhausted(old.taskId, task) };
-    const status = changed.status, runStatus = aggregate(workflow, replace(rows, changed));
-    this.store.transaction(() => { this.store.updateAttempt(id, { status, result: changed.result, error: changed.error, updatedAt: now, endedAt: now }); this.store.updateRun(old.workflowRunId, { status: runStatus, updatedAt: now, ...(terminal(runStatus) ? { endedAt: now } : {}) }); });
-    this.emitTask(old, status); this.emitRun(old.workflowRunId, runStatus); this.dropInteraction(id); this.live.delete(id);
+    // An attempt that failed before doing any work runs again as a new attempt of the same task (or map item),
+    // up to the executor's `retry.max` times; a resume starts the count again.
+    const retry = workflow.executors[old.executorProfile]?.retry;
+    const next: AttemptRow | undefined = "error" in value && value.retryable && request && retry && retries < retry.max && !this.stopping
+      ? { ...old, id: `tr_${randomUUID()}`, attempt: nextAttempt(rows, old.taskId), status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null }
+      : undefined;
+    const status = changed.status, runStatus = aggregate(workflow, next ? [...replace(rows, changed), next] : replace(rows, changed));
+    this.store.transaction(() => { this.store.updateAttempt(id, { status, result: changed.result, error: changed.error, updatedAt: now, endedAt: now }); if (next) this.store.insertAttempt(next); this.store.updateRun(old.workflowRunId, { status: runStatus, updatedAt: now, ...(terminal(runStatus) ? { endedAt: now } : {}) }); });
+    this.emitTask(old, status); if (next) this.emitTask(next, "running"); this.emitRun(old.workflowRunId, runStatus); this.dropInteraction(id); this.live.delete(id);
+    if (next) {
+      try {
+        await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_started" });
+        await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry!.max, delaySeconds: retry!.delaySeconds } });
+        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry!.delaySeconds * 1000);
+      } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
+    }
     if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);
   }
 
@@ -452,7 +469,7 @@ export class Scheduler {
     return { ...run, sequence: this.events.current, tasks };
   }
   private append(row: AttemptRow, record: Parameters<Hooks["transcript"]>[0]): Promise<number> { return this.transcripts.append(row.workflowRunId, row.id, record).then((line) => { this.events.publish({ type: "transcript.appended", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { line } }); return line; }); }
-  private async cancelLive(taskRunId: string): Promise<void> { const live = this.live.get(taskRunId); if (!live) return; try { await (await live.ready).cancel(); } catch {} }
+  private async cancelLive(taskRunId: string): Promise<void> { const live = this.live.get(taskRunId); if (!live) return; live.wait.abort(); try { await (await live.ready).cancel(); } catch {} }
   private emitRun(id: string, status: RunStatus): void { this.events.publish({ type: "workflow.status_changed", workflowRunId: id, data: { status } }); }
   private emitTask(a: AttemptRow, status: AttemptRow["status"]): void { this.events.publish({ type: "task.status_changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { taskId: a.taskId, attempt: a.attempt, status, ...(a.item === null ? {} : { item: a.item }) } }); }
   private dropInteraction(taskRunId: string): void { for (const [id, item] of this.pending) if (item.view.taskRunId === taskRunId) { this.pending.delete(id); item.reject(new Error("Interaction cancelled")); this.events.publish({ type: "interaction.changed", workflowRunId: item.view.workflowRunId, taskRunId, data: { interactionId: id, state: "cancelled" } }); } }
