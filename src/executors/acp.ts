@@ -42,6 +42,8 @@ class Attempt {
   private supportsClose = false;
   private text = "";
   private messageId?: string;
+  // Set by the agent's first tool call, output or interaction: from then on a failure may have left work behind.
+  private worked = false;
   private cancelled = false;
   private readonly abort = new AbortController();
   private cancelPromise?: Promise<void>;
@@ -57,12 +59,20 @@ class Attempt {
   ) {
     this.closed = new Promise((resolve) => child.once("close", resolve));
     this.done = this.run().catch((error) =>
-      this.cancelled ? errorValue("acp_cancelled", error) : { error: classifyFailure(error) },
+      this.cancelled ? errorValue("acp_cancelled", error) : this.failure(error),
     );
   }
 
   execution(): Execution {
     return { done: this.done, cancel: () => this.cancel() };
+  }
+
+  // An error the agent answered to one of dagmar's requests (session setup, model or mode selection,
+  // or the prompt) before its first tool call, output or interaction left nothing to undo, so it is
+  // retryable whatever its text. Errors dagmar raises itself, a lost connection and authentication are not.
+  private failure(error: unknown): Settlement {
+    const value = classifyFailure(error);
+    return value.code === "acp_failed" && error instanceof RequestError && !this.worked ? { error: value, retryable: true } : { error: value };
   }
 
   private async run(): Promise<Settlement> {
@@ -278,6 +288,7 @@ class Attempt {
       throw new Error("ACP update used the wrong session");
     }
     const update = params.update;
+    if (WORK.has(update.sessionUpdate)) this.worked = true;
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
       // A tool-using agent sends several messages per turn (progress notes between tool calls,
       // then the answer). ACP tags each with a messageId; keep only the latest message so the
@@ -292,6 +303,7 @@ class Attempt {
 
   private async permission(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     this.sameSession(request.sessionId);
+    this.worked = true;
     return (await this.hooks.interact({
       kind: "permission",
       method: "session/request_permission",
@@ -305,6 +317,7 @@ class Attempt {
       throw new Error("ACP URL elicitation is unsupported");
     }
     if ("sessionId" in request) this.sameSession(request.sessionId);
+    this.worked = true;
     return (await this.hooks.interact({
       kind: "input",
       method: "elicitation/create",
@@ -474,6 +487,8 @@ function errorValue(code: string, error: unknown): { error: TaskError } {
     },
   };
 }
+// The session updates that are the agent's work: a tool call or output. Others (commands, modes, usage) are not.
+const WORK = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"]);
 // JSON-RPC error code the ACP agent returns from session/new when it requires authentication.
 const AUTH_REQUIRED = -32000;
 // dagmar performs no ACP `authenticate` handshake, so an agent that gates session creation on
