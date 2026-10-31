@@ -18,6 +18,8 @@ type Live = { runId: string; handle?: Execution; ready: Promise<Execution>; fini
 type Pending = { view: Interaction; request: InteractionRequest; resolve(value: Json): void; reject(error: Error): void };
 const active = new Set(["running", "awaiting_permission", "awaiting_input"]);
 const blocking = new Set(["failed", "blocked", "cancelled"]);
+// The retry of an ACP executor without its own `retry`; `retry: { max: 0 }` turns it off.
+const DEFAULT_RETRY = { max: 2, delaySeconds: 300 };
 
 export class Scheduler {
   private readonly tails = new Map<string, Promise<unknown>>();
@@ -396,9 +398,9 @@ export class Scheduler {
     if (task?.rerun?.when && task.rerun.atMax !== "proceed" && fires(task, changed) && rerunCount(old.taskId, task, rows) > task.rerun.max)
       changed = { ...changed, status: "blocked", error: rerunExhausted(old.taskId, task) };
     // An attempt that failed before doing any work runs again as a new attempt of the same task (or map item),
-    // up to the executor's `retry.max` times; a resume starts the count again.
-    const retry = workflow.executors[old.executorProfile]?.retry;
-    const next: AttemptRow | undefined = "error" in value && value.retryable && request && retry && retries < retry.max && !this.stopping
+    // up to the executor's `retry.max` times (DEFAULT_RETRY without one); a resume starts the count again.
+    const retry = workflow.executors[old.executorProfile]?.retry ?? DEFAULT_RETRY;
+    const next: AttemptRow | undefined = "error" in value && value.retryable && request && retries < retry.max && !this.stopping
       ? { ...old, id: `tr_${randomUUID()}`, attempt: nextAttempt(rows, old.taskId), status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null }
       : undefined;
     const status = changed.status, runStatus = aggregate(workflow, next ? [...replace(rows, changed), next] : replace(rows, changed));
@@ -407,8 +409,8 @@ export class Scheduler {
     if (next) {
       try {
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_started" });
-        await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry!.max, delaySeconds: retry!.delaySeconds } });
-        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry!.delaySeconds * 1000);
+        await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry.max, delaySeconds: retry.delaySeconds } });
+        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry.delaySeconds * 1000);
       } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
     }
     if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);
