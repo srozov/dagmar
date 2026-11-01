@@ -99,6 +99,7 @@ A task's `executor` names one of its workflow's executors. A process task requir
 Input values may be literals or references:
 
 - `$run.input` and `$run.input.key` read the input supplied when the run starts.
+- `$run.id` reads the run's id, as `runs` and `status` show it; it is the same in every task of the run and in every item of a map task. Any other `$run.<name>` fails validation with `invalid_input_reference`.
 - `$tasks.<task-id>.output` and `$tasks.<task-id>.output.key` read a dependency's output.
 - `$item` and `$item.key` read the item of a map task (see `map` below).
 
