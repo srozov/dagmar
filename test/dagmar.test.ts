@@ -266,6 +266,47 @@ test("a process task that ignores stdin and exits does not crash the runtime", a
   app.store.close();
 });
 
+async function runProcess(prefix: string, source: string): Promise<{ settled: Settlement; stderr: string }> {
+  const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "task.mjs");
+  await writeFile(script, source);
+  let stderr = "";
+  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  return { settled: await execution.done, stderr };
+}
+
+test("a failed process carries the tail of its stderr in the error message", async () => {
+  const { settled, stderr } = await runProcess("dagmar-stderr-", `for await(const _ of process.stdin){};process.stderr.write('starting\\n\\nError: config file missing\\n\\n');process.exitCode=1;`);
+  assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process exited with code 1: starting\nError: config file missing" } });
+  assert.equal(stderr, "starting\n\nError: config file missing\n\n");
+});
+
+test("a long stderr tail is cut from the front to the bound", async () => {
+  const { settled, stderr } = await runProcess("dagmar-stderr-long-", `for await(const _ of process.stdin){};for(let i=0;i<2000;i++)process.stderr.write('line '+i+'\\n');process.stderr.write('last line\\n');process.exitCode=1;`);
+  const message = (settled as { error: { message: string } }).error.message;
+  const tail = message.slice("Process exited with code 1: ".length);
+  assert.ok(message.startsWith("Process exited with code 1: …"));
+  assert.ok(tail.endsWith("line 1999\nlast line"));
+  assert.equal(tail.length, 500);
+  assert.ok(stderr.startsWith("line 0\n"), "the transcript keeps the whole stream");
+});
+
+test("a failed process without stderr keeps the plain error message", async () => {
+  const { settled } = await runProcess("dagmar-stderr-none-", `for await(const _ of process.stdin){};process.exit(3);`);
+  assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process exited with code 3" } });
+});
+
+test("a process killed by a signal names the signal before its stderr tail", async () => {
+  const { settled } = await runProcess("dagmar-stderr-killed-", `for await(const _ of process.stdin){};process.stderr.write('allocating\\n',()=>process.kill(process.pid,'SIGKILL'));`);
+  assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process was killed by SIGKILL: allocating" } });
+});
+
+test("missing and invalid stdout carry the tail of stderr too", async () => {
+  const missing = await runProcess("dagmar-stderr-missing-", `for await(const _ of process.stdin){};console.error('nothing to report');`);
+  assert.deepEqual(missing.settled, { error: { code: "process_stdout_missing", message: "Process produced no result: nothing to report" } });
+  const invalid = await runProcess("dagmar-stderr-invalid-", `for await(const _ of process.stdin){};console.error('debug print went to stdout');console.log('oops');console.log('{}');`);
+  assert.deepEqual(invalid.settled, { error: { code: "process_stdout_invalid", message: "Process stdout must be exactly one JSON value: debug print went to stdout" } });
+});
+
 // Regression: transcript.read must drop an incomplete final line left by a crash (the
 // collapsed pop), returning only the complete records.
 test("transcript.read drops an incomplete final line", async () => {

@@ -4,6 +4,11 @@ import { validateResult } from "../result.js";
 import { DagmarError, type TaskError } from "../types.js";
 import type { Execution, Executor, Hooks, ProcessRequest, Settlement } from "./types.js";
 
+// The failure message of a failed process carries the tail of its stderr, so its reason is
+// visible without opening the transcript. Only the last few KB are kept while it runs.
+const STDERR_KEEP = 4096;
+const STDERR_TAIL = 500;
+
 export class ProcessExecutor implements Executor<ProcessRequest> {
   async start(request: ProcessRequest, hooks: Hooks): Promise<Execution> {
     let child: ChildProcessWithoutNullStreams;
@@ -24,6 +29,7 @@ export class ProcessExecutor implements Executor<ProcessRequest> {
 
 function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hooks: Hooks): Execution {
   let stdout = "";
+  let stderr = "";
   let cancelled = false;
   let cancelPromise: Promise<void> | undefined;
   let records = Promise.resolve();
@@ -46,9 +52,10 @@ function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hoo
     stdout += chunk;
   });
   child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) =>
-    record({ type: "stdio", direction: "from_executor", stream: "stderr", data: chunk }),
-  );
+  child.stderr.on("data", (chunk: string) => {
+    stderr = (stderr + chunk).slice(-STDERR_KEEP);
+    record({ type: "stdio", direction: "from_executor", stream: "stderr", data: chunk });
+  });
   const spawned = new Promise<void>((resolve, reject) => {
     child.once("spawn", resolve);
     child.once("error", reject);
@@ -81,17 +88,21 @@ function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hoo
         return { error: { code: "cancelled", message: "Process was cancelled" } };
       }
       if (exit.code !== 0) {
-        return { error: { code: "process_exit_nonzero", message: `Process exited with code ${exit.code}` } };
+        const status = exit.code === null ? `Process was killed by ${exit.signal}` : `Process exited with code ${exit.code}`;
+        return { error: { code: "process_exit_nonzero", message: withStderr(status, stderr) } };
       }
       if (!stdout.trim()) {
-        return { error: { code: "process_stdout_missing", message: "Process produced no result" } };
+        return { error: { code: "process_stdout_missing", message: withStderr("Process produced no result", stderr) } };
       }
       let value: unknown;
       try {
         value = JSON.parse(stdout);
       } catch {
         return {
-          error: { code: "process_stdout_invalid", message: "Process stdout must be exactly one JSON value" },
+          error: {
+            code: "process_stdout_invalid",
+            message: withStderr("Process stdout must be exactly one JSON value", stderr),
+          },
         };
       }
       try {
@@ -135,6 +146,16 @@ function signal(child: ChildProcessWithoutNullStreams, value: NodeJS.Signals): v
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ESRCH") child.kill(value);
   }
+}
+
+function withStderr(message: string, stderr: string): string {
+  const tail = stderr
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .join("\n");
+  if (!tail) return message;
+  return `${message}: ${tail.length > STDERR_TAIL ? `…${tail.slice(-(STDERR_TAIL - 1))}` : tail}`;
 }
 
 function failure(code: string, error: unknown): { error: TaskError } {
