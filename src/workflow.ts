@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Ajv } from "ajv";
 import { parseDocument } from "yaml";
 import { validateOutputSchema } from "./result.js";
-import type { ExecutorProfile, Json, JsonObject, TaskDef, Workflow, WorkflowErrorView } from "./types.js";
+import type { ExecutorProfile, Json, JsonObject, RunRow, TaskDef, Workflow, WorkflowErrorView } from "./types.js";
 import { DagmarError } from "./types.js";
 
 const shape = new Ajv({ allErrors: true, strict: false }).compile(JSON.parse(readFileSync(new URL("../workflow.schema.json", import.meta.url), "utf8")));
@@ -123,7 +123,7 @@ export function validateWorkflow(value: unknown): Workflow {
         if (hasEquals === hasIn) throw new DagmarError("invalid_guard", `Task ${id} ${field} clause needs exactly one of equals or in`);
         if (hasIn && clause.in!.length === 0) throw new DagmarError("invalid_guard", `Task ${id} ${field} in must be a non-empty array`);
         const ref = reference(clause.ref);
-        if (!ref || ref.item) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run reference`);
+        if (!ref || ref.item || ref.runId) throw new DagmarError("invalid_guard", `Task ${id} ${field} ref must be a $tasks or $run.input reference`);
         if (field === "rerun.when" && ref.task !== id) throw new DagmarError("invalid_rerun", `Task ${id} rerun.when must read its own output`);
         if (field === "when" && ref.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_guard", `Task ${id} when references non-dependency ${ref.task}`);
       }
@@ -136,7 +136,7 @@ export function validateWorkflow(value: unknown): Workflow {
     }
     if (task.map) {
       const ref = reference(task.map.over);
-      if (!ref || ref.item || (ref.task && !task.dependsOn.includes(ref.task))) throw new DagmarError("invalid_map", `Task ${id} map.over must read the run input or a dependency's output`);
+      if (!ref || ref.item || ref.runId || (ref.task && !task.dependsOn.includes(ref.task))) throw new DagmarError("invalid_map", `Task ${id} map.over must read the run input or a dependency's output`);
       if (task.rerun || task.session?.mode === "continue") throw new DagmarError("invalid_map", `Map task ${id} cannot rerun or continue a session`);
     }
     if (task.session?.mode === "continue") {
@@ -164,13 +164,13 @@ export function validateWorkflow(value: unknown): Workflow {
   return { id: raw.id, executors: profiles, tasks };
 }
 
-export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>, item?: JsonObject): JsonObject {
+export function resolveInputs(task: TaskDef, run: Pick<RunRow, "id" | "input">, outputs: Readonly<Record<string, Json>>, item?: JsonObject): JsonObject {
   const result: JsonObject = {};
   for (const [name, value] of Object.entries(task.inputs)) {
     if (typeof value !== "string") { result[name] = value; continue; }
     const ref = reference(value);
     if (!ref) { result[name] = value; continue; }
-    let current: Json = ref.item ? item as Json : ref.task ? outputs[ref.task] as Json : runInput;
+    let current: Json = ref.item ? item as Json : ref.task ? outputs[ref.task] as Json : ref.runId ? run.id : run.input;
     if (current === undefined) throw new DagmarError("input_resolution_failed", `Missing input ${value}`);
     for (const key of ref.path) {
       if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
@@ -182,8 +182,8 @@ export function resolveInputs(task: TaskDef, runInput: Json, outputs: Readonly<R
 }
 
 // The keyed items a map task runs over, in list order; a list it cannot run fails the task before any item starts.
-export function mapItems(task: TaskDef, runInput: Json, outputs: Readonly<Record<string, Json>>): Array<[string, JsonObject]> {
-  const { over, key } = task.map!, list = resolveInputs({ ...task, inputs: { list: over } }, runInput, outputs).list, keys = new Set<string>();
+export function mapItems(task: TaskDef, run: Pick<RunRow, "id" | "input">, outputs: Readonly<Record<string, Json>>): Array<[string, JsonObject]> {
+  const { over, key } = task.map!, list = resolveInputs({ ...task, inputs: { list: over } }, run, outputs).list, keys = new Set<string>();
   if (!Array.isArray(list)) throw new DagmarError("map_items_invalid", `${over} is not a list`);
   return list.map((item, i) => {
     const value = item && typeof item === "object" && !Array.isArray(item) ? item[key] : undefined;
@@ -206,9 +206,11 @@ function yaml(text: string): unknown {
   if (doc.errors.length) throw new DagmarError("invalid_yaml", "Workflow is not valid YAML");
   return doc.toJS({ maxAliasCount: 100 });
 }
-export function reference(value: string): { task?: string; item?: true; path: string[] } | undefined {
+// `$run.id` is the run's id; it has no path, so `$run.id.<key>` is invalid like any other `$run.<name>`.
+export function reference(value: string): { task?: string; item?: true; runId?: true; path: string[] } | undefined {
   if (value === "$item") return { item: true, path: [] };
   if (value.startsWith("$item.")) return { item: true, path: value.slice(6).split(".") };
+  if (value === "$run.id") return { runId: true, path: [] };
   if (value === "$run.input") return { path: [] };
   if (value.startsWith("$run.input.")) return { path: value.slice(11).split(".") };
   const match = /^\$tasks\.([A-Za-z0-9_-]+)\.output(?:\.(.+))?$/.exec(value);

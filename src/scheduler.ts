@@ -237,7 +237,7 @@ export class Scheduler {
         if (!task.map || parent?.status !== "running" || parent.roundId === null) continue;
         let settled: AttemptRow | undefined;
         try {
-          const round = roundOf(parent, mapItems(task, run.input, this.depOutputs(task, latest)), all);
+          const round = roundOf(parent, mapItems(task, run, this.depOutputs(task, latest)), all);
           for (const [key, value] of round.waiting.slice(0, Math.max(0, task.map.concurrency - round.active))) {
             const next = this.executorRow(run, workflow, taskId, task, latest, all, now, { key, value, roundId: parent.roundId });
             prepared.push(next); all.push(next.row); pos.set(next.row.id, pos.size); progressed = true;
@@ -299,7 +299,7 @@ export class Scheduler {
     if (task.gate) {
       const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: "gate", executorType: "gate" as const, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: null, roundId: null } as const;
       try {
-        resolveInputs(task, run.input, this.depOutputs(task, latest));
+        resolveInputs(task, run, this.depOutputs(task, latest));
         return { row: { ...base, status: "awaiting_input" as const, error: null, endedAt: null } };
       } catch (error) {
         return { row: { ...base, status: "failed" as const, error: taskError("input_resolution_failed", error), endedAt: now } };
@@ -319,7 +319,7 @@ export class Scheduler {
       // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
       const cwd = profile.cwd ?? run.cwd;
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
-      const inputs = resolveInputs(task, run.input, this.depOutputs(task, latest), item?.value);
+      const inputs = resolveInputs(task, run, this.depOutputs(task, latest), item?.value);
       // The daemon's environment, then the executor's envFile, then its literal env on top.
       const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
       const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
