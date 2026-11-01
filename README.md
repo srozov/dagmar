@@ -168,7 +168,7 @@ Dagmar writes the resolved task inputs as one JSON value to the process's standa
 }
 ```
 
-`outcome` may be `completed` or `blocked`; all three fields are required. Standard error is captured in the task transcript.
+`outcome` may be `completed` or `blocked`; all three fields are required. Standard error is captured in the task transcript; when the process exits non-zero or its standard output is missing or not one JSON value, the attempt's error message also ends with the last non-empty lines of standard error (at most 500 characters, cut from the front).
 
 An ACP task's agent returns the same JSON result as its final message; earlier messages in the turn (progress notes between tool calls) are ignored. If that final message is not a valid result, Dagmar sends one repair prompt on the same session asking for only the corrected result (transcript event `acp_result_repair`). A second invalid result fails the attempt. Interactive tasks treat a non-result reply as conversation instead.
 
