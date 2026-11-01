@@ -88,7 +88,8 @@ function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hoo
         return { error: { code: "cancelled", message: "Process was cancelled" } };
       }
       if (exit.code !== 0) {
-        return { error: { code: "process_exit_nonzero", message: withStderr(`Process exited with code ${exit.code}`, stderr) } };
+        const status = exit.code === null ? `Process was killed by ${exit.signal}` : `Process exited with code ${exit.code}`;
+        return { error: { code: "process_exit_nonzero", message: withStderr(status, stderr) } };
       }
       if (!stdout.trim()) {
         return { error: { code: "process_stdout_missing", message: withStderr("Process produced no result", stderr) } };

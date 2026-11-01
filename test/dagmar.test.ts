@@ -295,6 +295,11 @@ test("a failed process without stderr keeps the plain error message", async () =
   assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process exited with code 3" } });
 });
 
+test("a process killed by a signal names the signal before its stderr tail", async () => {
+  const { settled } = await runProcess("dagmar-stderr-killed-", `for await(const _ of process.stdin){};process.stderr.write('allocating\\n',()=>process.kill(process.pid,'SIGKILL'));`);
+  assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process was killed by SIGKILL: allocating" } });
+});
+
 test("missing and invalid stdout carry the tail of stderr too", async () => {
   const missing = await runProcess("dagmar-stderr-missing-", `for await(const _ of process.stdin){};console.error('nothing to report');`);
   assert.deepEqual(missing.settled, { error: { code: "process_stdout_missing", message: "Process produced no result: nothing to report" } });
