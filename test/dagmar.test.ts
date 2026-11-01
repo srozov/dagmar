@@ -2707,6 +2707,37 @@ test("validateWorkflow accepts map tasks and rejects malformed ones", () => {
   rejects({ list, review: { ...review, when: [{ ref: "$item.title", equals: "x" }] } }, "invalid_guard");
 });
 
+test("validateWorkflow accepts $run.id in inputs only and rejects every other $run.<name>", () => {
+  const profiles: Record<string, ExecutorProfile> = { local: { type: "process", cwd: "/tmp", env: {} } };
+  const check = (tasks: object) => validate({ id: "r", tasks }, profiles);
+  const rejects = (tasks: object, code: string) => assert.throws(() => check(tasks), (error) => error instanceof DagmarError && error.code === code, JSON.stringify(tasks));
+  const t = { executor: "local", inputs: { run: "$run.id" }, run: ["true"] };
+  assert.deepEqual(check({ t }).tasks.t!.inputs, { run: "$run.id" });
+  check({ t: { ...t, map: { over: "$run.input.docs", key: "id", concurrency: 1 } } });
+  for (const value of ["$run.started", "$run.id.x", "$run."]) rejects({ t: { ...t, inputs: { run: value } } }, "invalid_input_reference");
+  rejects({ t: { ...t, when: [{ ref: "$run.id", equals: "wr_x" }] } }, "invalid_guard");
+  rejects({ t: { ...t, map: { over: "$run.id", key: "id", concurrency: 1 } } }, "invalid_map");
+});
+
+test("every task of a run, and every item of its map task, reads the run's id from $run.id", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-run-id-")), echo = join(root, "echo.mjs");
+  await writeFile(echo, `const c=[];for await(const x of process.stdin)c.push(x);console.log(JSON.stringify({outcome:'completed',message:'echo',output:JSON.parse(c.join(''))}));`);
+  const app = await fixture(root, { id: "run-id", tasks: {
+    first: { executor: "local", inputs: { run: "$run.id", request: "$run.input" }, run: [process.execPath, echo] },
+    review: { executor: "local", dependsOn: ["first"], map: { over: "$run.input.docs", key: "id", concurrency: 2 }, inputs: { run: "$run.id", doc: "$item" }, run: [process.execPath, echo] },
+    last: { executor: "local", dependsOn: ["review"], inputs: { run: "$run.id", reviews: "$tasks.review.output" }, run: [process.execPath, echo] },
+  } });
+  const docs = [{ id: "a" }, { id: "b" }];
+  const started = await app.scheduler.start("run-id", { docs });
+  const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
+  const id = started.workflowRunId;
+  assert.deepEqual(app.scheduler.list().map((run) => run.id), [id]);
+  assert.deepEqual(view.tasks.first!.attempts[0]!.result!.output, { run: id, request: { docs } });
+  assert.deepEqual(view.tasks.review!.attempts.filter((a) => a.item !== null).map((a) => a.result!.output), docs.map((doc) => ({ run: id, doc })));
+  assert.deepEqual(view.tasks.last!.attempts[0]!.result!.output, { run: id, reviews: { a: { run: id, doc: docs[0] }, b: { run: id, doc: docs[1] } } });
+  app.store.close();
+});
+
 test("a map task runs 36 items 3 at a time, keeps the others when one fails, and a resume reruns only that one", { timeout: 20_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-map-"));
   const ids = Array.from({ length: 36 }, (_, i) => `doc${String(i + 1).padStart(2, "0")}`), runs: Record<string, number> = {};
