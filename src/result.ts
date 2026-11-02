@@ -5,6 +5,9 @@ import { DagmarError } from "./types.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false, validateFormats: false });
 const envelope = ajv.compile(JSON.parse(readFileSync(new URL("../result.schema.json", import.meta.url), "utf8")));
+// Bound on the schema-violation detail appended to output_validation_failed, so a very wrong
+// output does not flood the repair prompt or the attempt error.
+const SCHEMA_ERRORS_MAX = 500;
 
 export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskResult {
   if (!envelope(value) || !json(value)) throw new DagmarError("result_validation_failed", "Executor did not return a valid TaskResult");
@@ -13,7 +16,13 @@ export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskR
     let validate;
     try { validate = ajv.compile(outputSchema); }
     catch { throw new DagmarError("invalid_output_schema", "Task outputSchema is invalid"); }
-    if (!validate(result.output)) throw new DagmarError("output_validation_failed", "Task output does not match outputSchema");
+    if (!validate(result.output)) {
+      // Name every violation (Ajv runs with allErrors) by instance path, so an agent's repair
+      // turn and the attempt error say which part of the output failed, not only that it did.
+      const detail = ajv.errorsText(validate.errors, { dataVar: "output", separator: "; " });
+      const bounded = detail.length > SCHEMA_ERRORS_MAX ? `${detail.slice(0, SCHEMA_ERRORS_MAX)}…` : detail;
+      throw new DagmarError("output_validation_failed", `Task output does not match outputSchema: ${bounded}`);
+    }
   }
   return result;
 }
