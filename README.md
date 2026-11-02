@@ -105,7 +105,7 @@ Input values may be literals or references:
 
 A reference must be the whole value of a top-level input. A reference string anywhere inside an object or array value (for example `gaps: { a: $tasks.collect-a.output.gaps }`) fails validation with `invalid_input_reference`, naming the input and the path; lift each such value to its own top-level input instead. Objects and arrays of literals pass through unchanged.
 
-A task may also declare `outputSchema`, a JSON Schema applied to its `output`.
+A task may also declare `outputSchema`, a JSON Schema applied to its `output`. An output that does not match fails with `output_validation_failed`, whose message names each violation by path, such as `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
 
 An ACP task starts a new agent session unless it sets `session: { mode: continue, from: <task-id> }`, which loads that task's session through ACP `session/load`. The source must be a dependency (`invalid_dependency`) and an ACP task whose executor has a byte-identical `run` (`invalid_task`); `model` and `mode` may differ. The attempt fails with `acp_load_unsupported` if the agent cannot load sessions, or `continuation_unavailable` if the source has no recorded session (for example, it was skipped). `session: { mode: fork }` is rejected (`unsupported_session_mode`).
 

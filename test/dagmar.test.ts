@@ -12,6 +12,7 @@ import { loadConfig } from "../src/config.js";
 import { startDaemon } from "../src/daemon.js";
 import { AcpExecutor, REPAIR_INSTRUCTION } from "../src/executors/acp.js";
 import { ProcessExecutor } from "../src/executors/process.js";
+import { validateResult } from "../src/result.js";
 import type { AcpRequest, Execution, Executor, Hooks, Settlement } from "../src/executors/types.js";
 import { EventBus, RpcClient } from "../src/rpc.js";
 import { Scheduler } from "../src/scheduler.js";
@@ -273,6 +274,23 @@ async function runProcess(prefix: string, source: string): Promise<{ settled: Se
   const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   return { settled: await execution.done, stderr };
 }
+
+test("a process whose output fails outputSchema names each violation by path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-process-schema-")), script = join(root, "task.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};process.stdout.write(${JSON.stringify(JSON.stringify({ outcome: "completed", message: "ok", output: { items: [{ evidence: [] }], note: 1 } }))});`);
+  const outputSchema = { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { evidence: { type: "array", minItems: 1 } } } }, note: { type: "string" } } };
+  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], outputSchema }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  assert.deepEqual(await execution.done, { error: { code: "output_validation_failed", message: "Task output does not match outputSchema: output/items/0/evidence must NOT have fewer than 1 items; output/note must be string" } });
+});
+
+test("the schema-violation detail is cut to its bound", () => {
+  const outputSchema = { type: "array", items: { type: "string" } };
+  const error = (() => { try { validateResult({ outcome: "completed", message: "ok", output: Array.from({ length: 100 }, (_, i) => i) }, outputSchema); } catch (e) { return e as DagmarError; } })();
+  assert.equal(error?.code, "output_validation_failed");
+  assert.ok(error!.message.startsWith("Task output does not match outputSchema: output/0 must be string; output/1 must be string;"));
+  assert.ok(error!.message.endsWith("…"));
+  assert.equal(error!.message.length, "Task output does not match outputSchema: ".length + 500 + 1);
+});
 
 test("a failed process carries the tail of its stderr in the error message", async () => {
   const { settled, stderr } = await runProcess("dagmar-stderr-", `for await(const _ of process.stdin){};process.stderr.write('starting\\n\\nError: config file missing\\n\\n');process.exitCode=1;`);
@@ -1047,6 +1065,29 @@ test("AcpExecutor fails after the repair turn also returns an invalid result", a
   assert.equal("error" in settled && settled.error.code, "acp_failed");
   assert.match("error" in settled ? settled.error.message : "", /exactly one JSON value/);
   assert.equal(prompts.length, 2, "exactly one repair turn");
+});
+
+// An output with two schema violations: the repair prompt and the attempt error name both paths.
+const TWO_RULE_SCHEMA = { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { evidence: { type: "array", minItems: 1 } } } }, note: { type: "string" } } } as const;
+const TWO_RULE_VIOLATIONS = "output/items/0/evidence must NOT have fewer than 1 items; output/note must be string";
+const TWO_RULE_INVALID = { items: [{ evidence: [] }], note: 1 };
+
+test("AcpExecutor's repair prompt names each schema violation by path", async () => {
+  const invalid = JSON.stringify({ outcome: "completed", message: "ok", output: TWO_RULE_INVALID });
+  const valid = JSON.stringify({ outcome: "completed", message: "ok", output: { items: [{ evidence: ["e1"] }], note: "n" } });
+  const { root, script } = await repairAgent("dagmar-acp-repair-paths-", [invalid, valid]);
+  const { settled, prompts } = await runRepairAgent(root, script, TWO_RULE_SCHEMA);
+  assert.ok("result" in settled, `expected a result, got ${JSON.stringify(settled)}`);
+  assert.deepEqual(settled.result.output, { items: [{ evidence: ["e1"] }], note: "n" });
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts[1]!.includes(`Error: Task output does not match outputSchema: ${TWO_RULE_VIOLATIONS}.`), prompts[1]);
+});
+
+test("AcpExecutor's attempt error names each schema violation when the repair also fails", async () => {
+  const invalid = JSON.stringify({ outcome: "completed", message: "ok", output: TWO_RULE_INVALID });
+  const { root, script } = await repairAgent("dagmar-acp-repair-paths-twice-", [invalid, invalid]);
+  const { settled } = await runRepairAgent(root, script, TWO_RULE_SCHEMA);
+  assert.deepEqual(settled, { error: { code: "acp_failed", message: `Task output does not match outputSchema: ${TWO_RULE_VIOLATIONS}` } });
 });
 
 test("AcpExecutor does not repair a task whose own outputSchema is invalid", async () => {
