@@ -108,8 +108,12 @@ export function validateWorkflow(value: unknown): Workflow {
     for (const dep of task.dependsOn) {
       if (dep === id || !tasks[dep]) throw new DagmarError("invalid_dependency", `Task ${id} has invalid dependency ${dep}`);
     }
-    for (const value of Object.values(task.inputs)) {
-      if (typeof value !== "string") continue;
+    for (const [name, value] of Object.entries(task.inputs)) {
+      if (typeof value !== "string") {
+        const at = nestedReference(value, name);
+        if (at) throw new DagmarError("invalid_input_reference", `Task ${id} input ${name} has a reference at ${at}; a reference must be a whole top-level input value`);
+        continue;
+      }
       const ref = reference(value);
       if (ref?.task && !task.dependsOn.includes(ref.task)) throw new DagmarError("invalid_input_reference", `Task ${id} references a non-dependency`);
       if (ref?.item && !task.map) throw new DagmarError("invalid_input_reference", `Task ${id} reads $item but has no map`);
@@ -197,6 +201,15 @@ function upstream(tasks: Record<string, TaskDef>, id: string): Set<string> {
   const seen = new Set<string>(), stack = [...tasks[id]!.dependsOn];
   while (stack.length) { const next = stack.pop()!; if (!seen.has(next)) { seen.add(next); stack.push(...(tasks[next]?.dependsOn ?? [])); } }
   return seen;
+}
+// The path of the first reference below the top level of an input value, if any. `resolveInputs` resolves only a
+// whole top-level value, so a nested one would reach the task as a literal string. A string counts as a reference
+// when `reference()` would resolve or reject it.
+function nestedReference(value: Json, path: string): string | undefined {
+  if (typeof value === "string") return /^\$(?:item$|item\.|run\.|tasks\.)/.test(value) ? path : undefined;
+  if (!value || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) return value.map((child, i) => nestedReference(child, `${path}[${i}]`)).find(Boolean);
+  return Object.entries(value).map(([key, child]) => nestedReference(child!, `${path}.${key}`)).find(Boolean);
 }
 function idOf(raw: unknown): string | undefined {
   return typeof raw === "object" && raw !== null && !Array.isArray(raw) && typeof (raw as Record<string, unknown>).id === "string" ? (raw as { id: string }).id : undefined;

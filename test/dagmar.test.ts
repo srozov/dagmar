@@ -19,7 +19,7 @@ import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
 import type { ExecutorProfile, Json, RunView, TaskResult, Workflow } from "../src/types.js";
 import { DagmarError } from "../src/types.js";
-import { WorkflowRepository, validateWorkflow } from "../src/workflow.js";
+import { WorkflowRepository, resolveInputs, validateWorkflow } from "../src/workflow.js";
 
 test("process DAG runs a diamond concurrently and persists transcripts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-diamond-"));
@@ -2717,6 +2717,21 @@ test("validateWorkflow accepts $run.id in inputs only and rejects every other $r
   for (const value of ["$run.started", "$run.id.x", "$run."]) rejects({ t: { ...t, inputs: { run: value } } }, "invalid_input_reference");
   rejects({ t: { ...t, when: [{ ref: "$run.id", equals: "wr_x" }] } }, "invalid_guard");
   rejects({ t: { ...t, map: { over: "$run.id", key: "id", concurrency: 1 } } }, "invalid_map");
+});
+
+test("validateWorkflow rejects a reference nested below the top level of an input value", () => {
+  const profiles: Record<string, ExecutorProfile> = { local: { type: "process", cwd: "/tmp", env: {} } };
+  const a = { executor: "local", inputs: {}, run: ["true"] };
+  const check = (inputs: object) => validate({ id: "n", tasks: { a, t: { executor: "local", dependsOn: ["a"], inputs, run: ["true"] } } }, profiles);
+  const rejects = (inputs: object, at: string) => assert.throws(() => check(inputs), (error) => error instanceof DagmarError && error.code === "invalid_input_reference" && error.message.includes(` at ${at};`), JSON.stringify(inputs));
+  rejects({ gaps: { a: "$tasks.a.output.gaps", b: "literal" } }, "gaps.a");
+  rejects({ list: ["x", "$run.input.docs"] }, "list[1]");
+  rejects({ deep: { rows: [{ run: "$run.id" }] } }, "deep.rows[0].run");
+  rejects({ doc: { item: "$item" } }, "doc.item");
+  rejects({ bad: { ref: "$run.started" } }, "bad.ref");
+  const literal = { gaps: { a: ["x"], b: { note: "$runs", cost: "$5", n: 1, ok: true, none: null } }, top: "$tasks.a.output" };
+  const task = check(literal).tasks.t!;
+  assert.deepEqual(resolveInputs(task, { id: "wr_x", input: {} }, { a: { y: 1 } }), { gaps: literal.gaps, top: { y: 1 } });
 });
 
 test("every task of a run, and every item of its map task, reads the run's id from $run.id", { timeout: 20_000 }, async () => {
