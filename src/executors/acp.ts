@@ -39,6 +39,7 @@ class Attempt {
   private connection?: ClientConnection;
   private agent?: ClientContext;
   private sessionId?: string;
+  private configOptions: SessionConfigOption[] = [];
   private supportsClose = false;
   private text = "";
   private messageId?: string;
@@ -67,7 +68,7 @@ class Attempt {
     return { done: this.done, cancel: () => this.cancel() };
   }
 
-  // An error the agent answered to one of dagmar's requests (session setup, model or mode selection,
+  // An error the agent answered to one of dagmar's requests (session setup, model, mode or effort selection,
   // or the prompt) before its first tool call, output or interaction left nothing to undo, so it is
   // retryable whatever its text. Errors dagmar raises itself, a lost connection and authentication are not.
   private failure(error: unknown): Settlement {
@@ -121,7 +122,6 @@ class Attempt {
         throw new Error("ACP protocol version is unsupported");
       }
       this.supportsClose = initialized.agentCapabilities?.sessionCapabilities?.close != null;
-      let configOptions: SessionConfigOption[] | null | undefined;
       if (this.request.loadSessionId) {
         // The capability is top-level (not under sessionCapabilities), contrast with close.
         const supportsLoad = initialized.agentCapabilities?.loadSession === true;
@@ -142,14 +142,14 @@ class Attempt {
           mcpServers: [],
         });
         this.sessionId = this.request.loadSessionId;
-        configOptions = loaded.configOptions;
+        this.configOptions = loaded.configOptions ?? [];
       } else {
         const session = await this.agent.request(methods.agent.session.new, {
           cwd: this.request.cwd,
           mcpServers: [],
         });
         this.sessionId = session.sessionId;
-        configOptions = session.configOptions;
+        this.configOptions = session.configOptions ?? [];
       }
       await this.hooks.session(this.sessionId);
       // An agent may answer session/load before its own MCP servers have connected
@@ -161,11 +161,15 @@ class Attempt {
         await delay(this.request.loadSettleMs, undefined, { signal: this.abort.signal });
       }
       if (this.request.model !== undefined) {
-        const error = await this.selectOption("model", this.request.model, configOptions);
+        const error = await this.selectOption("model", this.request.model);
         if (error) return { error };
       }
       if (this.request.mode !== undefined) {
-        const error = await this.selectOption("mode", this.request.mode, configOptions);
+        const error = await this.selectOption("mode", this.request.mode);
+        if (error) return { error };
+      }
+      if (this.request.effort !== undefined) {
+        const error = await this.selectOption("thought_level", this.request.effort);
         if (error) return { error };
       }
       // First turn: append the contract the agent must follow. Interactive tasks get the
@@ -255,28 +259,34 @@ class Attempt {
     }
   }
 
-  // The profile's model and mode are applied through the agent's ACP config option of that
-  // category ("model" / "mode"), on every new or loaded session, so a continuing task runs with its
-  // own profile's settings. The value must be one the agent advertises, exactly: agents may
-  // fuzzy-match or silently keep a default for an unknown value, so dagmar fails fast instead.
-  private async selectOption(category: "model" | "mode", value: string, options: SessionConfigOption[] | null | undefined): Promise<TaskError | undefined> {
-    const option = options?.find((o) => o.category === category);
+  // The profile's model, mode and effort are applied through the agent's ACP config option of that
+  // category ("model" / "mode" / "thought_level"), on every new or loaded session, so a continuing
+  // task runs with its own profile's settings. The value must be one the agent advertises, exactly:
+  // agents may fuzzy-match or silently keep a default for an unknown value, so dagmar fails fast
+  // instead. Each set answers the full option list, which later selections read: the effort levels
+  // depend on the model. Effort is set even when already current, because an agent may show an
+  // effort it does not apply (claude-agent-acp leaves an unpinned effort to its CLI). Messages name
+  // the profile field as well as the category, which differ for effort.
+  private async selectOption(category: "model" | "mode" | "thought_level", value: string): Promise<TaskError | undefined> {
+    const label = category === "thought_level" ? "effort (thought_level)" : category;
+    const option = this.configOptions.find((o) => o.category === category);
     if (!option || option.type !== "select") {
-      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${category} ${value}` };
+      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${label} ${value}` };
     }
     const values = option.options.flatMap((o) => ("group" in o ? o.options : [o])).map((o) => o.value);
     if (!values.includes(value)) {
-      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${category} ${value}; available: ${values.join(", ")}` };
+      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${label} ${value}; available: ${values.join(", ")}` };
     }
-    if (option.currentValue !== value) {
+    if (option.currentValue !== value || category === "thought_level") {
       const set = await this.agent!.request(methods.agent.session.setConfigOption, {
         sessionId: this.sessionId!,
         configId: option.id,
         value,
       });
+      this.configOptions = set.configOptions;
       const current = set.configOptions.find((o) => o.id === option.id)?.currentValue;
       if (current !== value) {
-        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${category} ${value} (current: ${String(current)})` };
+        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${label} ${value} (current: ${String(current)})` };
       }
     }
     await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: `acp_${category}_selected`, data: { [category]: value } });

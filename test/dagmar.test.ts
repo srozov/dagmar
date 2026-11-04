@@ -742,18 +742,20 @@ if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1
 });
 
 // Profile model selection: the fake agent advertises `configOptions` on session/new and
-// session/load; `apply: false` makes it acknowledge set_config_option without switching.
+// session/load; `apply: false` makes it acknowledge set_config_option without switching, and
+// `switched` replaces the options once the model is set (an agent's levels depend on its model).
 const MODEL_OPTION = { id: "model", name: "Model", category: "model", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] };
-async function modelAgent(prefix: string, configOptions: unknown, apply = true): Promise<{ root: string; script: string }> {
+async function modelAgent(prefix: string, configOptions: unknown, apply = true, switched?: unknown): Promise<{ root: string; script: string }> {
   const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
   await writeFile(script, `
 import{createInterface}from'node:readline';
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
-const options=${JSON.stringify(configOptions)};
+let options=${JSON.stringify(configOptions)};const switched=${JSON.stringify(switched ?? null)};
 createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
 if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});
 if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'m-1',...(options?{configOptions:options}:{})}});
 if(m.method==='session/load')send({jsonrpc:'2.0',id:m.id,result:options?{configOptions:options}:{}});
+if(m.method==='session/set_config_option'&&m.params.configId==='model'&&switched)options=switched;
 if(m.method==='session/set_config_option')send({jsonrpc:'2.0',id:m.id,result:{configOptions:options.map(o=>o.id===m.params.configId&&${apply}?{...o,currentValue:m.params.value}:o)}});
 if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',params:{sessionId:m.params.sessionId,update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'{"outcome":"completed","message":"ok","output":{}}'}}}});send({jsonrpc:'2.0',id:m.id,result:{stopReason:'end_turn'}})}
 });
@@ -820,11 +822,11 @@ test("AcpExecutor fails with acp_model_not_applied when the agent does not switc
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
-test("scheduler forwards the executor profile's model and mode on the ACP request", async () => {
+test("scheduler forwards the executor profile's model, mode and effort on the ACP request", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-model-fwd-"));
   const workflowDir = join(root, "workflows");
   await mkdir(workflowDir, { recursive: true });
-  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", executors: { reviewer: { type: "acp", cwd: root, run: ["unused"], model: "opus", mode: "plan" } }, tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
+  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", executors: { reviewer: { type: "acp", cwd: root, run: ["unused"], model: "opus", mode: "plan", effort: "high" } }, tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
   const captured = { request: undefined as AcpRequest | undefined };
   const stub = new StubAcpExecutor(async (request) => { captured.request = request; return { result: { outcome: "completed", message: "a", output: {} } }; });
   const store = new Store(":memory:");
@@ -833,6 +835,7 @@ test("scheduler forwards the executor profile's model and mode on the ACP reques
   await waitFor(scheduler, started.workflowRunId, "completed");
   assert.equal(captured.request?.model, "opus");
   assert.equal(captured.request?.mode, "plan");
+  assert.equal(captured.request?.effort, "high");
   store.close();
 });
 
@@ -848,13 +851,15 @@ test("loadConfig rejects executors, which a workflow declares", async () => {
 test("validateWorkflow reads the workflow's executors and rejects malformed ones", () => {
   const tasks = { a: { executor: "agent", inputs: {}, prompt: "a" }, p: { executor: "proc", inputs: {}, run: ["node"] } };
   const agent = { type: "acp", cwd: "/tmp", run: ["/bin/agent"] }, proc = { type: "process", cwd: "/tmp" };
-  const ok = validateWorkflow({ id: "x", executors: { agent: { ...agent, env: { A: "1" }, model: "opus", mode: "acceptEdits" }, proc }, tasks });
-  assert.deepEqual(ok.executors, { agent: { type: "acp", cwd: "/tmp", run: ["/bin/agent"], env: { A: "1" }, model: "opus", mode: "acceptEdits" }, proc: { type: "process", cwd: "/tmp", env: {} } });
+  const ok = validateWorkflow({ id: "x", executors: { agent: { ...agent, env: { A: "1" }, model: "opus", mode: "acceptEdits", effort: "high" }, proc }, tasks });
+  assert.deepEqual(ok.executors, { agent: { type: "acp", cwd: "/tmp", run: ["/bin/agent"], env: { A: "1" }, model: "opus", mode: "acceptEdits", effort: "high" }, proc: { type: "process", cwd: "/tmp", env: {} } });
   const invalid = (executors: object) => assert.throws(() => validateWorkflow({ id: "x", executors, tasks }), (error) => error instanceof DagmarError && error.code === "workflow_invalid");
-  invalid({ agent, proc: { ...proc, model: "opus" } }); // model and mode are ACP-only
+  invalid({ agent, proc: { ...proc, model: "opus" } }); // model, mode and effort are ACP-only
   invalid({ agent, proc: { ...proc, mode: "acceptEdits" } });
+  invalid({ agent, proc: { ...proc, effort: "high" } });
   invalid({ agent: { ...agent, model: "" }, proc });
   invalid({ agent: { ...agent, mode: "" }, proc });
+  invalid({ agent: { ...agent, effort: "" }, proc });
   assert.equal(validateWorkflow({ id: "x", executors: { agent: { ...agent, loadSettleMs: 120000 }, proc }, tasks }).executors.agent?.loadSettleMs, 120000);
   invalid({ agent, proc: { ...proc, loadSettleMs: 1000 } }); // loadSettleMs is ACP-only
   invalid({ agent: { ...agent, loadSettleMs: 0 }, proc });
@@ -892,6 +897,15 @@ test("AcpExecutor selects the profile mode after the model, before prompting", a
   assert.ok(records.some((r) => (r as { event?: string; data?: { mode?: string } }).event === "acp_mode_selected" && (r as { data?: { mode?: string } }).data?.mode === "acceptEdits"));
 });
 
+test("AcpExecutor checks the profile mode against the options the model switch answers", async () => {
+  // The model switch resets the mode, so the mode session/new showed is no longer current.
+  const { root, script } = await modelAgent("dagmar-acp-mode-switched-", [MODEL_OPTION, { ...MODE_OPTION, currentValue: "acceptEdits" }], true, [{ ...MODEL_OPTION, currentValue: "opus" }, MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { model: "opus", mode: "acceptEdits" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const sets = sent.filter((m) => m.method === "session/set_config_option").map((m) => [m.params?.configId, m.params?.value]);
+  assert.deepEqual(sets, [["model", "opus"], ["mode", "acceptEdits"]]);
+});
+
 test("AcpExecutor re-applies the profile mode after session/load", async () => {
   const { root, script } = await modelAgent("dagmar-acp-mode-load-", [MODE_OPTION]);
   const { settled, sent } = await runModelAgent(root, script, { mode: "plan", loadSessionId: "sid-X" });
@@ -920,6 +934,51 @@ test("AcpExecutor fails with acp_mode_not_applied when the agent does not switch
   const { root, script } = await modelAgent("dagmar-acp-mode-ignored-", [MODE_OPTION], false);
   const { settled, sent } = await runModelAgent(root, script, { mode: "plan" });
   assert.equal("error" in settled && settled.error.code, "acp_mode_not_applied");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+// Profile effort selection reuses the model fake agent with a "thought_level" config option.
+const EFFORT_OPTION = { id: "effort", name: "Effort", category: "thought_level", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "low", name: "Low" }, { value: "medium", name: "Medium" }, { value: "high", name: "High" }] };
+
+test("AcpExecutor selects the profile effort from the options the model switch answers, before prompting", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-effort-", [MODEL_OPTION], true, [{ ...MODEL_OPTION, currentValue: "opus" }, EFFORT_OPTION]);
+  const { settled, records, sent } = await runModelAgent(root, script, { model: "opus", effort: "high" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const sets = sent.filter((m) => m.method === "session/set_config_option").map((m) => [m.params?.configId, m.params?.value]);
+  assert.deepEqual(sets, [["model", "opus"], ["effort", "high"]]);
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.lastIndexOf("session/set_config_option") < methods.indexOf("session/prompt"));
+  assert.ok(records.some((r) => (r as { event?: string; data?: { thought_level?: string } }).event === "acp_thought_level_selected" && (r as { data?: { thought_level?: string } }).data?.thought_level === "high"));
+});
+
+test("AcpExecutor sets the profile effort even when the agent already shows it", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-effort-current-", [{ ...EFFORT_OPTION, currentValue: "high" }]);
+  const { settled, sent } = await runModelAgent(root, script, { effort: "high", loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const methods = sent.map((m) => m.method);
+  assert.ok(methods.indexOf("session/set_config_option") > methods.indexOf("session/load"));
+  assert.equal(sent.find((m) => m.method === "session/set_config_option")?.params?.value, "high");
+});
+
+test("AcpExecutor fails with acp_thought_level_unknown for an effort the agent does not offer", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-effort-unknown-", [EFFORT_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { effort: "max" });
+  assert.equal("error" in settled && settled.error.code, "acp_thought_level_unknown");
+  assert.match("error" in settled ? settled.error.message : "", /does not offer effort \(thought_level\) max; available: default, low, medium, high/);
+  assert.ok(!sent.some((m) => m.method === "session/set_config_option" || m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_thought_level_unsupported when the agent has no effort option", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-effort-none-", [MODEL_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { effort: "high" });
+  assert.equal("error" in settled && settled.error.code, "acp_thought_level_unsupported");
+  assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+test("AcpExecutor fails with acp_thought_level_not_applied when the agent does not switch", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-effort-ignored-", [EFFORT_OPTION], false);
+  const { settled, sent } = await runModelAgent(root, script, { effort: "high" });
+  assert.equal("error" in settled && settled.error.code, "acp_thought_level_not_applied");
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
