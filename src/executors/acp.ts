@@ -265,15 +265,17 @@ class Attempt {
   // agents may fuzzy-match or silently keep a default for an unknown value, so dagmar fails fast
   // instead. Each set answers the full option list, which later selections read: the effort levels
   // depend on the model. Effort is set even when already current, because an agent may show an
-  // effort it does not apply (claude-agent-acp leaves an unpinned effort to its CLI).
+  // effort it does not apply (claude-agent-acp leaves an unpinned effort to its CLI). Messages name
+  // the profile field as well as the category, which differ for effort.
   private async selectOption(category: "model" | "mode" | "thought_level", value: string): Promise<TaskError | undefined> {
+    const label = category === "thought_level" ? "effort (thought_level)" : category;
     const option = this.configOptions.find((o) => o.category === category);
     if (!option || option.type !== "select") {
-      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${category} ${value}` };
+      return { code: `acp_${category}_unsupported`, message: `ACP agent does not advertise a ${category} selector; cannot select ${label} ${value}` };
     }
     const values = option.options.flatMap((o) => ("group" in o ? o.options : [o])).map((o) => o.value);
     if (!values.includes(value)) {
-      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${category} ${value}; available: ${values.join(", ")}` };
+      return { code: `acp_${category}_unknown`, message: `ACP agent does not offer ${label} ${value}; available: ${values.join(", ")}` };
     }
     if (option.currentValue !== value || category === "thought_level") {
       const set = await this.agent!.request(methods.agent.session.setConfigOption, {
@@ -284,7 +286,7 @@ class Attempt {
       this.configOptions = set.configOptions;
       const current = set.configOptions.find((o) => o.id === option.id)?.currentValue;
       if (current !== value) {
-        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${category} ${value} (current: ${String(current)})` };
+        return { code: `acp_${category}_not_applied`, message: `ACP agent did not apply ${label} ${value} (current: ${String(current)})` };
       }
     }
     await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: `acp_${category}_selected`, data: { [category]: value } });
