@@ -20,6 +20,11 @@ executors:
     # checks (acp_mode_unknown lists the offered values). For claude-agent-acp this is the
     # permission mode; 0.84.0 offers default, acceptEdits, plan, auto and bypassPermissions.
     # mode: acceptEdits
+    # Optional: the effort, applied via the agent's ACP config option with category thought_level,
+    # after the model, with the same exact-value checks (acp_thought_level_unknown lists the
+    # offered values). claude-agent-acp 0.93 offers the selected model's levels, such as low,
+    # medium and high. Without it, the agent picks its own.
+    # effort: high
     # To route one executor to another Anthropic-compatible provider, set it in this executor's
     # environment (the agent passes it on to Claude Code), not in a settings file in the working
     # directory, which would apply to every executor using that directory. Keep the key out of the
