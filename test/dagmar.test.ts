@@ -897,6 +897,15 @@ test("AcpExecutor selects the profile mode after the model, before prompting", a
   assert.ok(records.some((r) => (r as { event?: string; data?: { mode?: string } }).event === "acp_mode_selected" && (r as { data?: { mode?: string } }).data?.mode === "acceptEdits"));
 });
 
+test("AcpExecutor checks the profile mode against the options the model switch answers", async () => {
+  // The model switch resets the mode, so the mode session/new showed is no longer current.
+  const { root, script } = await modelAgent("dagmar-acp-mode-switched-", [MODEL_OPTION, { ...MODE_OPTION, currentValue: "acceptEdits" }], true, [{ ...MODEL_OPTION, currentValue: "opus" }, MODE_OPTION]);
+  const { settled, sent } = await runModelAgent(root, script, { model: "opus", mode: "acceptEdits" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  const sets = sent.filter((m) => m.method === "session/set_config_option").map((m) => [m.params?.configId, m.params?.value]);
+  assert.deepEqual(sets, [["model", "opus"], ["mode", "acceptEdits"]]);
+});
+
 test("AcpExecutor re-applies the profile mode after session/load", async () => {
   const { root, script } = await modelAgent("dagmar-acp-mode-load-", [MODE_OPTION]);
   const { settled, sent } = await runModelAgent(root, script, { mode: "plan", loadSessionId: "sid-X" });
@@ -955,7 +964,7 @@ test("AcpExecutor fails with acp_thought_level_unknown for an effort the agent d
   const { root, script } = await modelAgent("dagmar-acp-effort-unknown-", [EFFORT_OPTION]);
   const { settled, sent } = await runModelAgent(root, script, { effort: "max" });
   assert.equal("error" in settled && settled.error.code, "acp_thought_level_unknown");
-  assert.match("error" in settled ? settled.error.message : "", /available: default, low, medium, high/);
+  assert.match("error" in settled ? settled.error.message : "", /does not offer effort \(thought_level\) max; available: default, low, medium, high/);
   assert.ok(!sent.some((m) => m.method === "session/set_config_option" || m.method === "session/prompt"));
 });
 
