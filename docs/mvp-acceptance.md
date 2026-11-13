@@ -210,6 +210,7 @@ its `rerun.max` (3); the run reaches the gate.
 | `acp_model_unsupported` / `acp_model_not_applied` | agent has no model selector / didn't switch |
 | `acp_mode_unknown` / `acp_mode_unsupported` / `acp_mode_not_applied` | the same checks for the executor's `mode` |
 | `acp_thought_level_unknown` / `acp_thought_level_unsupported` / `acp_thought_level_not_applied` | the same checks for the executor's `effort` |
+| `acp_tools_unsupported` | the executor sets `tools`, but its agent is not `claude-agent-acp` |
 | `acp_load_unsupported` | agent can't `session/load`, so it can't continue a session |
 | `acp_authentication_required` | authenticate `claude-agent-acp` out-of-band |
 | `continuation_unavailable` | the source task has no persisted session id |
