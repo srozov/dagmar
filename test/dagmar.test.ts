@@ -3134,3 +3134,88 @@ async function freePort(): Promise<number> {
   const address = server.address(); if (!address || typeof address === "string") throw new Error("No port");
   await new Promise<void>((resolve) => server.close(() => resolve())); return address.port;
 }
+
+// A process that runs until killed; it records its pid so a test can check that it is gone.
+function sleeper(root: string): { script: string; pidFile: (name: string) => string } {
+  const script = join(root, "sleeper.mjs"), pids = join(root, "pid-");
+  return { script, pidFile: (name) => pids + name };
+}
+const sleeperSource = (pids: string) => `import{writeFileSync,existsSync}from'node:fs';const c=[];for await(const x of process.stdin)c.push(x);const{doc}=JSON.parse(c.join('')||'{}');const id=doc?.id??'task';writeFileSync(${JSON.stringify(pids)}+id,String(process.pid));if(id!=='fast'&&!existsSync(${JSON.stringify(pids)}+'fixed'))setTimeout(()=>{},60000);else console.log(JSON.stringify({outcome:'completed',message:id,output:{id}}));`;
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test("a process task that runs past its time limit is killed and fails with task_timeout", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-process-")), { script, pidFile } = sleeper(root);
+  await writeFile(script, sleeperSource(join(root, "pid-")));
+  const app = await fixture(root, { id: "limit", tasks: { slow: { executor: "local", inputs: {}, run: [process.execPath, script], timeoutSeconds: 1 } } });
+  const started = await app.scheduler.start("limit", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  const attempt = view.tasks.slow!.attempts[0]!;
+  assert.equal(attempt.status, "failed");
+  assert.equal(attempt.error!.code, "task_timeout");
+  assert.match(attempt.error!.message, /1 s/);
+  assert.ok(Date.parse(attempt.endedAt!) - Date.parse(attempt.startedAt) < 10_000);
+  assert.equal(view.tasks.slow!.attempts.length, 1, "no automatic retry");
+  assert.equal(alive(Number(await readFile(pidFile("task"), "utf8"))), false);
+  const events = (await app.transcripts.read(started.workflowRunId, attempt.id)).records.filter((r) => r.type === "lifecycle").map((r) => (r as { event: string }).event);
+  assert.ok(events.includes("task_timeout"));
+  app.store.close();
+});
+
+test("an ACP task whose agent keeps working ends failed with task_timeout and its agent process is gone", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-acp-")), script = join(root, "agent.mjs"), pid = join(root, "pid");
+  await writeFile(script, `
+import{createInterface}from'node:readline';import{writeFileSync}from'node:fs';
+writeFileSync(${JSON.stringify(pid)},String(process.pid));
+const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{}}});
+if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'busy-1'}});
+if(m.method==='session/prompt')setInterval(()=>send({jsonrpc:'2.0',method:'session/update',params:{sessionId:'busy-1',update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'still working '}}}}),50);
+});
+`);
+  const app = await fixture(root, { id: "limit", executors: { busy: { type: "acp", cwd: root, env: {}, run: [process.execPath, script] } }, tasks: { work: { executor: "busy", inputs: {}, prompt: "work", timeoutSeconds: 1 } } }, new AcpExecutor());
+  const started = await app.scheduler.start("limit", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  const attempt = view.tasks.work!.attempts[0]!;
+  assert.equal(attempt.status, "failed");
+  assert.equal(attempt.error!.code, "task_timeout");
+  assert.equal(alive(Number(await readFile(pid, "utf8"))), false);
+  app.store.close();
+});
+
+test("the time limit counts a wait for a permission answer", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-wait-"));
+  const app = await fixture(root, { id: "limit", tasks: { ask: { executor: "agent", inputs: {}, prompt: "ask", timeoutSeconds: 1 } } }, new InteractiveExecutor());
+  const started = await app.scheduler.start("limit", {});
+  await waitFor(app.scheduler, started.workflowRunId, "waiting");
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  assert.equal(view.tasks.ask!.attempts[0]!.error!.code, "task_timeout");
+  assert.equal(app.scheduler.interactions().length, 0);
+  app.store.close();
+});
+
+test("on a map task every item has its own limit, and a resume after a timeout runs only the timed-out item again", { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-map-")), { script, pidFile } = sleeper(root);
+  await writeFile(script, sleeperSource(join(root, "pid-")));
+  const app = await fixture(root, { id: "limit", tasks: { review: { executor: "local", map: { over: "$run.input.docs", key: "id", concurrency: 3 }, inputs: { doc: "$item" }, run: [process.execPath, script], timeoutSeconds: 1 } } });
+  const run = await app.scheduler.start("limit", { docs: [{ id: "fast" }, { id: "slow" }, { id: "slow2" }] });
+  const blocked = await waitFor(app.scheduler, run.workflowRunId, "blocked");
+  const items = blocked.tasks.review!.attempts.filter((a) => a.item !== null).map((a) => [a.item, a.status, a.error?.code ?? null]);
+  assert.deepEqual(items, [["fast", "completed", null], ["slow", "failed", "task_timeout"], ["slow2", "failed", "task_timeout"]]);
+  assert.equal(alive(Number(await readFile(pidFile("slow"), "utf8"))), false);
+  await writeFile(pidFile("fixed"), "");
+  await app.scheduler.resume(run.workflowRunId);
+  const done = await waitFor(app.scheduler, run.workflowRunId, "completed");
+  const again = done.tasks.review!.attempts.filter((a) => a.item !== null).map((a) => [a.item, a.status]);
+  assert.deepEqual(again, [["fast", "completed"], ["slow", "failed"], ["slow2", "failed"], ["slow", "completed"], ["slow2", "completed"]]);
+  app.store.close();
+});
+
+test("a task without timeoutSeconds is not limited; the field must be a positive integer and a gate cannot have it", () => {
+  const executors = { local: { type: "process", cwd: "/", env: {} } } as Record<string, ExecutorProfile>;
+  const task = { executor: "local", inputs: {}, run: ["x"] };
+  assert.equal(validate({ id: "w", tasks: { t: task } }, executors).tasks.t!.timeoutSeconds, undefined);
+  assert.equal(validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: 60 } } }, executors).tasks.t!.timeoutSeconds, 60);
+  for (const bad of [0, -1, 1.5, "60"]) assert.throws(() => validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: bad } } }, executors), (e) => e instanceof DagmarError && e.code === "workflow_invalid");
+  assert.throws(() => validate({ id: "w", tasks: { g: { gate: { prompt: "ok?" }, inputs: {}, timeoutSeconds: 60 } } }, executors), (e) => e instanceof DagmarError && e.code === "invalid_task");
+});
