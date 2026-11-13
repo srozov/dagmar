@@ -269,7 +269,7 @@ export class Scheduler {
       try { await this.append(item.row, { type: "lifecycle", direction: "internal", event: "attempt_started" }); launchable.push(item); }
       catch (error) { await this.settle(item.row.id, { error: taskError("transcript_write_failed", error) }); }
     }
-    for (const item of launchable) this.launch(item.row, item.request!);
+    for (const item of launchable) this.launch(item.row, item.request!, workflow.tasks[item.row.taskId]!.timeoutSeconds);
     for (const item of prepared) {
       if (item.row.executorType !== "gate" || item.row.status !== "awaiting_input") continue;
       try {
@@ -371,18 +371,29 @@ export class Scheduler {
   }
 
   // `retries`: how many retries of this task's attempt came before this one; a retry waits `delayMs` before it starts.
-  private launch(row: AttemptRow, request: ProcessRequest | AcpRequest, retries = 0, delayMs = 0): void {
+  // `timeoutSeconds`: the task's limit on this attempt, counted from the executor's start; once it passes the attempt is cancelled and settles `task_timeout`.
+  private launch(row: AttemptRow, request: ProcessRequest | AcpRequest, timeoutSeconds: number | undefined, retries = 0, delayMs = 0): void {
     let ready!: (handle: Execution) => void, failed!: (error: unknown) => void;
     const readyPromise = new Promise<Execution>((resolve, reject) => { ready = resolve; failed = reject; }); readyPromise.catch(() => undefined);
     const live: Live = { runId: row.workflowRunId, ready: readyPromise, finished: Promise.resolve(), wait: new AbortController() }; this.live.set(row.id, live);
+    let timer: NodeJS.Timeout | undefined, timedOut = false;
+    const timeout: Settlement = { error: { code: "task_timeout", message: `Task ran longer than its ${timeoutSeconds} s time limit` } };
     live.finished = (async () => {
       try {
         // Cancelling the attempt aborts the wait, and the settle below finds it no longer active.
         if (delayMs) await delay(delayMs, undefined, { signal: live.wait.signal });
         const hooks: Hooks = { transcript: (record) => this.append(row, record), session: (session) => this.serial(row.workflowRunId, async () => { if (this.store.attempt(row.id) && active.has(this.store.attempt(row.id)!.status)) this.store.updateAttempt(row.id, { acpSessionId: session, updatedAt: timestamp() }); }), interact: (item) => this.requestInteraction(row, item) };
         live.handle = request.type === "process" ? await this.executors.process.start(request, hooks) : await this.executors.acp.start(request, hooks); ready(live.handle);
-        await live.handle.done.then((value) => this.serial(row.workflowRunId, () => this.settle(row.id, value, request, retries)));
-      } catch (error) { failed(error); await this.serial(row.workflowRunId, () => this.settle(row.id, { error: taskError("executor_failed", error) })); }
+        if (timeoutSeconds !== undefined) {
+          const handle = live.handle;
+          timer = setTimeout(() => {
+            timedOut = true; this.dropInteraction(row.id);
+            this.background(this.append(row, { type: "lifecycle", direction: "internal", event: "task_timeout", data: { timeoutSeconds } }).then(() => undefined, () => undefined).then(() => handle.cancel()));
+          }, timeoutSeconds * 1000);
+        }
+        await live.handle.done.then((value) => this.serial(row.workflowRunId, () => this.settle(row.id, timedOut ? timeout : value, request, retries)));
+      } catch (error) { failed(error); await this.serial(row.workflowRunId, () => this.settle(row.id, timedOut ? timeout : { error: taskError("executor_failed", error) })); }
+      finally { clearTimeout(timer); }
     })();
     this.background(live.finished);
   }
@@ -410,7 +421,7 @@ export class Scheduler {
       try {
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_started" });
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry.max, delaySeconds: retry.delaySeconds } });
-        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry.delaySeconds * 1000);
+        this.launch(next, { ...request!, taskRunId: next.id }, task?.timeoutSeconds, retries + 1, retry.delaySeconds * 1000);
       } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
     }
     if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);

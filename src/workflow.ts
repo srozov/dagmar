@@ -78,8 +78,8 @@ export function validateWorkflow(value: unknown): Workflow {
   for (const [id, item] of Object.entries(raw.tasks)) {
     if (item.gate) {
       if (item.executor) throw new DagmarError("invalid_task", `Task ${id} cannot have both executor and gate`);
-      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.rerun !== undefined || item.map !== undefined)
-        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, rerun, or map`);
+      if (item.prompt !== undefined || item.run !== undefined || item.session !== undefined || item.interactive !== undefined || item.outputSchema !== undefined || item.rerun !== undefined || item.map !== undefined || item.timeoutSeconds !== undefined)
+        throw new DagmarError("invalid_task", `Gate task ${id} must not have prompt, run, session, interactive, outputSchema, rerun, map, or timeoutSeconds`);
       if (typeof item.gate.prompt !== "string" || !item.gate.prompt.trim())
         throw new DagmarError("invalid_task", `Gate task ${id} requires a non-empty prompt`);
       if (item.gate.schema !== undefined) validateOutputSchema(item.gate.schema);
