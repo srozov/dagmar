@@ -78,9 +78,13 @@ dagmar answer <interaction-id> --json '"Add a test"'
 
 The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
 
+## Time limits
+
+A task may set `timeoutSeconds`, a positive integer: the most seconds one attempt may run, counted from the executor's start to its end and including waits for a permission or input answer, so set it on unattended tasks, not interactive ones. On a map task each item's attempt has its own limit. When it passes, an ACP attempt is cancelled as by `dagmar cancel-task` (`session/cancel`, then its agent process is ended) and a process attempt gets SIGTERM, then SIGKILL after 2 seconds. The attempt ends `failed` with error code `task_timeout`, its message naming the limit, and a `task_timeout` transcript event. A timed-out attempt is not retried; the run goes on as after any failed attempt, and `resume` runs the task (or the item) again. Without the field a task has no limit.
+
 ## Gates
 
-A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision. It cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema`, `rerun` or `map`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
+A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision. It cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema`, `rerun`, `map` or `timeoutSeconds`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
 
 ## Guards
 
