@@ -122,6 +122,12 @@ class Attempt {
         throw new Error("ACP protocol version is unsupported");
       }
       this.supportsClose = initialized.agentCapabilities?.sessionCapabilities?.close != null;
+      // The tool set rides on claude-agent-acp's own `_meta` extension, which another agent would
+      // ignore and so offer every tool: fail before the session instead.
+      if (this.request.tools !== undefined && initialized.agentInfo?.name !== CLAUDE_AGENT_ACP) {
+        return { error: { code: "acp_tools_unsupported", message: `ACP agent ${initialized.agentInfo?.name ?? "(unnamed)"} does not take a tool set; tools requires ${CLAUDE_AGENT_ACP}` } };
+      }
+      const meta = this.request.tools !== undefined ? { _meta: toolsMeta(this.request.tools) } : {};
       if (this.request.loadSessionId) {
         // The capability is top-level (not under sessionCapabilities), contrast with close.
         const supportsLoad = initialized.agentCapabilities?.loadSession === true;
@@ -140,6 +146,7 @@ class Attempt {
           sessionId: this.request.loadSessionId,
           cwd: this.request.cwd,
           mcpServers: [],
+          ...meta,
         });
         this.sessionId = this.request.loadSessionId;
         this.configOptions = loaded.configOptions ?? [];
@@ -147,11 +154,15 @@ class Attempt {
         const session = await this.agent.request(methods.agent.session.new, {
           cwd: this.request.cwd,
           mcpServers: [],
+          ...meta,
         });
         this.sessionId = session.sessionId;
         this.configOptions = session.configOptions ?? [];
       }
       await this.hooks.session(this.sessionId);
+      if (this.request.tools !== undefined) {
+        await this.hooks.transcript({ type: "lifecycle", direction: "internal", event: "acp_tools_selected", data: { tools: this.request.tools } });
+      }
       // An agent may answer session/load before its own MCP servers have connected
       // (claude-agent-acp connects project `.mcp.json` servers in the background), and a
       // first prompt sent in that window can tell the model those tools are gone. ACP has no
@@ -496,6 +507,22 @@ function errorValue(code: string, error: unknown): { error: TaskError } {
       message: error instanceof Error ? error.message : "ACP execution failed",
     },
   };
+}
+const CLAUDE_AGENT_ACP = "@agentclientprotocol/claude-agent-acp";
+// A profile's tool set as claude-agent-acp's session options. Claude Code's `tools` narrows only
+// its built-in tools, so MCP tools are narrowed by server: the policy-tier allowedMcpServers keeps
+// only the servers the list names (all of whose tools stay offered), which also drops the tools a
+// plugin registers. With no `mcp__<server>__<tool>` entry, strictMcpConfig drops the settings'
+// servers as well, even where an administrator's policy tier overrides allowedMcpServers.
+// allowedTools pre-approves every listed tool.
+function toolsMeta(tools: string[]): JsonObject {
+  const servers = [...new Set(tools.flatMap((tool) => /^mcp__(.+?)__/.exec(tool)?.[1] ?? []))];
+  return { claudeCode: { options: {
+    tools: tools.filter((tool) => !tool.startsWith("mcp__")),
+    allowedTools: tools,
+    managedSettings: { allowedMcpServers: servers.map((serverName) => ({ serverName })) },
+    ...(servers.length === 0 ? { strictMcpConfig: true } : {}),
+  } } };
 }
 // The session updates that are the agent's work: a tool call or output. Others (commands, modes, usage) are not.
 const WORK = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update", "plan"]);
