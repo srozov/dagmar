@@ -745,14 +745,14 @@ if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1
 // session/load; `apply: false` makes it acknowledge set_config_option without switching, and
 // `switched` replaces the options once the model is set (an agent's levels depend on its model).
 const MODEL_OPTION = { id: "model", name: "Model", category: "model", type: "select", currentValue: "default", options: [{ value: "default", name: "Default" }, { value: "sonnet", name: "Sonnet" }, { value: "opus", name: "Opus" }] };
-async function modelAgent(prefix: string, configOptions: unknown, apply = true, switched?: unknown): Promise<{ root: string; script: string }> {
+async function modelAgent(prefix: string, configOptions: unknown, apply = true, switched?: unknown, agentName?: string): Promise<{ root: string; script: string }> {
   const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "agent.mjs");
   await writeFile(script, `
 import{createInterface}from'node:readline';
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
 let options=${JSON.stringify(configOptions)};const switched=${JSON.stringify(switched ?? null)};
 createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
-if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true}}});
+if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1,agentCapabilities:{loadSession:true},...${agentName ? `{agentInfo:{name:${JSON.stringify(agentName)},version:'0.93.0'}}` : "{}"}}});
 if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,result:{sessionId:'m-1',...(options?{configOptions:options}:{})}});
 if(m.method==='session/load')send({jsonrpc:'2.0',id:m.id,result:options?{configOptions:options}:{}});
 if(m.method==='session/set_config_option'&&m.params.configId==='model'&&switched)options=switched;
@@ -822,11 +822,11 @@ test("AcpExecutor fails with acp_model_not_applied when the agent does not switc
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
-test("scheduler forwards the executor profile's model, mode and effort on the ACP request", async () => {
+test("scheduler forwards the executor profile's model, mode, effort and tools on the ACP request", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-model-fwd-"));
   const workflowDir = join(root, "workflows");
   await mkdir(workflowDir, { recursive: true });
-  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", executors: { reviewer: { type: "acp", cwd: root, run: ["unused"], model: "opus", mode: "plan", effort: "high" } }, tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
+  await writeFile(join(workflowDir, "fwd.yaml"), stringify({ id: "fwd", executors: { reviewer: { type: "acp", cwd: root, run: ["unused"], model: "opus", mode: "plan", effort: "high", tools: ["Read", "Grep"] } }, tasks: { A: { executor: "reviewer", inputs: {}, prompt: "a" } } }));
   const captured = { request: undefined as AcpRequest | undefined };
   const stub = new StubAcpExecutor(async (request) => { captured.request = request; return { result: { outcome: "completed", message: "a", output: {} } }; });
   const store = new Store(":memory:");
@@ -836,6 +836,7 @@ test("scheduler forwards the executor profile's model, mode and effort on the AC
   assert.equal(captured.request?.model, "opus");
   assert.equal(captured.request?.mode, "plan");
   assert.equal(captured.request?.effort, "high");
+  assert.deepEqual(captured.request?.tools, ["Read", "Grep"]);
   store.close();
 });
 
@@ -860,6 +861,15 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent: { ...agent, model: "" }, proc });
   invalid({ agent: { ...agent, mode: "" }, proc });
   invalid({ agent: { ...agent, effort: "" }, proc });
+  assert.deepEqual(validateWorkflow({ id: "x", executors: { agent: { ...agent, tools: ["Read", "mcp__docs__search", "mcp__web_search__fetch_page"] }, proc }, tasks }).executors.agent?.tools, ["Read", "mcp__docs__search", "mcp__web_search__fetch_page"]);
+  assert.deepEqual(validateWorkflow({ id: "x", executors: { agent: { ...agent, tools: [] }, proc }, tasks }).executors.agent?.tools, []);
+  invalid({ agent, proc: { ...proc, tools: ["Read"] } }); // tools is ACP-only
+  invalid({ agent: { ...agent, tools: ["Read", "Read"] }, proc });
+  invalid({ agent: { ...agent, tools: [""] }, proc });
+  invalid({ agent: { ...agent, tools: ["Bash(git *)"] }, proc }); // a tool, not a permission rule
+  invalid({ agent: { ...agent, tools: ["mcp__docs"] }, proc }); // an MCP entry names one tool
+  invalid({ agent: { ...agent, tools: ["mcp__docs__"] }, proc });
+  invalid({ agent: { ...agent, tools: "Read" }, proc });
   assert.equal(validateWorkflow({ id: "x", executors: { agent: { ...agent, loadSettleMs: 120000 }, proc }, tasks }).executors.agent?.loadSettleMs, 120000);
   invalid({ agent, proc: { ...proc, loadSettleMs: 1000 } }); // loadSettleMs is ACP-only
   invalid({ agent: { ...agent, loadSettleMs: 0 }, proc });
@@ -935,6 +945,55 @@ test("AcpExecutor fails with acp_mode_not_applied when the agent does not switch
   const { settled, sent } = await runModelAgent(root, script, { mode: "plan" });
   assert.equal("error" in settled && settled.error.code, "acp_mode_not_applied");
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
+});
+
+// Profile tool sets ride on claude-agent-acp's `_meta.claudeCode.options`; the model fake agent
+// reports that name in agentInfo when asked to.
+const CLAUDE_AGENT_ACP = "@agentclientprotocol/claude-agent-acp";
+const sessionOptions = (sent: Array<{ method?: string; params?: Record<string, unknown> }>, method: string) => (sent.find((m) => m.method === method)?.params?._meta as { claudeCode?: { options?: unknown } } | undefined)?.claudeCode?.options;
+
+test("AcpExecutor offers only the listed built-in tools, pre-approved, and no MCP server on session/new", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-tools-", null, true, undefined, CLAUDE_AGENT_ACP);
+  const { settled, records, sent } = await runModelAgent(root, script, { tools: ["Read", "Grep"] });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.deepEqual(sessionOptions(sent, "session/new"), { tools: ["Read", "Grep"], allowedTools: ["Read", "Grep"], managedSettings: { allowedMcpServers: [] }, strictMcpConfig: true });
+  const selected = records.findIndex((r) => (r as { event?: string }).event === "acp_tools_selected");
+  assert.deepEqual((records[selected] as { data?: unknown }).data, { tools: ["Read", "Grep"] });
+  assert.ok(selected < records.findIndex((r) => (r as { message?: { method?: string } }).message?.method === "session/prompt"));
+});
+
+test("AcpExecutor keeps only the MCP servers the tool list names, on session/load", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-tools-load-", null, true, undefined, CLAUDE_AGENT_ACP);
+  const tools = ["Read", "mcp__docs__search", "mcp__docs__fetch", "mcp__web_search__query"];
+  const { settled, sent } = await runModelAgent(root, script, { tools, loadSessionId: "sid-X" });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.deepEqual(sessionOptions(sent, "session/load"), { tools: ["Read"], allowedTools: tools, managedSettings: { allowedMcpServers: [{ serverName: "docs" }, { serverName: "web_search" }] } });
+});
+
+test("AcpExecutor offers no tool for an empty tool list", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-tools-none-", null, true, undefined, CLAUDE_AGENT_ACP);
+  const { settled, sent } = await runModelAgent(root, script, { tools: [] });
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.deepEqual(sessionOptions(sent, "session/new"), { tools: [], allowedTools: [], managedSettings: { allowedMcpServers: [] }, strictMcpConfig: true });
+});
+
+test("AcpExecutor fails with acp_tools_unsupported before the session when the agent is not claude-agent-acp", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-tools-other-", null, true, undefined, "other-agent");
+  const { settled, sent } = await runModelAgent(root, script, { tools: ["Read"] });
+  assert.equal("error" in settled && settled.error.code, "acp_tools_unsupported");
+  assert.match("error" in settled ? settled.error.message : "", /other-agent does not take a tool set/);
+  assert.ok(!sent.some((m) => m.method === "session/new" || m.method === "session/prompt"));
+  const unnamed = await modelAgent("dagmar-acp-tools-unnamed-", null);
+  const result = await runModelAgent(unnamed.root, unnamed.script, { tools: ["Read"] });
+  assert.equal("error" in result.settled && result.settled.error.code, "acp_tools_unsupported");
+});
+
+test("AcpExecutor sends no session options without a tool list", async () => {
+  const { root, script } = await modelAgent("dagmar-acp-tools-unset-", null);
+  const { settled, records, sent } = await runModelAgent(root, script, {});
+  assert.equal("result" in settled && settled.result.outcome, "completed");
+  assert.equal(sent.find((m) => m.method === "session/new")?.params?._meta, undefined);
+  assert.ok(!records.some((r) => (r as { event?: string }).event === "acp_tools_selected"));
 });
 
 // Profile effort selection reuses the model fake agent with a "thought_level" config option.

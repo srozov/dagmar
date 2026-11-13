@@ -25,6 +25,10 @@ executors:
     # offered values). claude-agent-acp 0.93 offers the selected model's levels, such as low,
     # medium and high. Without it, the agent picks its own.
     # effort: high
+    # Optional: the tools the agent is offered, each pre-approved: built-in names and
+    # mcp__<server>__<tool>. Nothing else built in is offered, and only the named MCP servers are
+    # kept (with all their tools). Needs claude-agent-acp (acp_tools_unsupported otherwise).
+    # tools: [Read, Grep, Glob]
     # To route one executor to another Anthropic-compatible provider, set it in this executor's
     # environment (the agent passes it on to Claude Code), not in a settings file in the working
     # directory, which would apply to every executor using that directory. Keep the key out of the
