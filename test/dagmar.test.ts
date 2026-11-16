@@ -238,6 +238,9 @@ test("a run's view lists tasks its workflow has since renamed or removed, and a 
   assert.deepEqual(renamed.tasks.a!.attempts[0]!.result, { outcome: "completed", message: "done", output: { n: 1 } });
   assert.equal(renamed.tasks.c!.attempts.length, 1);
   assert.deepEqual(Object.keys(renamed.tasks).sort(), ["a", "b", "c"]);
+  // The run is not decided again, so `c` keeps the state of its attempt; the new name has none.
+  assert.equal(renamed.tasks.c!.state, "completed");
+  assert.equal(renamed.tasks.b!.state, "ready");
 
   // Task `a` removed.
   await edit({ c: task });

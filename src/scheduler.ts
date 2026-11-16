@@ -469,7 +469,10 @@ export class Scheduler {
     const run = this.requiredRun(id);
     const attempts = this.store.attempts(id);
     const latest = latestAttempts(attempts);
-    const states = taskStates(workflow, latest, run.status, dueOf(workflow, attempts));
+    // Tasks the file no longer has (renamed or removed since the run). definition() refuses such a run, so it is not
+    // decided again: no task is due, and each task with an attempt shows the state of its latest one.
+    const gone = [...latest.keys()].filter((taskId) => !Object.hasOwn(workflow.tasks, taskId));
+    const states = taskStates(workflow, latest, run.status, gone.length ? new Set<string>() : dueOf(workflow, attempts));
     const shown = (taskId: string) => attempts.filter((x) => x.taskId === taskId).map(({ workflowRunId: _, taskId: _t, executorProfile: _p, executorType: _e, ...a }) => a);
     const tasks = Object.fromEntries(Object.entries(workflow.tasks).map(([taskId, task]) => [taskId, {
       dependsOn: task.dependsOn,
@@ -477,8 +480,8 @@ export class Scheduler {
       state: states.get(taskId)!,
       attempts: shown(taskId),
     }]));
-    // A task the file no longer has (renamed or removed since the run) shows from its stored attempts; its dependencies are unknown.
-    for (const [taskId, row] of latest) if (!Object.hasOwn(workflow.tasks, taskId)) tasks[taskId] = { dependsOn: [], executor: row.executorProfile, state: row.status, attempts: shown(taskId) };
+    // A task the file no longer has shows from its stored attempts; its dependencies are unknown.
+    for (const taskId of gone) { const row = latest.get(taskId)!; tasks[taskId] = { dependsOn: [], executor: row.executorProfile, state: row.status, attempts: shown(taskId) }; }
     return { ...run, sequence: this.events.current, tasks };
   }
   private append(row: AttemptRow, record: Parameters<Hooks["transcript"]>[0]): Promise<number> { return this.transcripts.append(row.workflowRunId, row.id, record).then((line) => { this.events.publish({ type: "transcript.appended", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { line } }); return line; }); }
