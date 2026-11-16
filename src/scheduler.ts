@@ -460,7 +460,7 @@ export class Scheduler {
   // run with an attempt of a task the file no longer has, and names those tasks.
   private async definition(id: string): Promise<Workflow> {
     const run = this.requiredRun(id), workflow = await this.workflows.get(run.workflowId);
-    const gone = [...new Set(this.store.attempts(id).map((x) => x.taskId))].filter((taskId) => !workflow.tasks[taskId]);
+    const gone = [...new Set(this.store.attempts(id).map((x) => x.taskId))].filter((taskId) => !Object.hasOwn(workflow.tasks, taskId));
     if (gone.length) throw new DagmarError("workflow_definition_unavailable", `Workflow ${run.workflowId} no longer has tasks of run ${id}: ${gone.join(", ")}`);
     return workflow;
   }
@@ -478,7 +478,7 @@ export class Scheduler {
       attempts: shown(taskId),
     }]));
     // A task the file no longer has (renamed or removed since the run) shows from its stored attempts; its dependencies are unknown.
-    for (const [taskId, row] of latest) if (!workflow.tasks[taskId]) tasks[taskId] = { dependsOn: [], executor: row.executorProfile, state: row.status, attempts: shown(taskId) };
+    for (const [taskId, row] of latest) if (!Object.hasOwn(workflow.tasks, taskId)) tasks[taskId] = { dependsOn: [], executor: row.executorProfile, state: row.status, attempts: shown(taskId) };
     return { ...run, sequence: this.events.current, tasks };
   }
   private append(row: AttemptRow, record: Parameters<Hooks["transcript"]>[0]): Promise<number> { return this.transcripts.append(row.workflowRunId, row.id, record).then((line) => { this.events.publish({ type: "transcript.appended", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { line } }); return line; }); }
