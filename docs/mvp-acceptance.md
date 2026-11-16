@@ -214,6 +214,7 @@ its `rerun.max` (3); the run reaches the gate.
 | `acp_load_unsupported` | agent can't `session/load`, so it can't continue a session |
 | `acp_authentication_required` | authenticate `claude-agent-acp` out-of-band |
 | `continuation_unavailable` | the source task has no persisted session id |
+| `task_timeout` | the attempt ran past its task's `timeoutSeconds`; `resume` runs it again |
 | `executor_lost` | the daemon died while the attempt ran; `resume` the blocked run |
 | `rerun_exhausted` | verify still fails after the third fixup; fixup is not run again and the run is blocked |
 | `invalid_task` … `continue must target the same agent` | builder/reviewer `run` differ |
