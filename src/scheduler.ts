@@ -55,7 +55,8 @@ export class Scheduler {
     return { workflowRunId: id, status: "running" };
   }
   list(): Omit<RunRow, "input">[] { return this.store.runs().map(({ input: _, ...run }) => run); }
-  get(id: string): Promise<RunView> { return this.serial(id, async () => this.view(id, await this.definition(id))); }
+  // A read never depends on the workflow's tasks: view() lists the stored tasks the file no longer has.
+  get(id: string): Promise<RunView> { return this.serial(id, async () => this.view(id, await this.workflows.get(this.requiredRun(id).workflowId))); }
   // A blocked or cancelled run resumes where it stopped: its blocked, failed and cancelled tasks run
   // again and its unstarted tasks start. `from` also runs that task again, whatever its state, so a
   // completed run can redo a task, and the tasks downstream of it follow as after a rerun.
@@ -455,19 +456,32 @@ export class Scheduler {
   }
 
   private async blockDefinition(id: string, error: unknown): Promise<void> { await this.failActiveLocked(id, "workflow_definition_unavailable", error instanceof Error ? error.message : "Workflow definition unavailable", false); }
-  private async definition(id: string): Promise<Workflow> { const run = this.requiredRun(id), workflow = await this.workflows.get(run.workflowId), known = new Set(Object.keys(workflow.tasks)); if (this.store.attempts(id).some((x) => !known.has(x.taskId))) throw new DagmarError("workflow_definition_unavailable", "Workflow task set changed"); return workflow; }
+  // The workflow as the file has it now, for a step that would run or settle tasks against it: it refuses a
+  // run with an attempt of a task the file no longer has, and names those tasks.
+  private async definition(id: string): Promise<Workflow> {
+    const run = this.requiredRun(id), workflow = await this.workflows.get(run.workflowId);
+    const gone = [...new Set(this.store.attempts(id).map((x) => x.taskId))].filter((taskId) => !Object.hasOwn(workflow.tasks, taskId));
+    if (gone.length) throw new DagmarError("workflow_definition_unavailable", `Workflow ${run.workflowId} no longer has tasks of run ${id}: ${gone.join(", ")}`);
+    return workflow;
+  }
   private requiredRun(id: string): RunRow { const run = this.store.run(id); if (!run) throw new DagmarError("run_not_found", `Run ${id} was not found`); return run; }
   private async view(id: string, workflow: Workflow): Promise<RunView> {
     const run = this.requiredRun(id);
     const attempts = this.store.attempts(id);
     const latest = latestAttempts(attempts);
-    const states = taskStates(workflow, latest, run.status, dueOf(workflow, attempts));
+    // Tasks the file no longer has (renamed or removed since the run). definition() refuses such a run, so it is not
+    // decided again: no task is due, and each task with an attempt shows the state of its latest one.
+    const gone = [...latest.keys()].filter((taskId) => !Object.hasOwn(workflow.tasks, taskId));
+    const states = taskStates(workflow, latest, run.status, gone.length ? new Set<string>() : dueOf(workflow, attempts));
+    const shown = (taskId: string) => attempts.filter((x) => x.taskId === taskId).map(({ workflowRunId: _, taskId: _t, executorProfile: _p, executorType: _e, ...a }) => a);
     const tasks = Object.fromEntries(Object.entries(workflow.tasks).map(([taskId, task]) => [taskId, {
       dependsOn: task.dependsOn,
       executor: task.executor ?? "gate",
       state: states.get(taskId)!,
-      attempts: attempts.filter((x) => x.taskId === taskId).map(({ workflowRunId: _, taskId: _t, executorProfile: _p, executorType: _e, ...a }) => a),
+      attempts: shown(taskId),
     }]));
+    // A task the file no longer has shows from its stored attempts; its dependencies are unknown.
+    for (const taskId of gone) { const row = latest.get(taskId)!; tasks[taskId] = { dependsOn: [], executor: row.executorProfile, state: row.status, attempts: shown(taskId) }; }
     return { ...run, sequence: this.events.current, tasks };
   }
   private append(row: AttemptRow, record: Parameters<Hooks["transcript"]>[0]): Promise<number> { return this.transcripts.append(row.workflowRunId, row.id, record).then((line) => { this.events.publish({ type: "transcript.appended", workflowRunId: row.workflowRunId, taskRunId: row.id, data: { line } }); return line; }); }

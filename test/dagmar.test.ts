@@ -216,6 +216,74 @@ test("daemon exposes the process runtime through JSON-RPC", async () => {
   } finally { client.close(); await daemon.stop(); }
 });
 
+test("a run's view lists tasks its workflow has since renamed or removed, and a step against them names them", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-renamed-")), script = join(root, "done.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'done',output:{n:1}}));`);
+  const task = { executor: "local", inputs: {}, run: [process.execPath, script] };
+  const app = await fixture(root, { id: "renamed", tasks: { a: task, c: { ...task, dependsOn: ["a"] } } });
+  const file = join(root, "workflows", "renamed.yaml"), edit = (tasks: object) => writeFile(file, stringify({ id: "renamed", executors: defaultExecutors(root), tasks }));
+  const { workflowRunId } = await app.scheduler.start("renamed", {});
+  const before = await waitFor(app.scheduler, workflowRunId, "completed");
+  // The workflow as it was: nothing differs from before the fix.
+  assert.deepEqual(Object.keys(before.tasks), ["a", "c"]);
+  assert.equal(before.tasks.a!.state, "completed");
+
+  // Task `a` renamed to `b`.
+  await edit({ b: task, c: { ...task, dependsOn: ["b"] } });
+  const renamed = await app.scheduler.get(workflowRunId);
+  assert.equal(renamed.status, "completed");
+  assert.equal(renamed.tasks.a!.state, "completed");
+  assert.equal(renamed.tasks.a!.executor, "local");
+  assert.equal(renamed.tasks.a!.attempts.length, 1);
+  assert.deepEqual(renamed.tasks.a!.attempts[0]!.result, { outcome: "completed", message: "done", output: { n: 1 } });
+  assert.equal(renamed.tasks.c!.attempts.length, 1);
+  assert.deepEqual(Object.keys(renamed.tasks).sort(), ["a", "b", "c"]);
+  // The run is not decided again, so `c` keeps the state of its attempt; the new name has none.
+  assert.equal(renamed.tasks.c!.state, "completed");
+  assert.equal(renamed.tasks.b!.state, "ready");
+
+  // Task `a` removed.
+  await edit({ c: task });
+  const removed = await app.scheduler.get(workflowRunId);
+  assert.equal(removed.status, "completed");
+  assert.deepEqual(removed.tasks.a!.attempts, before.tasks.a!.attempts);
+
+  // A step that would run tasks against the changed workflow still refuses, and names the tasks.
+  await assert.rejects(app.scheduler.resume(workflowRunId, "c"), (error) => error instanceof DagmarError && error.code === "workflow_definition_unavailable" && /renamed/.test(error.message) && /: a$/.test(error.message));
+  app.store.close();
+});
+
+test("a removed task named like an Object member still shows, and a step against its workflow refuses", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-member-")), script = join(root, "done.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};console.log(JSON.stringify({outcome:'completed',message:'done',output:{}}));`);
+  const task = { executor: "local", inputs: {}, run: [process.execPath, script] };
+  const app = await fixture(root, { id: "member", tasks: { toString: task, c: task } });
+  const { workflowRunId } = await app.scheduler.start("member", {});
+  await waitFor(app.scheduler, workflowRunId, "completed");
+  await writeFile(join(root, "workflows", "member.yaml"), stringify({ id: "member", executors: defaultExecutors(root), tasks: { c: task } }));
+  const view = await app.scheduler.get(workflowRunId);
+  assert.deepEqual(Object.keys(view.tasks).sort(), ["c", "toString"]);
+  assert.equal(new Map(Object.entries(view.tasks)).get("toString")!.attempts.length, 1);
+  await assert.rejects(app.scheduler.resume(workflowRunId, "c"), (error) => error instanceof DagmarError && error.code === "workflow_definition_unavailable" && /: toString$/.test(error.message));
+  app.store.close();
+});
+
+test("an active run whose workflow lost a task blocks at its next step with the task named, and status still reads it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-renamed-active-")), wait = join(root, "wait.mjs"), release = join(root, "release");
+  await writeFile(wait, `import{existsSync}from'node:fs';for await(const _ of process.stdin){};while(!existsSync(${JSON.stringify(release)}))await new Promise(r=>setTimeout(r,10));console.log(JSON.stringify({outcome:'completed',message:'done',output:{}}));`);
+  const task = { executor: "local", inputs: {}, run: [process.execPath, wait] };
+  const app = await fixture(root, { id: "renamed-active", tasks: { a: task, z: { ...task, dependsOn: ["a"] } } });
+  const { workflowRunId } = await app.scheduler.start("renamed-active", {});
+  await waitForTask(app.scheduler, workflowRunId, "a", "running");
+  await writeFile(join(root, "workflows", "renamed-active.yaml"), stringify({ id: "renamed-active", executors: defaultExecutors(root), tasks: { b: task, z: { ...task, dependsOn: ["b"] } } }));
+  await writeFile(release, "");
+  const view = await waitFor(app.scheduler, workflowRunId, "blocked");
+  assert.equal(view.tasks.a!.state, "failed");
+  assert.equal(view.tasks.a!.attempts[0]!.error!.code, "workflow_definition_unavailable");
+  assert.match(view.tasks.a!.attempts[0]!.error!.message, /no longer has tasks of run .*: a$/);
+  app.store.close();
+});
+
 test("startup recovery blocks persisted active attempts", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-recovery-"));
   const app = await fixture(root, { id: "recovery", tasks: { task: { executor: "local", inputs: {}, run: [process.execPath, "missing"] } } });
