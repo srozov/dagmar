@@ -50,6 +50,7 @@ class Attempt {
   private cancelPromise?: Promise<void>;
   private cleanupPromise?: Promise<void>;
   private stderrDone: Promise<void> = Promise.resolve();
+  private readonly spawned: Promise<void>;
   private readonly closed: Promise<void>;
   private readonly done: Promise<Settlement>;
 
@@ -58,6 +59,10 @@ class Attempt {
     private readonly request: AcpRequest,
     private readonly hooks: Hooks,
   ) {
+    this.spawned = new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
     this.closed = new Promise((resolve) => child.once("close", resolve));
     this.done = this.run().catch((error) =>
       this.cancelled ? errorValue("acp_cancelled", error) : this.failure(error),
@@ -78,6 +83,13 @@ class Attempt {
 
   private async run(): Promise<Settlement> {
     try {
+      // A command that cannot be started (not found, not executable) says so with an 'error' event,
+      // not by throwing from spawn(); unheard, that event would take the daemon down.
+      try {
+        await this.spawned;
+      } catch (error) {
+        return errorValue("acp_spawn_failed", error);
+      }
       await this.hooks.transcript({
         type: "lifecycle",
         direction: "internal",

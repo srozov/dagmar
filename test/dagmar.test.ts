@@ -200,6 +200,14 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.ok(records.some((x) => (x as { type?: string }).type === "acp"));
 });
 
+test("an ACP agent command that does not exist fails the attempt with acp_spawn_failed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-missing-"));
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [join(root, "no-such-agent")], prompt: "Do it" }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  const settled = await execution.done;
+  assert.equal("error" in settled && settled.error.code, "acp_spawn_failed");
+  assert.match("error" in settled ? settled.error.message : "", /ENOENT/);
+});
+
 test("daemon exposes the process runtime through JSON-RPC", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-daemon-")), workflows = join(root, "workflows"), state = join(root, "state"), script = join(root, "done.mjs");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflows, { recursive: true }));
