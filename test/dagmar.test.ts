@@ -193,7 +193,7 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 });
 `);
   const records: unknown[] = []; let session = "";
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_x", taskRunId: "tr_x", taskId: "x", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.equal(session, "fresh-1");
   assert.equal("result" in settled && settled.result.outcome, "completed");
@@ -339,7 +339,7 @@ async function runProcess(prefix: string, source: string): Promise<{ settled: Se
   const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "task.mjs");
   await writeFile(script, source);
   let stderr = "";
-  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   return { settled: await execution.done, stderr };
 }
 
@@ -347,7 +347,7 @@ test("a process whose output fails outputSchema names each violation by path", a
   const root = await mkdtemp(join(tmpdir(), "dagmar-process-schema-")), script = join(root, "task.mjs");
   await writeFile(script, `for await(const _ of process.stdin){};process.stdout.write(${JSON.stringify(JSON.stringify({ outcome: "completed", message: "ok", output: { items: [{ evidence: [] }], note: 1 } }))});`);
   const outputSchema = { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { evidence: { type: "array", minItems: 1 } } } }, note: { type: "string" } } };
-  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], outputSchema }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], outputSchema }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   assert.deepEqual(await execution.done, { error: { code: "output_validation_failed", message: "Task output does not match outputSchema: output/items/0/evidence must NOT have fewer than 1 items; output/note must be string" } });
 });
 
@@ -465,7 +465,7 @@ if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,error:{code:-32000,messa
 });
 `);
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_a", taskRunId: "tr_a", taskId: "a", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    { type: "acp", taskId: "a", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
     { transcript: async () => 1, session: async () => {}, interact: async () => { throw new Error("unexpected"); } },
   );
   const settled = await execution.done;
@@ -721,7 +721,7 @@ if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',para
 });
 `);
   const records: unknown[] = []; let session = "";
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_y", taskRunId: "tr_y", taskId: "y", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "y", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.equal(session, "sid-X");
   assert.equal("result" in settled && settled.result.outcome, "completed");
@@ -779,7 +779,7 @@ test("AcpExecutor cancel interrupts the loadSettleMs wait without prompting", as
   const records: unknown[] = [];
   let settling!: () => void;
   const waiting = new Promise<void>((resolve) => { settling = resolve; });
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_c", taskRunId: "tr_c", taskId: "c", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", loadSessionId: "sid-X", loadSettleMs: 60_000 }, { transcript: async (record) => { records.push(record); if ((record as { event?: string }).event === "acp_load_settle") settling(); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "c", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", loadSessionId: "sid-X", loadSettleMs: 60_000 }, { transcript: async (record) => { records.push(record); if ((record as { event?: string }).event === "acp_load_settle") settling(); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   await waiting;
   const started = Date.now();
   await execution.cancel();
@@ -802,7 +802,7 @@ if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1
 });
 `);
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_z", taskRunId: "tr_z", taskId: "z", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => { throw new Error("hooks.session must not be called when the agent lacks loadSession"); }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "z", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => { throw new Error("hooks.session must not be called when the agent lacks loadSession"); }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.ok("error" in settled, "expected a failed settlement, not a crash");
   assert.equal("error" in settled && settled.error.code, "acp_load_unsupported");
@@ -832,7 +832,7 @@ if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',para
 }
 async function runModelAgent(root: string, script: string, extra: Partial<AcpRequest>): Promise<{ settled: Settlement; records: unknown[]; sent: Array<{ method?: string; params?: Record<string, unknown> }> }> {
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_m", taskRunId: "tr_m", taskId: "m", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...extra }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "m", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...extra }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   const sent = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: Record<string, unknown> } }).message);
   return { settled, records, sent };
@@ -1183,7 +1183,7 @@ if(m.method==='session/prompt'){for(const [id,text] of chunks)send({jsonrpc:'2.0
 }
 async function runMessagesAgent(root: string, script: string, interactive: boolean): Promise<{ settled: Settlement; turns: number }> {
   let turns = 0;
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_msg", taskRunId: "tr_msg", taskId: "msg", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(interactive ? { interactive: true } : {}) }, { transcript: async () => 1, session: async () => undefined, interact: async () => { turns++; throw new Error("unexpected turn"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "msg", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(interactive ? { interactive: true } : {}) }, { transcript: async () => 1, session: async () => undefined, interact: async () => { turns++; throw new Error("unexpected turn"); } });
   return { settled: await execution.done, turns };
 }
 const ENVELOPE_PARTS = ['{"outcome":"completed",', '"message":"ok","output":{"n":1}}'];
@@ -1226,7 +1226,7 @@ if(m.method==='session/prompt'){const text=replies[Math.min(n++,replies.length-1
 }
 async function runRepairAgent(root: string, script: string, outputSchema?: AcpRequest["outputSchema"]): Promise<{ settled: Settlement; prompts: string[]; events: string[] }> {
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_r", taskRunId: "tr_r", taskId: "r", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(outputSchema === undefined ? {} : { outputSchema }) }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "r", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(outputSchema === undefined ? {} : { outputSchema }) }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   const prompts = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: { prompt?: Array<{ text: string }> } } }).message).filter((m) => m.method === "session/prompt").map((m) => m.params!.prompt![0]!.text);
   const events = records.filter((r) => (r as { type?: string }).type === "lifecycle").map((r) => (r as { event: string }).event);
@@ -1408,7 +1408,7 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 `);
   const records: unknown[] = []; let interactCalls = 0; let capturedMessage = "";
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_i", taskRunId: "tr_i", taskId: "i", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Converse", interactive: true },
+    { type: "acp", taskId: "i", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Converse", interactive: true },
     {
       transcript: async (record) => { records.push(record); return records.length; },
       session: async () => {},
@@ -1477,7 +1477,7 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 `);
   let interactCalls = 0;
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_n", taskRunId: "tr_n", taskId: "n", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    { type: "acp", taskId: "n", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
     {
       transcript: async () => 1,
       session: async () => {},
