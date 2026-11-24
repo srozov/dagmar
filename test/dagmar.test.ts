@@ -959,6 +959,11 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent, proc: { type: "gate", cwd: "/tmp" } });
   invalid({ agent, proc, "-bad": proc });
   assert.throws(() => validateWorkflow({ id: "x", executors: { agent }, tasks }), (error) => error instanceof DagmarError && error.code === "unknown_executor");
+  // A name every object inherits is not an executor, a dependency or a rerun target.
+  const inherited = (task: object, code: string) => assert.throws(() => validateWorkflow({ id: "x", executors: { proc }, tasks: { p: { executor: "proc", inputs: {}, run: ["node"], ...task } } }), (error) => error instanceof DagmarError && error.code === code);
+  inherited({ executor: "constructor" }, "unknown_executor");
+  inherited({ dependsOn: ["toString"] }, "invalid_dependency");
+  inherited({ rerun: { from: "valueOf", max: 1 } }, "invalid_rerun");
 });
 
 // Profile mode selection reuses the model fake agent with a "mode" config option.
