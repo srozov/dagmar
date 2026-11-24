@@ -33,7 +33,6 @@ export class Scheduler {
     private readonly workflows: WorkflowRepository,
     private readonly events: Events,
     private readonly executors: Executors,
-    private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
   // `cwd` is the run's working directory, for every executor without a cwd of its own. A workflow with
@@ -322,7 +321,7 @@ export class Scheduler {
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
       const inputs = resolveInputs(task, run, this.depOutputs(task, latest), item?.value);
       // The daemon's environment, then the executor's envFile, then its literal env on top.
-      const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
+      const env = { ...process.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
       const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
