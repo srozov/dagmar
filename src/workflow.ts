@@ -87,7 +87,8 @@ export function validateWorkflow(value: unknown): Workflow {
       continue;
     }
     if (!item.executor) throw new DagmarError("invalid_task", `Task ${id} requires executor or gate`);
-    const profile = profiles[item.executor];
+    // Own keys only: a name such as `constructor` is not an executor (or, below, a task).
+    const profile = Object.hasOwn(profiles, item.executor) ? profiles[item.executor] : undefined;
     if (!profile) throw new DagmarError("unknown_executor", `Task ${id} references unknown executor ${item.executor}`);
     let session: TaskDef["session"] | undefined;
     if (item.session) {
@@ -106,7 +107,7 @@ export function validateWorkflow(value: unknown): Workflow {
   }
   for (const [id, task] of Object.entries(tasks)) {
     for (const dep of task.dependsOn) {
-      if (dep === id || !tasks[dep]) throw new DagmarError("invalid_dependency", `Task ${id} has invalid dependency ${dep}`);
+      if (dep === id || !Object.hasOwn(tasks, dep)) throw new DagmarError("invalid_dependency", `Task ${id} has invalid dependency ${dep}`);
     }
     for (const [name, value] of Object.entries(task.inputs)) {
       if (typeof value !== "string") {
@@ -134,7 +135,7 @@ export function validateWorkflow(value: unknown): Workflow {
     }
     if (task.rerun !== undefined) {
       const from = task.rerun.from;
-      if (!tasks[from]) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} is not a task`);
+      if (!Object.hasOwn(tasks, from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} is not a task`);
       if (!upstream(tasks, id).has(from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} must be upstream of it`);
       if (!Number.isInteger(task.rerun.max) || task.rerun.max < 1) throw new DagmarError("invalid_rerun", `Task ${id} rerun.max must be an integer >= 1`);
     }
