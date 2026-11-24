@@ -50,7 +50,7 @@ export class Scheduler {
     const id = `wr_${randomUUID()}`, now = timestamp();
     this.store.insertRun({ id, workflowId, cwd, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
     this.emitRun(id, "running");
-    this.background(this.serial(id, () => this.advance(id, false, false)));
+    this.background(this.serial(id, () => this.advance(id)));
     return { workflowRunId: id, status: "running" };
   }
   list(): Omit<RunRow, "input">[] { return this.store.runs().map(({ input: _, ...run }) => run); }
@@ -69,7 +69,7 @@ export class Scheduler {
         const attempts = this.store.attempts(id);
         if (!depsSettled(task, latestAttempts(attempts), dueOf(workflow, attempts))) throw new DagmarError("invalid_run_state", `Task ${from} cannot run: not all its dependencies are completed or skipped`);
       }
-      await this.advance(id, true, true, from);
+      await this.advance(id, true, from);
       return this.view(id, await this.definition(id));
     });
   }
@@ -99,7 +99,7 @@ export class Scheduler {
       const status = aggregate(workflow, replace(this.store.attempts(first.workflowRunId), changed));
       this.store.transaction(() => { this.store.updateAttempt(taskRunId, { status: "cancelled", updatedAt: now, endedAt: now }); this.store.updateRun(first.workflowRunId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : {}) }); });
       this.emitTask(attempt, "cancelled"); this.emitRun(first.workflowRunId, status); this.dropInteraction(taskRunId); cancelId = taskRunId;
-      if (status === "running") await this.advance(first.workflowRunId, false, false);
+      if (status === "running") await this.advance(first.workflowRunId);
     });
     if (cancelId) await this.cancelLive(cancelId); return this.get(first.workflowRunId);
   }
@@ -126,7 +126,7 @@ export class Scheduler {
         this.emitTask(a, "completed");
         this.events.publish({ type: "interaction.changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { interactionId: id, state: "answered" } });
         this.emitRun(a.workflowRunId, runStatus);
-        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId, false, false);
+        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId);
         return this.view(a.workflowRunId, workflow);
       }
       // Non-gate: resume the executor by flipping the attempt back to running and resolving its Promise.
@@ -194,7 +194,8 @@ export class Scheduler {
     })();
   }
 
-  private async advance(id: string, retry: boolean, resuming: boolean, from: string | null = null): Promise<void> {
+  // `resuming`: a resume, which also decides the run's blocked, failed and cancelled tasks again.
+  private async advance(id: string, resuming = false, from: string | null = null): Promise<void> {
     const run = this.requiredRun(id);
     if (this.stopping || (!resuming && run.status !== "running" && run.status !== "waiting")) return;
     let workflow: Workflow;
@@ -221,7 +222,7 @@ export class Scheduler {
       const due = dueTasks(workflow, latest, pos, reruns, existing);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        const retried = current !== undefined && retry && blocking.has(current.status) && pos.get(current.id)! < existing.length;
+        const retried = current !== undefined && resuming && blocking.has(current.status) && pos.get(current.id)! < existing.length;
         let candidate = !current || retried || (taskId === from && pos.get(current.id)! < existing.length);
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
@@ -413,7 +414,7 @@ export class Scheduler {
         this.launch(next, request!, retries + 1, retry.delaySeconds * 1000);
       } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
     }
-    if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);
+    if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId);
   }
 
   private requestInteraction(row: AttemptRow, request: InteractionRequest): Promise<Json> {
