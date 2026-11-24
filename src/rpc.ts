@@ -16,7 +16,7 @@ export class EventBus {
     return this.sequence;
   }
 
-  publish(input: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent {
+  publish(input: Omit<DagmarEvent, "sequence" | "timestamp">): void {
     const event = { ...input, sequence: ++this.sequence, timestamp: new Date().toISOString() };
     this.events.push(event);
     if (this.events.length > 1000) this.events.shift();
@@ -26,7 +26,6 @@ export class EventBus {
         else notify(sub.socket, event);
       }
     }
-    return event;
   }
 
   subscribe(socket: WebSocket, params: JsonObject): { subscriptionId: string; currentSequence: number; activate(): void } {

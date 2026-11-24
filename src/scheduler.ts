@@ -12,7 +12,7 @@ import { DagmarError } from "./types.js";
 import { WorkflowRepository, mapItems, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
 
-type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
+type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): void };
 type Executors = { process: Executor<ProcessRequest>; acp: Executor<AcpRequest> };
 type Live = { runId: string; handle?: Execution; ready: Promise<Execution>; finished: Promise<void>; wait: AbortController };
 type Pending = { view: Interaction; request: InteractionRequest; resolve(value: Json): void; reject(error: Error): void };
