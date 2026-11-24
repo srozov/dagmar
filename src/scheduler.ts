@@ -322,7 +322,7 @@ export class Scheduler {
       const inputs = resolveInputs(task, run, this.depOutputs(task, latest), item?.value);
       // The daemon's environment, then the executor's envFile, then its literal env on top.
       const env = { ...process.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      const common = { taskId, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -410,7 +410,7 @@ export class Scheduler {
       try {
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_started" });
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry.max, delaySeconds: retry.delaySeconds } });
-        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry.delaySeconds * 1000);
+        this.launch(next, request!, retries + 1, retry.delaySeconds * 1000);
       } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
     }
     if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);

@@ -7,10 +7,7 @@ let sessionId;
 const records = [];
 const execution = await new AcpExecutor().start({
   type: "acp",
-  runId: "wr_smoke",
-  taskRunId: "tr_smoke",
   taskId: "smoke",
-  profile: "smoke",
   cwd,
   env: process.env,
   inputs: { request: "Identify your ACP server in one short field." },

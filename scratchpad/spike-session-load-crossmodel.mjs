@@ -56,10 +56,7 @@ const recordModel = (side) => async (record) => {
 let sessionA = "";
 const execA = await new AcpExecutor().start({
   type: "acp",
-  runId: "wr_smoke_A",
-  taskRunId: "tr_smoke_A",
   taskId: "builder",
-  profile: "smoke",
   cwd,
   env: process.env,
   inputs: {},
@@ -84,10 +81,7 @@ if (!("result" in settledA) || !sessionA) {
 let sessionB = "";
 const execB = await new AcpExecutor().start({
   type: "acp",
-  runId: "wr_smoke_B",
-  taskRunId: "tr_smoke_B",
   taskId: "reviewer",
-  profile: "smoke",
   cwd,
   env: process.env,
   inputs: {},
