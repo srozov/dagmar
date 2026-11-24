@@ -44,15 +44,13 @@ export class WorkflowRepository {
     catch { return { valid: new Map(), errors: [{ file: this.dir, code: "workflow_directory_unreadable", message: "Workflow directory cannot be read" }] }; }
     const rows: Array<{ file: string; id?: string; workflow?: Workflow; error?: WorkflowErrorView }> = [];
     for (const file of names) {
+      let id: string | undefined;
       try {
-        const text = await readFile(join(this.dir, file), "utf8");
-        const raw = yaml(text);
-        const id = idOf(raw);
+        const raw = yaml(await readFile(join(this.dir, file), "utf8"));
+        id = idOf(raw);
         rows.push({ file, ...(id ? { id } : {}), workflow: validateWorkflow(raw) });
       } catch (error) {
         const e = error instanceof DagmarError ? error : new DagmarError("workflow_invalid", "Workflow is invalid");
-        let id: string | undefined;
-        try { id = idOf(yaml(await readFile(join(this.dir, file), "utf8"))); } catch {}
         rows.push({ file, ...(id ? { id } : {}), error: { file, code: e.code, message: e.message } });
       }
     }
