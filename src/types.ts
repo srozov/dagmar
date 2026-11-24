@@ -8,7 +8,7 @@ export type TaskState = "pending" | "ready" | AttemptStatus | "blocked_by_depend
 export interface WhenClause { ref: string; equals?: Json; in?: Json[] }
 
 export interface TaskResult { outcome: "completed" | "blocked"; message: string; output: Json }
-export interface TaskError { code: string; message: string; data?: Json }
+export interface TaskError { code: string; message: string }
 export interface ExecutorProfile { type: ExecutorType; cwd?: string; env: Record<string, string>; envFile?: string; run?: [string, ...string[]]; model?: string; mode?: string; effort?: string; tools?: string[]; loadSettleMs?: number; retry?: { max: number; delaySeconds: number } }
 export interface Config { workflowDir: string; storageDir: string; listen: { host: "127.0.0.1" | "::1"; port: number } }
 export interface TaskDef { executor?: string; dependsOn: string[]; inputs: JsonObject; prompt?: string; run?: [string, ...string[]]; outputSchema?: JsonSchema; interactive?: boolean; session?: { mode: "fresh" } | { mode: "continue"; from: string }; gate?: { prompt: string; schema?: JsonSchema }; when?: WhenClause[]; rerun?: { from: string; max: number; atMax?: "block" | "proceed"; when?: WhenClause[] }; map?: { over: string; key: string; concurrency: number } }
@@ -27,5 +27,5 @@ export type EventType = "workflow.status_changed" | "task.status_changed" | "int
 export interface DagmarEvent { sequence: number; timestamp: string; type: EventType; workflowRunId: string; taskRunId?: string; data: JsonObject }
 
 export class DagmarError extends Error {
-  constructor(readonly code: string, message: string, readonly data?: Json) { super(message); this.name = "DagmarError"; }
+  constructor(readonly code: string, message: string) { super(message); this.name = "DagmarError"; }
 }
