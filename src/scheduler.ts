@@ -7,7 +7,7 @@ import { parseEnv } from "node:util";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, WhenClause, Workflow } from "./types.js";
+import type { AttemptRow, DagmarEvent, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, WhenClause, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, mapItems, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";

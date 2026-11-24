@@ -5,7 +5,7 @@ import { parseDocument } from "yaml";
 import type { Config } from "./types.js";
 import { DagmarError } from "./types.js";
 
-export const DEFAULT_CONFIG = join(homedir(), ".config/dagmar/config.yaml");
+const DEFAULT_CONFIG = join(homedir(), ".config/dagmar/config.yaml");
 
 export async function loadConfig(path = DEFAULT_CONFIG): Promise<Config> {
   let text: string;

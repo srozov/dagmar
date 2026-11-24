@@ -8,7 +8,7 @@ import { EventBus, RpcServer } from "./rpc.js";
 import { Scheduler } from "./scheduler.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { Config, Json, JsonObject } from "./types.js";
+import type { Json, JsonObject } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository } from "./workflow.js";
 
