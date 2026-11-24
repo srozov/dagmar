@@ -389,6 +389,16 @@ test("a failed process without stderr keeps the plain error message", async () =
   assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process exited with code 3" } });
 });
 
+test("a schema with an $id validates each time its workflow is read again, and after an edit", () => {
+  const outputSchema = () => ({ $id: "https://example.com/output", type: "object", required: ["ok"] });
+  const workflow = () => ({ id: "x", executors: { proc: { type: "process" } }, tasks: { p: { executor: "proc", inputs: {}, run: ["node"], outputSchema: outputSchema() }, g: { inputs: {}, gate: { prompt: "Go?", schema: outputSchema() } } } });
+  validateWorkflow(workflow());
+  validateWorkflow(workflow());
+  for (let i = 0; i < 2; i++) assert.equal(validateResult({ outcome: "completed", message: "ok", output: { ok: true } }, outputSchema()).outcome, "completed");
+  assert.equal(validateResult({ outcome: "completed", message: "ok", output: { ok: true } }, { ...outputSchema(), title: "edited" }).outcome, "completed");
+  assert.throws(() => validateResult({ outcome: "completed", message: "ok", output: {} }, outputSchema()), (error) => error instanceof DagmarError && error.code === "output_validation_failed");
+});
+
 test("a process killed by a signal names the signal before its stderr tail", async () => {
   const { settled } = await runProcess("dagmar-stderr-killed-", `for await(const _ of process.stdin){};process.stderr.write('allocating\\n',()=>process.kill(process.pid,'SIGKILL'));`);
   assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process was killed by SIGKILL: allocating" } });
