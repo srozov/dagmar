@@ -8,7 +8,7 @@ const MAX_CACHED_COUNTS = 256;
 export class Transcripts {
   private readonly tails = new Map<string, Promise<unknown>>();
   private readonly counts = new Map<string, number>();
-  constructor(private readonly storageDir: string, private readonly appended?: (runId: string, taskRunId: string, line: number) => void) {}
+  constructor(private readonly storageDir: string) {}
   path(runId: string, taskRunId: string): string {
     safe(runId);
     safe(taskRunId);
@@ -36,7 +36,6 @@ export class Transcripts {
       this.counts.delete(path);
       this.counts.set(path, count);
       if (this.counts.size > MAX_CACHED_COUNTS) this.counts.delete(this.counts.keys().next().value!);
-      this.appended?.(runId, taskRunId, count);
       return count;
     });
     // A failed write may leave a partial line: forget the count so the next append repairs it.
