@@ -1,4 +1,4 @@
-// T7 manual probe: what does an ACP agent advertise? NOT part of the automated suite.
+// Manual probe: what does an ACP agent advertise? NOT part of the automated suite.
 //
 // Spawns the agent, sends `initialize` then `session/new` (no prompt, so no quota), prints the
 // protocol version (and whether it matches dagmar's SDK), agentCapabilities, and the

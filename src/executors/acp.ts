@@ -260,8 +260,8 @@ class Attempt {
         }
         // Conversational turn: surface to the user as a turn interaction and wait for
         // the next prompt. A rejected interact promise (cancel / dropInteraction) bubbles
-        // out of the loop and is caught by the `this.done` catch above — same path as
-        // elicitation cancellation today.
+        // out of the loop and is caught by the `this.done` catch above, like a cancelled
+        // elicitation.
         await this.hooks.transcript({
           type: "lifecycle",
           direction: "internal",
@@ -325,7 +325,7 @@ class Attempt {
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
       // A tool-using agent sends several messages per turn (progress notes between tool calls,
       // then the answer). ACP tags each with a messageId; keep only the latest message so the
-      // result is parsed from the turn's final message. Chunks without an id accumulate as before.
+      // result is parsed from the turn's final message. Chunks without an id accumulate.
       if (update.messageId && update.messageId !== this.messageId) {
         this.text = "";
         this.messageId = update.messageId;

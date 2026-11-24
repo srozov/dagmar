@@ -343,9 +343,8 @@ export class Scheduler {
     }
   }
 
-  // Skip-safe replacement for the inline output-map builds. Excludes deps whose latest attempt
-  // has no result (e.g. skipped), so a no-guard task referencing a skipped dep output gets
-  // input_resolution_failed instead of a null-deref.
+  // The outputs of a task's dependencies. A dependency whose latest attempt has no result (e.g.
+  // skipped) is left out, so a task that reads its output fails with input_resolution_failed.
   private depOutputs(task: TaskDef, latest: Map<string, AttemptRow>): Record<string, Json> {
     const out: Record<string, Json> = {};
     for (const dep of task.dependsOn) { const r = latest.get(dep)?.result; if (r) out[dep] = r.output; }

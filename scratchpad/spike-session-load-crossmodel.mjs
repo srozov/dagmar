@@ -1,13 +1,13 @@
-// T1 (ticket t1) manual smoke: cross-task + cross-model session/load recall.
+// Manual smoke: cross-task + cross-model session/load recall.
 //
-// This script is the AC5 manual validation. It is NOT part of the automated suite:
+// It is NOT part of the automated suite:
 // it requires an authenticated `claude-agent-acp` and consumes Pro quota.
 //
 // Goal: prove that a `claude-agent-acp` session created under one model
 // (sonnet) can be loaded into a fresh process running a different model
 // (opus) and still recall facts the first turn deposited. This is the
 // "different-model reviewer continues the builder's session" path that
-// the WP1 / T1 ticket relies on for the implement → fixup → review loop.
+// the implement → fixup → review loop relies on.
 //
 // Usage:
 //   1. Ensure claude-agent-acp is installed and authenticated out-of-band
