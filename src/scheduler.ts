@@ -291,7 +291,7 @@ export class Scheduler {
     const exhausted = !skip && task.rerun !== undefined && task.rerun.when === undefined && rerunCount(taskId, task, rows) >= task.rerun.max;
     if (skip || exhausted) {
       const isGate = Boolean(task.gate);
-      const executorType = isGate ? "gate" as const : (workflow.executors[task.executor!]?.type ?? "process");
+      const executorType = isGate ? "gate" as const : workflow.executors[task.executor!]!.type;
       const executorProfile = isGate ? "gate" : task.executor!;
       const block = exhausted && task.rerun!.atMax !== "proceed";
       const error = block ? rerunExhausted(taskId, task) : null;
@@ -307,16 +307,15 @@ export class Scheduler {
       }
     }
     // A map task's attempt runs nothing itself: advance() starts its items. A resumed attempt continues its round.
-    if (task.map) { const id = `tr_${randomUUID()}`; return { row: { id, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: workflow.executors[task.executor!]?.type ?? "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: round ?? id } }; }
+    if (task.map) { const id = `tr_${randomUUID()}`; return { row: { id, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: workflow.executors[task.executor!]!.type, status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: round ?? id } }; }
     return this.executorRow(run, workflow, taskId, task, latest, rows, now);
   }
 
   // An attempt that runs the task's executor: the task's own, or one item of a map task.
   private executorRow(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string, item?: { key: string; value: JsonObject; roundId: string }): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
-    const profile = workflow.executors[task.executor!];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: item?.key ?? null, roundId: item?.roundId ?? null } as const;
+    const profile = workflow.executors[task.executor!]!;
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: profile.type, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: item?.key ?? null, roundId: item?.roundId ?? null } as const;
     try {
-      if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
       const cwd = profile.cwd ?? run.cwd;
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
@@ -336,10 +335,10 @@ export class Scheduler {
       const request = profile.type === "process"
         ? { ...common, type: "process" as const, run: task.run! }
         : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}), ...(task.interactive ? { interactive: true } : {}), ...(profile.model ? { model: profile.model } : {}), ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.effort ? { effort: profile.effort } : {}), ...(profile.tools ? { tools: profile.tools } : {}), ...(loadSessionId && profile.loadSettleMs ? { loadSettleMs: profile.loadSettleMs } : {}) };
-      return { row: { ...base, executorType: profile.type, status: "running", error: null, endedAt: null }, request };
+      return { row: { ...base, status: "running", error: null, endedAt: null }, request };
     } catch (error) {
-      // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, executor_unavailable),
-      // so validation/scheduling failures surface with their semantic code instead of a generic one.
+      // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, cwd_required),
+      // so these failures surface with their semantic code instead of a generic one.
       return { row: { ...base, status: "failed", error: taskError("input_resolution_failed", error), endedAt: now } };
     }
   }
