@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import type { DagmarEvent, Json, JsonObject } from "./types.js";
 import { DagmarError } from "./types.js";
 
-type Handler = (params: JsonObject, signal: AbortSignal) => Json | Promise<Json>;
+type Handler = (params: JsonObject) => Json | Promise<Json>;
 type Subscription = { socket: WebSocket; workflowRunId?: string; paused: boolean; queued: DagmarEvent[] };
 
 export class EventBus {
@@ -67,9 +67,9 @@ export class EventBus {
     };
   }
 
-  unsubscribe(id: string, socket?: WebSocket): boolean {
+  unsubscribe(id: string, socket: WebSocket): boolean {
     const sub = this.subscriptions.get(id);
-    if (!sub || (socket && sub.socket !== socket)) return false;
+    if (!sub || sub.socket !== socket) return false;
     this.subscriptions.delete(id);
     return true;
   }
@@ -115,19 +115,17 @@ export class RpcServer {
 
   private accept(socket: WebSocket): void {
     this.sockets.add(socket);
-    const controller = new AbortController();
     socket.on("message", (data) => {
-      const job = this.message(socket, String(data), controller.signal).finally(() => this.work.delete(job));
+      const job = this.message(socket, String(data)).finally(() => this.work.delete(job));
       this.work.add(job);
     });
     socket.on("error", () => socket.terminate());
     socket.on("close", () => {
-      controller.abort();
       this.events.remove(socket);
       this.sockets.delete(socket);
     });
   }
-  private async message(socket: WebSocket, raw: string, signal: AbortSignal): Promise<void> {
+  private async message(socket: WebSocket, raw: string): Promise<void> {
     let request: Record<string, unknown>;
     try {
       request = JSON.parse(raw);
@@ -174,13 +172,10 @@ export class RpcServer {
         sendError(socket, id, -32601, "Method not found");
         return;
       }
-      send(socket, { jsonrpc: "2.0", id, result: await handler(params as JsonObject, signal) });
+      send(socket, { jsonrpc: "2.0", id, result: await handler(params as JsonObject) });
     } catch (error) {
       if (error instanceof DagmarError) {
-        sendError(socket, id, -32000, error.message, {
-          code: error.code,
-          ...(error.data === undefined ? {} : { data: error.data }),
-        });
+        sendError(socket, id, -32000, error.message, { code: error.code });
       } else {
         sendError(socket, id, -32603, "Internal error");
       }
@@ -220,9 +215,8 @@ export class RpcClient {
       send(this.socket, { jsonrpc: "2.0", id, method, params });
     });
   }
-  onEvent(listener: (event: DagmarEvent) => void): () => void {
+  onEvent(listener: (event: DagmarEvent) => void): void {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
   }
 
   close(): void {
