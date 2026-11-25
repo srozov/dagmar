@@ -202,10 +202,18 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 
 test("an ACP agent command that does not exist fails the attempt with acp_spawn_failed", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-acp-missing-"));
-  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [join(root, "no-such-agent")], prompt: "Do it" }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  const records: unknown[] = [];
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [join(root, "no-such-agent")], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
   const settled = await execution.done;
   assert.equal("error" in settled && settled.error.code, "acp_spawn_failed");
   assert.match("error" in settled ? settled.error.message : "", /ENOENT/);
+  assert.deepEqual(records, [], "a process that never started has no lifecycle records");
+});
+
+test("an ACP executor whose cwd does not exist names the cwd, not the command", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-nocwd-")), cwd = join(root, "gone");
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd, env: process.env, inputs: {}, run: [process.execPath], prompt: "Do it" }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  assert.deepEqual(await execution.done, { error: { code: "acp_spawn_failed", message: `ACP agent cwd ${cwd} does not exist` } });
 });
 
 test("an input path never resolves to an inherited property", () => {
