@@ -3251,16 +3251,15 @@ async function freePort(): Promise<number> {
 }
 
 // A process that runs until killed; it records its pid so a test can check that it is gone.
-function sleeper(root: string): { script: string; pidFile: (name: string) => string } {
+async function sleeper(root: string): Promise<{ script: string; pidFile: (name: string) => string }> {
   const script = join(root, "sleeper.mjs"), pids = join(root, "pid-");
+  await writeFile(script, `import{writeFileSync,existsSync}from'node:fs';const c=[];for await(const x of process.stdin)c.push(x);const{doc}=JSON.parse(c.join('')||'{}');const id=doc?.id??'task';writeFileSync(${JSON.stringify(pids)}+id,String(process.pid));if(id!=='fast'&&!existsSync(${JSON.stringify(pids)}+'fixed'))setTimeout(()=>{},60000);else console.log(JSON.stringify({outcome:'completed',message:id,output:{id}}));`);
   return { script, pidFile: (name) => pids + name };
 }
-const sleeperSource = (pids: string) => `import{writeFileSync,existsSync}from'node:fs';const c=[];for await(const x of process.stdin)c.push(x);const{doc}=JSON.parse(c.join('')||'{}');const id=doc?.id??'task';writeFileSync(${JSON.stringify(pids)}+id,String(process.pid));if(id!=='fast'&&!existsSync(${JSON.stringify(pids)}+'fixed'))setTimeout(()=>{},60000);else console.log(JSON.stringify({outcome:'completed',message:id,output:{id}}));`;
 const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 test("a process task that runs past its time limit is killed and fails with task_timeout", { timeout: 20_000 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-process-")), { script, pidFile } = sleeper(root);
-  await writeFile(script, sleeperSource(join(root, "pid-")));
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-process-")), { script, pidFile } = await sleeper(root);
   const app = await fixture(root, { id: "limit", tasks: { slow: { executor: "local", inputs: {}, run: [process.execPath, script], timeoutSeconds: 1 } } });
   const started = await app.scheduler.start("limit", {});
   const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
@@ -3310,8 +3309,7 @@ test("the time limit counts a wait for a permission answer", { timeout: 20_000 }
 });
 
 test("on a map task every item has its own limit, and a resume after a timeout runs only the timed-out item again", { timeout: 30_000 }, async () => {
-  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-map-")), { script, pidFile } = sleeper(root);
-  await writeFile(script, sleeperSource(join(root, "pid-")));
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-map-")), { script, pidFile } = await sleeper(root);
   const app = await fixture(root, { id: "limit", tasks: { review: { executor: "local", map: { over: "$run.input.docs", key: "id", concurrency: 3 }, inputs: { doc: "$item" }, run: [process.execPath, script], timeoutSeconds: 1 } } });
   const run = await app.scheduler.start("limit", { docs: [{ id: "fast" }, { id: "slow" }, { id: "slow2" }] });
   const blocked = await waitFor(app.scheduler, run.workflowRunId, "blocked");
