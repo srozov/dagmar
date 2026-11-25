@@ -1,6 +1,6 @@
 {
   "name": "dagmar",
-  "version": "0.10.0",
+  "version": "0.9.1",
   "description": "Light agentic workflow orchestration: YAML task graphs run through ACP agents and local processes",
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/srozov/dagmar.git" },
