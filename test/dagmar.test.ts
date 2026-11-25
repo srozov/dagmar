@@ -208,6 +208,10 @@ test("an ACP agent command that does not exist fails the attempt with acp_spawn_
   assert.match("error" in settled ? settled.error.message : "", /ENOENT/);
 });
 
+test("an input path never resolves to an inherited property", () => {
+  assert.throws(() => resolveInputs({ executor: "proc", dependsOn: ["a"], inputs: { x: "$tasks.a.output.constructor" }, run: ["node"] }, { id: "wr_x", input: null }, { a: {} }), (error) => error instanceof DagmarError && error.code === "input_resolution_failed");
+});
+
 test("daemon exposes the process runtime through JSON-RPC", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-daemon-")), workflows = join(root, "workflows"), state = join(root, "state"), script = join(root, "done.mjs");
   await import("node:fs/promises").then((fs) => fs.mkdir(workflows, { recursive: true }));
