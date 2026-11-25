@@ -43,5 +43,6 @@ These are implementation constraints, not slogans. Apply them by default.
 ### Pull requests
 
 - Before proposing a pull request, inspect the branch diff against `main` and ensure its commits are focused, the documentation reflects behavior changes, and no secrets or unrelated files are included.
+- A pull request that changes behavior adds a line under `## [Unreleased]` in `CHANGELOG.md` (see `docs/releasing.md`).
 - A pull-request description must state the problem and approach, the user-visible or behavioral changes, tests/checks run, and known limitations or follow-up work.
 - Do not push a branch or open a pull request unless the user explicitly asks.
