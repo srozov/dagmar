@@ -80,7 +80,7 @@ model values.
 starting (a red baseline makes verify meaningless):
 
 ```bash
-git -C "$DAGMAR" worktree add "$TARGET" -b claude/t6-acceptance-target main
+git -C "$DAGMAR" worktree add "$TARGET" -b acceptance-target main
 (cd "$TARGET" && pnpm install --frozen-lockfile && pnpm test)
 ```
 

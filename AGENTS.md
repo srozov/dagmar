@@ -43,7 +43,7 @@ These are implementation constraints, not slogans. Apply them by default.
 
   ```text
   Worktree: <worktrees dir>/dagmar/<feature>
-  Branch: codex/<feature>
+  Branch: <feature>
   ```
 
 - Before editing, run `git status --short` in the relevant worktree. Preserve any changes that do not belong to the current task.
@@ -53,7 +53,7 @@ These are implementation constraints, not slogans. Apply them by default.
 - Use "Conventional Commits" style for commit messages. Each commit should have a clear, imperative subject line and a body that explains the reasoning behind the change.
 - Work in small, cohesive commits. Each commit should implement one logical change and have an imperative, descriptive subject.
 - Stage only files relevant to the current task. Do not commit credentials, local configuration, generated artifacts, or unrelated changes.
-- Commit completed feature work only to its `codex/<feature>` branch. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.
+- Commit completed feature work only to its feature branch, named for the change in a few words (for example `readme-docs`) with no `claude/`, `codex/` or other prefix; rename a branch the app created before pushing it. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.
 - Before asking to integrate a feature, provide its branch name, commit list, and test results for review.
 
 ### Pull requests
