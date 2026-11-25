@@ -60,7 +60,8 @@ export function gateValidator(schema?: JsonSchema): (response: Json) => Json {
 
 // Ajv never frees what it compiled, and workflows are read again on every step, so each distinct schema is
 // compiled once, found again by its text. Ajv's own record of the schema is dropped: it would refuse a
-// second schema with the same `$id` as a duplicate.
+// second schema with the same `$id` as a duplicate. Nothing is evicted: each edited version of a schema
+// stays compiled until the daemon restarts, which is bounded by how often workflow files change.
 const compiled = new Map<string, ValidateFunction>();
 function compile(schema: JsonSchema): ValidateFunction {
   const text = JSON.stringify(schema);
