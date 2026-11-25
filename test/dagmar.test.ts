@@ -18,7 +18,7 @@ import { EventBus, RpcClient } from "../src/rpc.js";
 import { Scheduler } from "../src/scheduler.js";
 import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
-import type { ExecutorProfile, Json, RunView, TaskResult, Workflow } from "../src/types.js";
+import type { ExecutorProfile, Json, JsonObject, RunView, TaskResult, Workflow } from "../src/types.js";
 import { DagmarError } from "../src/types.js";
 import { WorkflowRepository, resolveInputs, validateWorkflow } from "../src/workflow.js";
 
@@ -1357,7 +1357,7 @@ test("scheduler retries an ACP attempt that failed before any work as a new atte
   assert.deepEqual(attempts.map((x) => [x.attempt, x.status, x.error?.code ?? null]), [[1, "failed", "acp_failed"], [2, "completed", null]]);
   assert.deepEqual(seen.filter((x) => x.data.attempt !== undefined).map((x) => `${x.data.attempt}:${x.data.status}`), ["1:running", "1:failed", "2:running", "2:completed"]);
   const { records } = await app.transcripts.read(run.workflowRunId, attempts[1]!.id);
-  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: attempts[0]!.id, retry: 1, max: 2, delaySeconds: 0 });
+  assert.deepEqual(records.flatMap((x) => x.type === "lifecycle" && x.event === "attempt_retry" ? [x.data] : []), [{ retryOf: attempts[0]!.id, retry: 1, max: 2, delaySeconds: 0 }]);
   app.store.close();
 });
 
@@ -1389,7 +1389,7 @@ test("an ACP executor without retry gets the default retry, and cancelling a tas
   const waiting = (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts;
   assert.deepEqual(waiting.map((x) => x.status), ["failed", "running"]);
   const { records } = await app.transcripts.read(run.workflowRunId, waiting[1]!.id);
-  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: waiting[0]!.id, retry: 1, max: 2, delaySeconds: 300 });
+  assert.deepEqual(records.flatMap((x) => x.type === "lifecycle" && x.event === "attempt_retry" ? [x.data] : []), [{ retryOf: waiting[0]!.id, retry: 1, max: 2, delaySeconds: 300 }]);
   await app.scheduler.cancelTask(waiting[1]!.id);
   const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
   assert.deepEqual(view.tasks.a!.attempts.map((x) => x.status), ["failed", "cancelled"]);
@@ -3006,7 +3006,7 @@ test("every task of a run, and every item of its map task, reads the run's id fr
 test("a map task runs 36 items 3 at a time, keeps the others when one fails, and a resume reruns only that one", { timeout: 20_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-map-"));
   const ids = Array.from({ length: 36 }, (_, i) => `doc${String(i + 1).padStart(2, "0")}`), runs: Record<string, number> = {};
-  let inflight = 0, most = 0, summary: Json = null;
+  let inflight = 0, most = 0, summary = null as Json;
   const stub = new StubAcpExecutor(async (request) => {
     if (request.taskId === "list") return { result: { outcome: "completed", message: "list", output: { docs: ids.map((id) => ({ id })) } } };
     if (request.taskId === "summary") { summary = request.inputs.reviews!; return { result: { outcome: "completed", message: "summary", output: {} } }; }
