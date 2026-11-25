@@ -411,6 +411,12 @@ test("a schema with an $id validates each time its workflow is read again, and a
   assert.throws(() => validateResult({ outcome: "completed", message: "ok", output: {} }, outputSchema()), (error) => error instanceof DagmarError && error.code === "output_validation_failed");
 });
 
+test("a process whose cwd does not exist names the cwd, not the command", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-process-nocwd-")), cwd = join(root, "gone");
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd, env: process.env, inputs: {}, run: [process.execPath, "-e", "0"] }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  assert.deepEqual(await execution.done, { error: { code: "process_failed", message: `Process cwd ${cwd} does not exist` } });
+});
+
 test("a process killed by a signal names the signal before its stderr tail", async () => {
   const { settled } = await runProcess("dagmar-stderr-killed-", `for await(const _ of process.stdin){};process.stderr.write('allocating\\n',()=>process.kill(process.pid,'SIGKILL'));`);
   assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process was killed by SIGKILL: allocating" } });

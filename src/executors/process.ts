@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { validateResult } from "../result.js";
 import { DagmarError, type TaskError } from "../types.js";
@@ -111,6 +112,10 @@ function run(child: ChildProcessWithoutNullStreams, request: ProcessRequest, hoo
         return failure("result_validation_failed", error);
       }
     } catch (error) {
+      // A missing cwd is also ENOENT, and Node's message names only the command.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(request.cwd)) {
+        return { error: { code: "process_failed", message: `Process cwd ${request.cwd} does not exist` } };
+      }
       return failure("process_failed", error);
     }
   })();
