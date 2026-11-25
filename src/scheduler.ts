@@ -593,7 +593,7 @@ function taskError(code: string, error: unknown): TaskError { return { code: err
 function timestamp(): string { return new Date().toISOString(); }
 function walk(value: Json | undefined, path: string[]): Json | undefined {
   let current = value;
-  for (const key of path) { if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) return undefined; current = current[key]; }
+  for (const key of path) { if (!current || typeof current !== "object" || Array.isArray(current) || !Object.hasOwn(current, key)) return undefined; current = current[key]; }
   return current;
 }
 function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {

@@ -176,7 +176,7 @@ export function resolveInputs(task: TaskDef, run: Pick<RunRow, "id" | "input">, 
     let current: Json = ref.item ? item as Json : ref.task ? outputs[ref.task] as Json : ref.runId ? run.id : run.input;
     if (current === undefined) throw new DagmarError("input_resolution_failed", `Missing input ${value}`);
     for (const key of ref.path) {
-      if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
+      if (!current || typeof current !== "object" || Array.isArray(current) || !Object.hasOwn(current, key)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
       current = current[key]!;
     }
     result[name] = current;
