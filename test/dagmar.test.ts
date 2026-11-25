@@ -3326,11 +3326,12 @@ test("on a map task every item has its own limit, and a resume after a timeout r
   app.store.close();
 });
 
-test("a task without timeoutSeconds is not limited; the field must be a positive integer and a gate cannot have it", () => {
+test("a task without timeoutSeconds is not limited; the field must be an integer from 1 to 2147483 and a gate cannot have it", () => {
   const executors = { local: { type: "process", cwd: "/", env: {} } } as Record<string, ExecutorProfile>;
   const task = { executor: "local", inputs: {}, run: ["x"] };
   assert.equal(validate({ id: "w", tasks: { t: task } }, executors).tasks.t!.timeoutSeconds, undefined);
   assert.equal(validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: 60 } } }, executors).tasks.t!.timeoutSeconds, 60);
-  for (const bad of [0, -1, 1.5, "60"]) assert.throws(() => validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: bad } } }, executors), (e) => e instanceof DagmarError && e.code === "workflow_invalid");
+  assert.equal(validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: 2147483 } } }, executors).tasks.t!.timeoutSeconds, 2147483);
+  for (const bad of [0, -1, 1.5, "60", 2147484]) assert.throws(() => validate({ id: "w", tasks: { t: { ...task, timeoutSeconds: bad } } }, executors), (e) => e instanceof DagmarError && e.code === "workflow_invalid");
   assert.throws(() => validate({ id: "w", tasks: { g: { gate: { prompt: "ok?" }, inputs: {}, timeoutSeconds: 60 } } }, executors), (e) => e instanceof DagmarError && e.code === "invalid_task");
 });

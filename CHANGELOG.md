@@ -6,7 +6,7 @@ Notable changes to Dagmar, by version. The format follows [Keep a Changelog](htt
 
 ### Added
 
-- `timeoutSeconds` on a task limits how long one attempt may run; an attempt past it is cancelled and fails with `task_timeout` ([#52](https://github.com/srozov/dagmar/pull/52)).
+- `timeoutSeconds` on a task, at most 2147483 (about 24 days), limits how long one attempt may run; an attempt past it is cancelled and fails with `task_timeout` ([#52](https://github.com/srozov/dagmar/pull/52)).
 
 ## [0.9.1] - 2026-11-25
 

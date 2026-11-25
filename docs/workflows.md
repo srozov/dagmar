@@ -80,7 +80,7 @@ The task ends when the agent replies with a result. Interactive tasks are live-o
 
 ## Time limits
 
-A task may set `timeoutSeconds`, a positive integer: the most seconds one attempt may run, counted from the executor's start to its end and including waits for a permission or input answer, so set it on unattended tasks, not interactive ones. On a map task each item's attempt has its own limit. When it passes, an ACP attempt is cancelled as by `dagmar cancel-task` (`session/cancel`, then its agent process is ended) and a process attempt gets SIGTERM, then SIGKILL after 2 seconds. The attempt ends `failed` with error code `task_timeout`, its message naming the limit, and a `task_timeout` transcript event. A timed-out attempt is not retried; the run goes on as after any failed attempt, and `resume` runs the task (or the item) again. Without the field a task has no limit.
+A task may set `timeoutSeconds`, an integer from 1 to 2147483 (about 24 days): the most seconds one attempt may run, counted from the executor's start to its end and including waits for a permission or input answer, so set it on unattended tasks, not interactive ones. On a map task each item's attempt has its own limit. When it passes, an ACP attempt is cancelled as by `dagmar cancel-task` (`session/cancel`, then its agent process is ended) and a process attempt gets SIGTERM, then SIGKILL after 2 seconds. The attempt ends `failed` with error code `task_timeout`, its message naming the limit, and a `task_timeout` transcript event. A timed-out attempt is not retried; the run goes on as after any failed attempt, and `resume` runs the task (or the item) again. Without the field a task has no limit.
 
 ## Gates
 
