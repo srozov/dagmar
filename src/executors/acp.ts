@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionConfigOption, type SessionNotification } from "@agentclientprotocol/sdk";
@@ -50,6 +51,7 @@ class Attempt {
   private cancelPromise?: Promise<void>;
   private cleanupPromise?: Promise<void>;
   private stderrDone: Promise<void> = Promise.resolve();
+  private readonly spawned: Promise<void>;
   private readonly closed: Promise<void>;
   private readonly done: Promise<Settlement>;
 
@@ -58,6 +60,10 @@ class Attempt {
     private readonly request: AcpRequest,
     private readonly hooks: Hooks,
   ) {
+    this.spawned = new Promise((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
     this.closed = new Promise((resolve) => child.once("close", resolve));
     this.done = this.run().catch((error) =>
       this.cancelled ? errorValue("acp_cancelled", error) : this.failure(error),
@@ -78,6 +84,17 @@ class Attempt {
 
   private async run(): Promise<Settlement> {
     try {
+      // A command that cannot be started (not found, not executable, or its cwd missing) says so with an
+      // 'error' event, not by throwing from spawn(); unheard, that event would take the daemon down.
+      try {
+        await this.spawned;
+      } catch (error) {
+        // A missing cwd is also ENOENT, and Node's message names only the command.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(this.request.cwd)) {
+          return { error: { code: "acp_spawn_failed", message: `ACP agent cwd ${this.request.cwd} does not exist` } };
+        }
+        return errorValue("acp_spawn_failed", error);
+      }
       await this.hooks.transcript({
         type: "lifecycle",
         direction: "internal",
@@ -248,8 +265,8 @@ class Attempt {
         }
         // Conversational turn: surface to the user as a turn interaction and wait for
         // the next prompt. A rejected interact promise (cancel / dropInteraction) bubbles
-        // out of the loop and is caught by the `this.done` catch above — same path as
-        // elicitation cancellation today.
+        // out of the loop and is caught by the `this.done` catch above, like a cancelled
+        // elicitation.
         await this.hooks.transcript({
           type: "lifecycle",
           direction: "internal",
@@ -313,7 +330,7 @@ class Attempt {
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
       // A tool-using agent sends several messages per turn (progress notes between tool calls,
       // then the answer). ACP tags each with a messageId; keep only the latest message so the
-      // result is parsed from the turn's final message. Chunks without an id accumulate as before.
+      // result is parsed from the turn's final message. Chunks without an id accumulate.
       if (update.messageId && update.messageId !== this.messageId) {
         this.text = "";
         this.messageId = update.messageId;
@@ -388,6 +405,8 @@ class Attempt {
       this.child.stdin.end();
       await terminate(this.child, this.closed);
       await this.stderrDone.catch(() => undefined);
+      // A process that never started has no exit to record.
+      if (this.child.pid === undefined) return;
       try {
         await this.hooks.transcript({
           type: "lifecycle",

@@ -7,12 +7,12 @@ import { parseEnv } from "node:util";
 import type { AcpRequest, Execution, Executor, Hooks, InteractionRequest, ProcessRequest, Settlement } from "./executors/types.js";
 import { Store } from "./store.js";
 import { Transcripts } from "./transcript.js";
-import type { AttemptRow, DagmarEvent, ExecutorProfile, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, WhenClause, Workflow } from "./types.js";
+import type { AttemptRow, DagmarEvent, Interaction, Json, JsonObject, RunRow, RunStatus, RunView, TaskDef, TaskError, TaskResult, TaskState, WhenClause, Workflow } from "./types.js";
 import { DagmarError } from "./types.js";
 import { WorkflowRepository, mapItems, resolveInputs, reference } from "./workflow.js";
 import { gateValidator } from "./result.js";
 
-type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): DagmarEvent };
+type Events = { readonly current: number; publish(event: Omit<DagmarEvent, "sequence" | "timestamp">): void };
 type Executors = { process: Executor<ProcessRequest>; acp: Executor<AcpRequest> };
 type Live = { runId: string; handle?: Execution; ready: Promise<Execution>; finished: Promise<void>; wait: AbortController };
 type Pending = { view: Interaction; request: InteractionRequest; resolve(value: Json): void; reject(error: Error): void };
@@ -33,7 +33,6 @@ export class Scheduler {
     private readonly workflows: WorkflowRepository,
     private readonly events: Events,
     private readonly executors: Executors,
-    private readonly env: NodeJS.ProcessEnv = process.env,
   ) {}
 
   // `cwd` is the run's working directory, for every executor without a cwd of its own. A workflow with
@@ -51,7 +50,7 @@ export class Scheduler {
     const id = `wr_${randomUUID()}`, now = timestamp();
     this.store.insertRun({ id, workflowId, cwd, input, status: "running", startedAt: now, updatedAt: now, endedAt: null });
     this.emitRun(id, "running");
-    this.background(this.serial(id, () => this.advance(id, false, false)));
+    this.background(this.serial(id, () => this.advance(id)));
     return { workflowRunId: id, status: "running" };
   }
   list(): Omit<RunRow, "input">[] { return this.store.runs().map(({ input: _, ...run }) => run); }
@@ -70,7 +69,7 @@ export class Scheduler {
         const attempts = this.store.attempts(id);
         if (!depsSettled(task, latestAttempts(attempts), dueOf(workflow, attempts))) throw new DagmarError("invalid_run_state", `Task ${from} cannot run: not all its dependencies are completed or skipped`);
       }
-      await this.advance(id, true, true, from);
+      await this.advance(id, true, from);
       return this.view(id, await this.definition(id));
     });
   }
@@ -100,7 +99,7 @@ export class Scheduler {
       const status = aggregate(workflow, replace(this.store.attempts(first.workflowRunId), changed));
       this.store.transaction(() => { this.store.updateAttempt(taskRunId, { status: "cancelled", updatedAt: now, endedAt: now }); this.store.updateRun(first.workflowRunId, { status, updatedAt: now, ...(terminal(status) ? { endedAt: now } : {}) }); });
       this.emitTask(attempt, "cancelled"); this.emitRun(first.workflowRunId, status); this.dropInteraction(taskRunId); cancelId = taskRunId;
-      if (status === "running") await this.advance(first.workflowRunId, false, false);
+      if (status === "running") await this.advance(first.workflowRunId);
     });
     if (cancelId) await this.cancelLive(cancelId); return this.get(first.workflowRunId);
   }
@@ -127,7 +126,7 @@ export class Scheduler {
         this.emitTask(a, "completed");
         this.events.publish({ type: "interaction.changed", workflowRunId: a.workflowRunId, taskRunId: a.id, data: { interactionId: id, state: "answered" } });
         this.emitRun(a.workflowRunId, runStatus);
-        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId, false, false);
+        if (!this.stopping && runStatus === "running") await this.advance(a.workflowRunId);
         return this.view(a.workflowRunId, workflow);
       }
       // Non-gate: resume the executor by flipping the attempt back to running and resolving its Promise.
@@ -195,7 +194,8 @@ export class Scheduler {
     })();
   }
 
-  private async advance(id: string, retry: boolean, resuming: boolean, from: string | null = null): Promise<void> {
+  // `resuming`: a resume, which also decides the run's blocked, failed and cancelled tasks again.
+  private async advance(id: string, resuming = false, from: string | null = null): Promise<void> {
     const run = this.requiredRun(id);
     if (this.stopping || (!resuming && run.status !== "running" && run.status !== "waiting")) return;
     let workflow: Workflow;
@@ -222,7 +222,7 @@ export class Scheduler {
       const due = dueTasks(workflow, latest, pos, reruns, existing);
       for (const [taskId, task] of Object.entries(workflow.tasks)) {
         const current = latest.get(taskId);
-        const retried = current !== undefined && retry && blocking.has(current.status) && pos.get(current.id)! < existing.length;
+        const retried = current !== undefined && resuming && blocking.has(current.status) && pos.get(current.id)! < existing.length;
         let candidate = !current || retried || (taskId === from && pos.get(current.id)! < existing.length);
         if (!candidate && current && (current.status === "completed" || current.status === "skipped"))
           candidate = due.has(taskId);
@@ -291,7 +291,7 @@ export class Scheduler {
     const exhausted = !skip && task.rerun !== undefined && task.rerun.when === undefined && rerunCount(taskId, task, rows) >= task.rerun.max;
     if (skip || exhausted) {
       const isGate = Boolean(task.gate);
-      const executorType = isGate ? "gate" as const : (workflow.executors[task.executor!]?.type ?? "process");
+      const executorType = isGate ? "gate" as const : workflow.executors[task.executor!]!.type;
       const executorProfile = isGate ? "gate" : task.executor!;
       const block = exhausted && task.rerun!.atMax !== "proceed";
       const error = block ? rerunExhausted(taskId, task) : null;
@@ -307,23 +307,22 @@ export class Scheduler {
       }
     }
     // A map task's attempt runs nothing itself: advance() starts its items. A resumed attempt continues its round.
-    if (task.map) { const id = `tr_${randomUUID()}`; return { row: { id, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: workflow.executors[task.executor!]?.type ?? "process", status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: round ?? id } }; }
+    if (task.map) { const id = `tr_${randomUUID()}`; return { row: { id, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: workflow.executors[task.executor!]!.type, status: "running", result: null, error: null, acpSessionId: null, startedAt: now, updatedAt: now, endedAt: null, item: null, roundId: round ?? id } }; }
     return this.executorRow(run, workflow, taskId, task, latest, rows, now);
   }
 
   // An attempt that runs the task's executor: the task's own, or one item of a map task.
   private executorRow(run: RunRow, workflow: Workflow, taskId: string, task: TaskDef, latest: Map<string, AttemptRow>, rows: AttemptRow[], now: string, item?: { key: string; value: JsonObject; roundId: string }): { row: AttemptRow; request?: ProcessRequest | AcpRequest } {
-    const profile = workflow.executors[task.executor!];
-    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: profile?.type ?? "process", result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: item?.key ?? null, roundId: item?.roundId ?? null } as const;
+    const profile = workflow.executors[task.executor!]!;
+    const base = { id: `tr_${randomUUID()}`, workflowRunId: run.id, taskId, attempt: nextAttempt(rows, taskId), executorProfile: task.executor!, executorType: profile.type, result: null, acpSessionId: null, startedAt: now, updatedAt: now, item: item?.key ?? null, roundId: item?.roundId ?? null } as const;
     try {
-      if (!profile) throw new DagmarError("executor_unavailable", "Executor profile is unavailable");
       // A workflow edited mid-run can gain an executor without a cwd that its run never gave.
       const cwd = profile.cwd ?? run.cwd;
       if (cwd === null) throw new DagmarError("cwd_required", `Executor ${task.executor} has no cwd and the run gives none`);
       const inputs = resolveInputs(task, run, this.depOutputs(task, latest), item?.value);
       // The daemon's environment, then the executor's envFile, then its literal env on top.
-      const env = { ...this.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
-      const common = { runId: run.id, taskRunId: base.id, taskId, profile: task.executor!, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
+      const env = { ...process.env, ...(profile.envFile === undefined ? {} : envFile(profile.envFile)), ...profile.env };
+      const common = { taskId, cwd, env, inputs, ...(task.outputSchema === undefined ? {} : { outputSchema: task.outputSchema }) };
       let loadSessionId: string | undefined;
       if (task.session?.mode === "continue") {
         // Validation guarantees `from` is a completed dependency, so latest.get(from) is its
@@ -336,17 +335,16 @@ export class Scheduler {
       const request = profile.type === "process"
         ? { ...common, type: "process" as const, run: task.run! }
         : { ...common, type: "acp" as const, run: profile.run!, prompt: task.prompt!, ...(loadSessionId ? { loadSessionId } : {}), ...(task.interactive ? { interactive: true } : {}), ...(profile.model ? { model: profile.model } : {}), ...(profile.mode ? { mode: profile.mode } : {}), ...(profile.effort ? { effort: profile.effort } : {}), ...(profile.tools ? { tools: profile.tools } : {}), ...(loadSessionId && profile.loadSettleMs ? { loadSettleMs: profile.loadSettleMs } : {}) };
-      return { row: { ...base, executorType: profile.type, status: "running", error: null, endedAt: null }, request };
+      return { row: { ...base, status: "running", error: null, endedAt: null }, request };
     } catch (error) {
-      // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, executor_unavailable),
-      // so validation/scheduling failures surface with their semantic code instead of a generic one.
+      // taskError preserves a DagmarError's own code (e.g. continuation_unavailable, cwd_required),
+      // so these failures surface with their semantic code instead of a generic one.
       return { row: { ...base, status: "failed", error: taskError("input_resolution_failed", error), endedAt: now } };
     }
   }
 
-  // Skip-safe replacement for the inline output-map builds. Excludes deps whose latest attempt
-  // has no result (e.g. skipped), so a no-guard task referencing a skipped dep output gets
-  // input_resolution_failed instead of a null-deref.
+  // The outputs of a task's dependencies. A dependency whose latest attempt has no result (e.g.
+  // skipped) is left out, so a task that reads its output fails with input_resolution_failed.
   private depOutputs(task: TaskDef, latest: Map<string, AttemptRow>): Record<string, Json> {
     const out: Record<string, Json> = {};
     for (const dep of task.dependsOn) { const r = latest.get(dep)?.result; if (r) out[dep] = r.output; }
@@ -411,10 +409,10 @@ export class Scheduler {
       try {
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_started" });
         await this.append(next, { type: "lifecycle", direction: "internal", event: "attempt_retry", data: { retryOf: id, retry: retries + 1, max: retry.max, delaySeconds: retry.delaySeconds } });
-        this.launch(next, { ...request!, taskRunId: next.id }, retries + 1, retry.delaySeconds * 1000);
+        this.launch(next, request!, retries + 1, retry.delaySeconds * 1000);
       } catch (error) { await this.settle(next.id, { error: taskError("transcript_write_failed", error) }); }
     }
-    if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId, false, false);
+    if (!this.stopping && runStatus === "running") await this.advance(old.workflowRunId);
   }
 
   private requestInteraction(row: AttemptRow, request: InteractionRequest): Promise<Json> {
@@ -595,7 +593,7 @@ function taskError(code: string, error: unknown): TaskError { return { code: err
 function timestamp(): string { return new Date().toISOString(); }
 function walk(value: Json | undefined, path: string[]): Json | undefined {
   let current = value;
-  for (const key of path) { if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) return undefined; current = current[key]; }
+  for (const key of path) { if (!current || typeof current !== "object" || Array.isArray(current) || !Object.hasOwn(current, key)) return undefined; current = current[key]; }
   return current;
 }
 function jsonEqual(a: Json | undefined, b: Json | undefined): boolean {

@@ -34,7 +34,7 @@ These are implementation constraints, not slogans. Apply them by default.
   `pnpm install --frozen-lockfile` for verification after the lockfile exists.
 - Do not install dagmar dependencies globally. Host-provided executables such
   as `openclaw` and `claude-agent-acp` are configured by absolute path in
-  dagmar’s machine-local config.
+  the `executors` of each workflow.
 
 ## Parallel feature work and Git
 

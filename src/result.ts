@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { Ajv } from "ajv";
+import { Ajv, type ValidateFunction } from "ajv";
 import type { Json, JsonSchema, TaskResult } from "./types.js";
 import { DagmarError } from "./types.js";
 
@@ -14,7 +14,7 @@ export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskR
   const result = value as TaskResult;
   if (outputSchema !== undefined) {
     let validate;
-    try { validate = ajv.compile(outputSchema); }
+    try { validate = compile(outputSchema); }
     catch { throw new DagmarError("invalid_output_schema", "Task outputSchema is invalid"); }
     if (!validate(result.output)) {
       // Name every violation (Ajv runs with allErrors) by instance path, so an agent's repair
@@ -39,7 +39,7 @@ export function isEnvelope(value: unknown): boolean {
 
 export function validateOutputSchema(value: unknown): asserts value is JsonSchema {
   if (typeof value !== "boolean" && (!value || typeof value !== "object" || Array.isArray(value))) throw new DagmarError("invalid_output_schema", "outputSchema is invalid");
-  try { ajv.compile(value as JsonSchema); }
+  try { compile(value as JsonSchema); }
   catch { throw new DagmarError("invalid_output_schema", "outputSchema is invalid"); }
 }
 
@@ -49,13 +49,29 @@ export function validateOutputSchema(value: unknown): asserts value is JsonSchem
 // the InteractionRequest.validate contract: return the accepted value or throw.
 export function gateValidator(schema?: JsonSchema): (response: Json) => Json {
   if (schema === undefined) return (value) => value;
-  let validate: ReturnType<typeof ajv.compile>;
-  try { validate = ajv.compile(schema); }
+  let validate: ValidateFunction;
+  try { validate = compile(schema); }
   catch { throw new DagmarError("invalid_gate_schema", "Gate schema is invalid"); }
   return (value: Json): Json => {
     if (!validate(value)) throw new DagmarError("gate_validation_failed", "Gate response does not match schema");
     return value;
   };
+}
+
+// Ajv never frees what it compiled, and workflows are read again on every step, so each distinct schema is
+// compiled once, found again by its text. Ajv's own record of the schema is dropped: it would refuse a
+// second schema with the same `$id` as a duplicate. Nothing is evicted: each edited version of a schema
+// stays compiled until the daemon restarts, which is bounded by how often workflow files change.
+const compiled = new Map<string, ValidateFunction>();
+function compile(schema: JsonSchema): ValidateFunction {
+  const text = JSON.stringify(schema);
+  let validate = compiled.get(text);
+  if (!validate) {
+    try { validate = ajv.compile(schema); }
+    finally { if (typeof schema === "object") ajv.removeSchema(schema); }
+    compiled.set(text, validate);
+  }
+  return validate;
 }
 
 function json(value: unknown, seen = new Set<object>()): boolean {

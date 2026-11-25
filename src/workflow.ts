@@ -44,15 +44,13 @@ export class WorkflowRepository {
     catch { return { valid: new Map(), errors: [{ file: this.dir, code: "workflow_directory_unreadable", message: "Workflow directory cannot be read" }] }; }
     const rows: Array<{ file: string; id?: string; workflow?: Workflow; error?: WorkflowErrorView }> = [];
     for (const file of names) {
+      let id: string | undefined;
       try {
-        const text = await readFile(join(this.dir, file), "utf8");
-        const raw = yaml(text);
-        const id = idOf(raw);
+        const raw = yaml(await readFile(join(this.dir, file), "utf8"));
+        id = idOf(raw);
         rows.push({ file, ...(id ? { id } : {}), workflow: validateWorkflow(raw) });
       } catch (error) {
         const e = error instanceof DagmarError ? error : new DagmarError("workflow_invalid", "Workflow is invalid");
-        let id: string | undefined;
-        try { id = idOf(yaml(await readFile(join(this.dir, file), "utf8"))); } catch {}
         rows.push({ file, ...(id ? { id } : {}), error: { file, code: e.code, message: e.message } });
       }
     }
@@ -87,7 +85,8 @@ export function validateWorkflow(value: unknown): Workflow {
       continue;
     }
     if (!item.executor) throw new DagmarError("invalid_task", `Task ${id} requires executor or gate`);
-    const profile = profiles[item.executor];
+    // Own keys only: a name such as `constructor` is not an executor (or, below, a task).
+    const profile = Object.hasOwn(profiles, item.executor) ? profiles[item.executor] : undefined;
     if (!profile) throw new DagmarError("unknown_executor", `Task ${id} references unknown executor ${item.executor}`);
     let session: TaskDef["session"] | undefined;
     if (item.session) {
@@ -106,7 +105,7 @@ export function validateWorkflow(value: unknown): Workflow {
   }
   for (const [id, task] of Object.entries(tasks)) {
     for (const dep of task.dependsOn) {
-      if (dep === id || !tasks[dep]) throw new DagmarError("invalid_dependency", `Task ${id} has invalid dependency ${dep}`);
+      if (dep === id || !Object.hasOwn(tasks, dep)) throw new DagmarError("invalid_dependency", `Task ${id} has invalid dependency ${dep}`);
     }
     for (const [name, value] of Object.entries(task.inputs)) {
       if (typeof value !== "string") {
@@ -134,7 +133,7 @@ export function validateWorkflow(value: unknown): Workflow {
     }
     if (task.rerun !== undefined) {
       const from = task.rerun.from;
-      if (!tasks[from]) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} is not a task`);
+      if (!Object.hasOwn(tasks, from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} is not a task`);
       if (!upstream(tasks, id).has(from)) throw new DagmarError("invalid_rerun", `Task ${id} rerun.from ${from} must be upstream of it`);
       if (!Number.isInteger(task.rerun.max) || task.rerun.max < 1) throw new DagmarError("invalid_rerun", `Task ${id} rerun.max must be an integer >= 1`);
     }
@@ -177,7 +176,7 @@ export function resolveInputs(task: TaskDef, run: Pick<RunRow, "id" | "input">, 
     let current: Json = ref.item ? item as Json : ref.task ? outputs[ref.task] as Json : ref.runId ? run.id : run.input;
     if (current === undefined) throw new DagmarError("input_resolution_failed", `Missing input ${value}`);
     for (const key of ref.path) {
-      if (!current || typeof current !== "object" || Array.isArray(current) || !(key in current)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
+      if (!current || typeof current !== "object" || Array.isArray(current) || !Object.hasOwn(current, key)) throw new DagmarError("input_resolution_failed", `Missing input path ${value}`);
       current = current[key]!;
     }
     result[name] = current;

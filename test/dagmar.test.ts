@@ -18,7 +18,7 @@ import { EventBus, RpcClient } from "../src/rpc.js";
 import { Scheduler } from "../src/scheduler.js";
 import { Store } from "../src/store.js";
 import { Transcripts } from "../src/transcript.js";
-import type { ExecutorProfile, Json, RunView, TaskResult, Workflow } from "../src/types.js";
+import type { ExecutorProfile, Json, JsonObject, RunView, TaskResult, Workflow } from "../src/types.js";
 import { DagmarError } from "../src/types.js";
 import { WorkflowRepository, resolveInputs, validateWorkflow } from "../src/workflow.js";
 
@@ -193,11 +193,31 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 });
 `);
   const records: unknown[] = []; let session = "";
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_x", taskRunId: "tr_x", taskId: "x", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.equal(session, "fresh-1");
   assert.equal("result" in settled && settled.result.outcome, "completed");
   assert.ok(records.some((x) => (x as { type?: string }).type === "acp"));
+});
+
+test("an ACP agent command that does not exist fails the attempt with acp_spawn_failed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-missing-"));
+  const records: unknown[] = [];
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd: root, env: process.env, inputs: {}, run: [join(root, "no-such-agent")], prompt: "Do it" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  const settled = await execution.done;
+  assert.equal("error" in settled && settled.error.code, "acp_spawn_failed");
+  assert.match("error" in settled ? settled.error.message : "", /ENOENT/);
+  assert.deepEqual(records, [], "a process that never started has no lifecycle records");
+});
+
+test("an ACP executor whose cwd does not exist names the cwd, not the command", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-acp-nocwd-")), cwd = join(root, "gone");
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "x", cwd, env: process.env, inputs: {}, run: [process.execPath], prompt: "Do it" }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  assert.deepEqual(await execution.done, { error: { code: "acp_spawn_failed", message: `ACP agent cwd ${cwd} does not exist` } });
+});
+
+test("an input path never resolves to an inherited property", () => {
+  assert.throws(() => resolveInputs({ executor: "proc", dependsOn: ["a"], inputs: { x: "$tasks.a.output.constructor" }, run: ["node"] }, { id: "wr_x", input: null }, { a: {} }), (error) => error instanceof DagmarError && error.code === "input_resolution_failed");
 });
 
 test("daemon exposes the process runtime through JSON-RPC", async () => {
@@ -339,7 +359,7 @@ async function runProcess(prefix: string, source: string): Promise<{ settled: Se
   const root = await mkdtemp(join(tmpdir(), prefix)), script = join(root, "task.mjs");
   await writeFile(script, source);
   let stderr = "";
-  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script] }, { transcript: async (record) => { if (record.type === "stdio" && record.stream === "stderr") stderr += record.data; return 0; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   return { settled: await execution.done, stderr };
 }
 
@@ -347,7 +367,7 @@ test("a process whose output fails outputSchema names each violation by path", a
   const root = await mkdtemp(join(tmpdir(), "dagmar-process-schema-")), script = join(root, "task.mjs");
   await writeFile(script, `for await(const _ of process.stdin){};process.stdout.write(${JSON.stringify(JSON.stringify({ outcome: "completed", message: "ok", output: { items: [{ evidence: [] }], note: 1 } }))});`);
   const outputSchema = { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { evidence: { type: "array", minItems: 1 } } } }, note: { type: "string" } } };
-  const execution = await new ProcessExecutor().start({ type: "process", runId: "wr_p", taskRunId: "tr_p", taskId: "p", profile: "local", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], outputSchema }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], outputSchema }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   assert.deepEqual(await execution.done, { error: { code: "output_validation_failed", message: "Task output does not match outputSchema: output/items/0/evidence must NOT have fewer than 1 items; output/note must be string" } });
 });
 
@@ -379,6 +399,22 @@ test("a long stderr tail is cut from the front to the bound", async () => {
 test("a failed process without stderr keeps the plain error message", async () => {
   const { settled } = await runProcess("dagmar-stderr-none-", `for await(const _ of process.stdin){};process.exit(3);`);
   assert.deepEqual(settled, { error: { code: "process_exit_nonzero", message: "Process exited with code 3" } });
+});
+
+test("a schema with an $id validates each time its workflow is read again, and after an edit", () => {
+  const outputSchema = () => ({ $id: "https://example.com/output", type: "object", required: ["ok"] });
+  const workflow = () => ({ id: "x", executors: { proc: { type: "process" } }, tasks: { p: { executor: "proc", inputs: {}, run: ["node"], outputSchema: outputSchema() }, g: { inputs: {}, gate: { prompt: "Go?", schema: outputSchema() } } } });
+  validateWorkflow(workflow());
+  validateWorkflow(workflow());
+  for (let i = 0; i < 2; i++) assert.equal(validateResult({ outcome: "completed", message: "ok", output: { ok: true } }, outputSchema()).outcome, "completed");
+  assert.equal(validateResult({ outcome: "completed", message: "ok", output: { ok: true } }, { ...outputSchema(), title: "edited" }).outcome, "completed");
+  assert.throws(() => validateResult({ outcome: "completed", message: "ok", output: {} }, outputSchema()), (error) => error instanceof DagmarError && error.code === "output_validation_failed");
+});
+
+test("a process whose cwd does not exist names the cwd, not the command", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-process-nocwd-")), cwd = join(root, "gone");
+  const execution = await new ProcessExecutor().start({ type: "process", taskId: "p", cwd, env: process.env, inputs: {}, run: [process.execPath, "-e", "0"] }, { transcript: async () => 0, session: async () => undefined, interact: async () => { throw new Error("unexpected interaction"); } });
+  assert.deepEqual(await execution.done, { error: { code: "process_failed", message: `Process cwd ${cwd} does not exist` } });
 });
 
 test("a process killed by a signal names the signal before its stderr tail", async () => {
@@ -465,7 +501,7 @@ if(m.method==='session/new')send({jsonrpc:'2.0',id:m.id,error:{code:-32000,messa
 });
 `);
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_a", taskRunId: "tr_a", taskId: "a", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    { type: "acp", taskId: "a", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
     { transcript: async () => 1, session: async () => {}, interact: async () => { throw new Error("unexpected"); } },
   );
   const settled = await execution.done;
@@ -567,8 +603,8 @@ test("a completed run resumes from a task: that task and its downstream run agai
   app.store.close();
 });
 
-// T1 (session continuation): validateWorkflow accepts a continue task whose 'from' is a
-// same-agent ACP dependency, and rejects every variant the plan enumerates. Profiles are
+// Session continuation: validateWorkflow accepts a continue task whose 'from' is a
+// same-agent ACP dependency, and rejects every invalid variant. Profiles are
 // passed in directly so each rejection can pin a specific failure mode without disk I/O.
 test("validateWorkflow accepts continue with a same-agent ACP dependency and rejects variants", () => {
   const profiles: Record<string, ExecutorProfile> = {
@@ -647,7 +683,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
   );
 });
 
-// T1 (scheduler resolution): the scheduler forwards the source task's persisted
+// Scheduler resolution: the scheduler forwards the source task's persisted
 // acp_session_id on the continuing task's request as loadSessionId. The fake ACP executor
 // captures B's request after A completes with hooks.session("sid-A"); assert the forwarded
 // id matches and the run completes.
@@ -705,7 +741,7 @@ test("scheduler forwards the executor's loadSettleMs only to a continuing task",
   app.store.close();
 });
 
-// T1 (ACP load branch): when loadSessionId is set and the agent advertises loadSession,
+// ACP load branch: when loadSessionId is set and the agent advertises loadSession,
 // AcpExecutor calls session/load (not session/new) and then one session/prompt, settling
 // with the parsed TaskResult. Inspect the captured transcript for both the load method
 // (and the absence of session/new) and the resulting completion.
@@ -721,7 +757,7 @@ if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',para
 });
 `);
   const records: unknown[] = []; let session = "";
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_y", taskRunId: "tr_y", taskId: "y", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "y", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async (id) => { session = id; }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.equal(session, "sid-X");
   assert.equal("result" in settled && settled.result.outcome, "completed");
@@ -779,7 +815,7 @@ test("AcpExecutor cancel interrupts the loadSettleMs wait without prompting", as
   const records: unknown[] = [];
   let settling!: () => void;
   const waiting = new Promise<void>((resolve) => { settling = resolve; });
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_c", taskRunId: "tr_c", taskId: "c", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", loadSessionId: "sid-X", loadSettleMs: 60_000 }, { transcript: async (record) => { records.push(record); if ((record as { event?: string }).event === "acp_load_settle") settling(); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "c", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", loadSessionId: "sid-X", loadSettleMs: 60_000 }, { transcript: async (record) => { records.push(record); if ((record as { event?: string }).event === "acp_load_settle") settling(); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   await waiting;
   const started = Date.now();
   await execution.cancel();
@@ -789,7 +825,7 @@ test("AcpExecutor cancel interrupts the loadSettleMs wait without prompting", as
   assert.ok(!records.some((r) => (r as { type?: string; message?: { method?: string } }).type === "acp" && (r as { message: { method?: string } }).message.method === "session/prompt"));
 });
 
-// T1 (acp_load_unsupported): when loadSessionId is set but the agent does not advertise
+// Acp_load_unsupported: when loadSessionId is set but the agent does not advertise
 // loadSession, AcpExecutor must fail fast with a clear code rather than calling
 // session/load and crashing the runtime.
 test("AcpExecutor fails with acp_load_unsupported when loadSessionId is set but the agent does not advertise loadSession", async () => {
@@ -802,7 +838,7 @@ if(m.method==='initialize')send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:1
 });
 `);
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_z", taskRunId: "tr_z", taskId: "z", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => { throw new Error("hooks.session must not be called when the agent lacks loadSession"); }, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "z", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Continue", loadSessionId: "sid-X" }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => { throw new Error("hooks.session must not be called when the agent lacks loadSession"); }, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   assert.ok("error" in settled, "expected a failed settlement, not a crash");
   assert.equal("error" in settled && settled.error.code, "acp_load_unsupported");
@@ -832,7 +868,7 @@ if(m.method==='session/prompt'){send({jsonrpc:'2.0',method:'session/update',para
 }
 async function runModelAgent(root: string, script: string, extra: Partial<AcpRequest>): Promise<{ settled: Settlement; records: unknown[]; sent: Array<{ method?: string; params?: Record<string, unknown> }> }> {
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_m", taskRunId: "tr_m", taskId: "m", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...extra }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "m", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...extra }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   const sent = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: Record<string, unknown> } }).message);
   return { settled, records, sent };
@@ -959,6 +995,11 @@ test("validateWorkflow reads the workflow's executors and rejects malformed ones
   invalid({ agent, proc: { type: "gate", cwd: "/tmp" } });
   invalid({ agent, proc, "-bad": proc });
   assert.throws(() => validateWorkflow({ id: "x", executors: { agent }, tasks }), (error) => error instanceof DagmarError && error.code === "unknown_executor");
+  // A name every object inherits is not an executor, a dependency or a rerun target.
+  const inherited = (task: object, code: string) => assert.throws(() => validateWorkflow({ id: "x", executors: { proc }, tasks: { p: { executor: "proc", inputs: {}, run: ["node"], ...task } } }), (error) => error instanceof DagmarError && error.code === code);
+  inherited({ executor: "constructor" }, "unknown_executor");
+  inherited({ dependsOn: ["toString"] }, "invalid_dependency");
+  inherited({ rerun: { from: "valueOf", max: 1 } }, "invalid_rerun");
 });
 
 // Profile mode selection reuses the model fake agent with a "mode" config option.
@@ -1109,7 +1150,7 @@ test("AcpExecutor fails with acp_thought_level_not_applied when the agent does n
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
-// T1 (continuation_unavailable): when the source task completes without persisting an
+// Continuation_unavailable: when the source task completes without persisting an
 // acp_session_id (e.g. an interactive executor that doesn't call hooks.session), the
 // continuing task's attempt must fail-fast with continuation_unavailable — never silently
 // fall back to a fresh session.
@@ -1136,9 +1177,9 @@ test("scheduler fails the continuing task with continuation_unavailable when the
   app.store.close();
 });
 
-// T2 (workflow validation): validateWorkflow accepts an ACP task with interactive:true
+// Workflow validation: validateWorkflow accepts an ACP task with interactive:true
 // (and normalizes it onto the TaskDef) but rejects it on a process task — interactive
-// is an ACP-only flag. Mirrors the T1 validateWorkflow test (lines 348-426): profiles
+// is an ACP-only flag. Like the session-continuation validateWorkflow test, profiles
 // are passed directly so each case pins a specific failure mode without disk I/O.
 test("validateWorkflow accepts interactive on ACP tasks and rejects it on process tasks", () => {
   const profiles: Record<string, ExecutorProfile> = {
@@ -1183,7 +1224,7 @@ if(m.method==='session/prompt'){for(const [id,text] of chunks)send({jsonrpc:'2.0
 }
 async function runMessagesAgent(root: string, script: string, interactive: boolean): Promise<{ settled: Settlement; turns: number }> {
   let turns = 0;
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_msg", taskRunId: "tr_msg", taskId: "msg", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(interactive ? { interactive: true } : {}) }, { transcript: async () => 1, session: async () => undefined, interact: async () => { turns++; throw new Error("unexpected turn"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "msg", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(interactive ? { interactive: true } : {}) }, { transcript: async () => 1, session: async () => undefined, interact: async () => { turns++; throw new Error("unexpected turn"); } });
   return { settled: await execution.done, turns };
 }
 const ENVELOPE_PARTS = ['{"outcome":"completed",', '"message":"ok","output":{"n":1}}'];
@@ -1226,7 +1267,7 @@ if(m.method==='session/prompt'){const text=replies[Math.min(n++,replies.length-1
 }
 async function runRepairAgent(root: string, script: string, outputSchema?: AcpRequest["outputSchema"]): Promise<{ settled: Settlement; prompts: string[]; events: string[] }> {
   const records: unknown[] = [];
-  const execution = await new AcpExecutor().start({ type: "acp", runId: "wr_r", taskRunId: "tr_r", taskId: "r", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(outputSchema === undefined ? {} : { outputSchema }) }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
+  const execution = await new AcpExecutor().start({ type: "acp", taskId: "r", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Go", ...(outputSchema === undefined ? {} : { outputSchema }) }, { transcript: async (record) => { records.push(record); return records.length; }, session: async () => undefined, interact: async () => { throw new Error("unexpected"); } });
   const settled = await execution.done;
   const prompts = records.filter((r) => (r as { type?: string; direction?: string }).type === "acp" && (r as { direction?: string }).direction === "to_executor").map((r) => (r as { message: { method?: string; params?: { prompt?: Array<{ text: string }> } } }).message).filter((m) => m.method === "session/prompt").map((m) => m.params!.prompt![0]!.text);
   const events = records.filter((r) => (r as { type?: string }).type === "lifecycle").map((r) => (r as { event: string }).event);
@@ -1334,7 +1375,7 @@ test("scheduler retries an ACP attempt that failed before any work as a new atte
   assert.deepEqual(attempts.map((x) => [x.attempt, x.status, x.error?.code ?? null]), [[1, "failed", "acp_failed"], [2, "completed", null]]);
   assert.deepEqual(seen.filter((x) => x.data.attempt !== undefined).map((x) => `${x.data.attempt}:${x.data.status}`), ["1:running", "1:failed", "2:running", "2:completed"]);
   const { records } = await app.transcripts.read(run.workflowRunId, attempts[1]!.id);
-  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: attempts[0]!.id, retry: 1, max: 2, delaySeconds: 0 });
+  assert.deepEqual(records.flatMap((x) => x.type === "lifecycle" && x.event === "attempt_retry" ? [x.data] : []), [{ retryOf: attempts[0]!.id, retry: 1, max: 2, delaySeconds: 0 }]);
   app.store.close();
 });
 
@@ -1366,7 +1407,7 @@ test("an ACP executor without retry gets the default retry, and cancelling a tas
   const waiting = (await app.scheduler.get(run.workflowRunId)).tasks.a!.attempts;
   assert.deepEqual(waiting.map((x) => x.status), ["failed", "running"]);
   const { records } = await app.transcripts.read(run.workflowRunId, waiting[1]!.id);
-  assert.deepEqual(records.find((x) => x.type === "lifecycle" && x.event === "attempt_retry")?.data, { retryOf: waiting[0]!.id, retry: 1, max: 2, delaySeconds: 300 });
+  assert.deepEqual(records.flatMap((x) => x.type === "lifecycle" && x.event === "attempt_retry" ? [x.data] : []), [{ retryOf: waiting[0]!.id, retry: 1, max: 2, delaySeconds: 300 }]);
   await app.scheduler.cancelTask(waiting[1]!.id);
   const view = await waitFor(app.scheduler, run.workflowRunId, "blocked");
   assert.deepEqual(view.tasks.a!.attempts.map((x) => x.status), ["failed", "cancelled"]);
@@ -1383,7 +1424,7 @@ test("retry max 0 turns the ACP retry off", async () => {
   app.store.close();
 });
 
-// T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session
+// Executor multi-turn: the AcpExecutor loops session/prompt on one live session
 // when request.interactive === true. Turn 1 is conversational ("need input"); turn 2
 // emits the envelope. The same agent connection takes both turns (two session/prompt
 // sends on one sessionId) and the attempt settles `completed` with the envelope output.
@@ -1408,7 +1449,7 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 `);
   const records: unknown[] = []; let interactCalls = 0; let capturedMessage = "";
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_i", taskRunId: "tr_i", taskId: "i", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Converse", interactive: true },
+    { type: "acp", taskId: "i", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Converse", interactive: true },
     {
       transcript: async (record) => { records.push(record); return records.length; },
       session: async () => {},
@@ -1438,11 +1479,11 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.ok(events.includes("acp_turn_completed"), "expected an acp_turn_completed lifecycle event");
 });
 
-// T2 (scheduler park→turn→complete): an ACP task with interactive:true whose fake
+// Scheduler park→turn→complete: an ACP task with interactive:true whose fake
 // executor issues one `turn` interaction via hooks.interact then completes after the
 // user answers. The scheduler must park the attempt as awaiting_input with kind="turn",
 // surface the interaction, and resume on answer(). Mirrors the existing ACP-interaction
-// park/answer test (lines 162-173) but with a `turn` interaction instead of `permission`.
+// park/answer test but with a `turn` interaction instead of `permission`.
 test("scheduler parks an interactive task awaiting a turn and completes on answer", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-turn-park-"));
   const workflow = { id: "turn", tasks: { talk: { executor: "agent", inputs: {}, prompt: "converse", interactive: true } } };
@@ -1459,10 +1500,10 @@ test("scheduler parks an interactive task awaiting a turn and completes on answe
   app.store.close();
 });
 
-// T2 (regression): the non-interactive single-shot path must be unchanged — a mock
+// Regression: the non-interactive single-shot path must be unchanged — a mock
 // agent emitting non-envelope prose ("hello") + end_turn must settle the attempt as
 // `failed` (the existing "ACP response must be exactly one JSON value" throw), and
-// must NOT park a `turn` interaction. Guards AC5: no silent behavior change.
+// must NOT park a `turn` interaction. No silent behavior change.
 test("non-interactive ACP task with non-envelope prose fails fast without suspending", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-acp-nonenv-")), script = join(root, "agent.mjs");
   await writeFile(script, `
@@ -1477,7 +1518,7 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
 `);
   let interactCalls = 0;
   const execution = await new AcpExecutor().start(
-    { type: "acp", runId: "wr_n", taskRunId: "tr_n", taskId: "n", profile: "agent", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
+    { type: "acp", taskId: "n", cwd: root, env: process.env, inputs: {}, run: [process.execPath, script], prompt: "Do it" },
     {
       transcript: async () => 1,
       session: async () => {},
@@ -1491,9 +1532,9 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.equal(interactCalls, 0);
 });
 
-// T3 (workflow validation): gate tasks are accepted (with normalized gate block) and every reject
-// variant the plan enumerates is surfaced as a clear invalid_task. Mirrors the T1 validateWorkflow
-// test (lines 348-426): profiles are passed in directly so each case pins a specific failure mode
+// Workflow validation: gate tasks are accepted (with normalized gate block) and every reject
+// variant is surfaced as a clear invalid_task. Like the session-continuation validateWorkflow
+// test, profiles are passed in directly so each case pins a specific failure mode
 // without disk I/O.
 test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
   const profiles: Record<string, ExecutorProfile> = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
@@ -1576,7 +1617,7 @@ test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
   );
 });
 
-// T3 (gate park/answer/complete): a gate task after a dependency parks the attempt as
+// Gate park/answer/complete: a gate task after a dependency parks the attempt as
 // awaiting_input with kind:"gate", surfaces the interaction, and completes when the human
 // answers via interaction.answer. Mirrors the ACP interaction park/answer test at lines 162-173
 // but with a `gate` interaction instead of `permission`.
@@ -1617,7 +1658,7 @@ test("scheduler parks a gate task awaiting input and completes on answer", async
   app.store.close();
 });
 
-// T3 (gate with schema): a gate with a JSON Schema validates the answer. A valid answer
+// Gate with schema: a gate with a JSON Schema validates the answer. A valid answer
 // completes the gate, an invalid one raises invalid_interaction_response (same shape as other
 // interactions). Mirrors the ACP-interaction park/answer pattern.
 test("scheduler validates a gate answer against its schema", async () => {
@@ -1656,7 +1697,7 @@ test("scheduler validates a gate answer against its schema", async () => {
   app2.store.close();
 });
 
-// T3 (root gate): a gate task with no dependencies parks immediately on run start, then
+// Root gate: a gate task with no dependencies parks immediately on run start, then
 // completes when answered. Validates that the gate branch fires for the first ready task too.
 test("a root gate with no dependencies parks immediately on run start", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-gate-root-"));
@@ -1674,7 +1715,7 @@ test("a root gate with no dependencies parks immediately on run start", async ()
   app.store.close();
 });
 
-// T3 (recovery carve-out): a gate attempt inserted into the store with awaiting_input +
+// Recovery carve-out: a gate attempt inserted into the store with awaiting_input +
 // executorType:"gate" must survive a daemon restart. recover() does NOT mark it executor_lost —
 // it reconstructs the Pending entry from the persisted row + workflow definition. The answer
 // remains valid (the gate is answerable after recovery). Mirrors the recovery test at 211-217.
@@ -1703,7 +1744,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   app.store.close();
 });
 
-// T3 (mixed recovery): a run with both a gate attempt (awaiting_input, executorType:"gate") and
+// Mixed recovery: a run with both a gate attempt (awaiting_input, executorType:"gate") and
 // a non-gate attempt (running, executorType:"process") recovers the gate and fails the non-gate.
 // The run's final state is waiting because the surviving gate is still active.
 test("recover() fails non-gate attempts but preserves gate attempts in the same run", async () => {
@@ -1736,7 +1777,7 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   app.store.close();
 });
 
-// T3 (gate input-resolution failure): a gate task whose `inputs` reference a path that does not
+// Gate input-resolution failure: a gate task whose `inputs` reference a path that does not
 // resolve against a completed dep's output fails synchronously at prepare() time. The attempt
 // is inserted with status: "failed" and error.code "input_resolution_failed", no Pending entry
 // is registered, and the run reaches "blocked" without ever producing a gate interaction.
@@ -1762,7 +1803,7 @@ test("a gate with an unresolvable input fails at prepare() rather than parking",
   app.store.close();
 });
 
-// T3 (recover() clears stale endedAt on non-terminal restoration): when a run arrives at recover()
+// Recover() clears stale endedAt on non-terminal restoration: when a run arrives at recover()
 // with endedAt set (because a prior shutdown() wrote it via failActiveLocked + skipGates:true),
 // and the recomputed run status is non-terminal ("waiting", because a gate survived), the run's
 // endedAt must be cleared — mirroring the symmetric advance() pattern. Without this, run.list /
@@ -1795,7 +1836,7 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   app.store.close();
 });
 
-// T3 (shutdown preserves gates): shutdown() does NOT mark gate attempts as daemon_shutdown —
+// Shutdown preserves gates: shutdown() does NOT mark gate attempts as daemon_shutdown —
 // the skipGates:true flag keeps them alive across a graceful shutdown. A fresh scheduler on
 // the same store recovers them and the human can still answer.
 test("shutdown() preserves gate attempts across restart", async () => {
@@ -1835,7 +1876,7 @@ test("shutdown() preserves gate attempts across restart", async () => {
   store2.close();
 });
 
-// T3 (gate output feeds downstream tasks): $tasks.<gate>.output resolves to the human's answer
+// Gate output feeds downstream tasks: $tasks.<gate>.output resolves to the human's answer
 // in a downstream task. Mirrors the diamond test's input-reference wiring but with a gate source.
 test("gate output is available as $tasks.<gate>.output to downstream tasks", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-gate-output-"));
@@ -1866,9 +1907,9 @@ test("gate output is available as $tasks.<gate>.output to downstream tasks", asy
 });
 
 
-// T4 (when validation matrix): validateWorkflow accepts well-formed when clauses (ref/equals/in/dep
-// checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the variants the
-// plan enumerates. Profiles are passed directly so each rejection pins a specific failure mode.
+// When validation matrix: validateWorkflow accepts well-formed when clauses (ref/equals/in/dep
+// checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the malformed
+// variants. Profiles are passed directly so each rejection pins a specific failure mode.
 test("validateWorkflow accepts when guards and rejects malformed variants", () => {
   const profiles: Record<string, ExecutorProfile> = {
     local: { type: "process", cwd: "/tmp", env: {} },
@@ -1984,7 +2025,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
   );
 });
 
-// T4 (N-way decider): an upstream decide task picks a route; three branches each gate on a different
+// N-way decider: an upstream decide task picks a route; three branches each gate on a different
 // value. Exactly one branch runs, the other two skip, and the run completes (not blocked).
 // Uses the local process executor with an echo script that emits {outcome,output:<inputs>}.
 test("scheduler runs only the matching branch of an N-way decider and skips the rest", async () => {
@@ -2046,7 +2087,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{lane:data.r
   app.store.close();
 });
 
-// T4 (cascade via guard referencing a skipped output): a1's guard references decide.output.route;
+// Cascade via guard referencing a skipped output: a1's guard references decide.output.route;
 // a2's guard references a1.output. If decide.output.route != "a", a1 skips; a2's guard then
 // references a skipped dep, so the cascade short-circuits and a2 also skips.
 test("scheduler cascades a skip through a guard referencing a skipped output", async () => {
@@ -2085,7 +2126,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{x:1,route:d
   app.store.close();
 });
 
-// T4 (no-guard join past a skipped sibling): a1 has a guard and skips; keep has NO guard and
+// No-guard join past a skipped sibling: a1 has a guard and skips; keep has NO guard and
 // references decide (not a1) so it runs past the skip and completes.
 test("a no-guard task runs past a skipped sibling it does not reference", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-noguard-join-"));
@@ -2122,7 +2163,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   app.store.close();
 });
 
-// T4 (no-guard task referencing a skipped output fails): convention violation surface. a1 skips;
+// No-guard task referencing a skipped output fails: convention violation surface. a1 skips;
 // join has no guard and references a1.output -> input_resolution_failed at prepare() time. Run
 // reaches blocked, not completed.
 test("a no-guard task referencing a skipped output fails with input_resolution_failed", async () => {
@@ -2161,9 +2202,10 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   app.store.close();
 });
 
-// T4 (missing path -> skip, never throws): decide.output lacks `flavor`; b's guard references
+// Missing path -> skip, never throws: decide.output lacks `flavor`; b's guard references
 // $tasks.decide.output.flavor. walk() returns undefined for the missing path, the clause is
-// false, b skips. Run completes (not blocked).
+// false, b skips. Run completes (not blocked). A path that only exists on what every object
+// inherits is missing too: c's guard would hold if `__proto__` read Object.prototype.
 test("a guard referencing a missing path causes the task to skip (not fail)", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-missing-"));
   const script = join(root, "task.mjs");
@@ -2183,6 +2225,10 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
         executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
         when: [{ ref: "$tasks.decide.output.flavor", equals: "x" }],
       },
+      c: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.__proto__", equals: {} }],
+      },
     },
   };
   const app = await fixture(root, workflow);
@@ -2190,11 +2236,12 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
   assert.equal(view.tasks.decide!.state, "completed");
   assert.equal(view.tasks.b!.state, "skipped");
+  assert.equal(view.tasks.c!.state, "skipped");
   assert.equal(view.status, "completed");
   app.store.close();
 });
 
-// T4 (run-input guard): a single task with no deps and a guard on $run.input. Two separate runs
+// Run-input guard: a single task with no deps and a guard on $run.input. Two separate runs
 // (different workflow ids because one active run per workflow), one with mode:slow -> skip, one
 // with mode:fast -> complete.
 test("a run-input guard decides on the run input and skips or completes accordingly", async () => {
@@ -2983,7 +3030,7 @@ test("every task of a run, and every item of its map task, reads the run's id fr
 test("a map task runs 36 items 3 at a time, keeps the others when one fails, and a resume reruns only that one", { timeout: 20_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-map-"));
   const ids = Array.from({ length: 36 }, (_, i) => `doc${String(i + 1).padStart(2, "0")}`), runs: Record<string, number> = {};
-  let inflight = 0, most = 0, summary: Json = null;
+  let inflight = 0, most = 0, summary = null as Json;
   const stub = new StubAcpExecutor(async (request) => {
     if (request.taskId === "list") return { result: { outcome: "completed", message: "list", output: { docs: ids.map((id) => ({ id })) } } };
     if (request.taskId === "summary") { summary = request.inputs.reviews!; return { result: { outcome: "completed", message: "summary", output: {} } }; }
@@ -3161,7 +3208,7 @@ class InteractiveExecutor implements Executor<AcpRequest> {
   }
 }
 
-// T2 helper: like InteractiveExecutor but emits a `turn` interaction instead of a
+// Like InteractiveExecutor but emits a `turn` interaction instead of a
 // `permission` interaction. The validate function passes the answer through as-is so
 // the scheduler sees the user's next-turn text in the resulting TaskResult.output.
 class TurnInteractionExecutor implements Executor<AcpRequest> {

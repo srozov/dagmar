@@ -8,7 +8,7 @@
   "bin": { "dagmar": "./dist/cli.js", "dagmard": "./dist/daemon.js" },
   "scripts": {
     "build": "tsc",
-    "check": "tsc --noEmit",
+    "check": "tsc -p test",
     "test": "tsx --test test/*.test.ts",
     "dev:daemon": "tsx src/daemon.ts",
     "dev:cli": "tsx src/cli.ts"

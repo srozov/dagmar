@@ -34,7 +34,7 @@ const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 export class Store {
   private readonly db: DatabaseSync;
-  constructor(readonly path: string) {
+  constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SQL);
@@ -91,7 +91,7 @@ export class Store {
     return (this.db.prepare("SELECT * FROM task_runs WHERE status IN ('running','awaiting_permission','awaiting_input')").all() as Row[]).map(attempt);
   }
 
-  updateRun(id: string, patch: Partial<Pick<RunRow, "status" | "updatedAt" | "endedAt">>): RunRow {
+  updateRun(id: string, patch: Partial<Pick<RunRow, "status" | "updatedAt" | "endedAt">>): void {
     try {
       update(this.db, "workflow_runs", id, patch, { status: "status", updatedAt: "updated_at", endedAt: "ended_at" });
     } catch (error) {
@@ -100,11 +100,8 @@ export class Store {
       if ((error as { errcode?: number }).errcode === SQLITE_CONSTRAINT_UNIQUE && run) throw new DagmarError("active_run_exists", `Workflow ${run.workflowId} already has an active run${run.cwd === null ? "" : ` in ${run.cwd}`}`);
       throw error;
     }
-    const value = this.run(id);
-    if (!value) throw new DagmarError("run_not_found", `Run ${id} was not found`);
-    return value;
   }
-  updateAttempt(id: string, patch: Partial<Pick<AttemptRow, "status" | "result" | "error" | "acpSessionId" | "updatedAt" | "endedAt">>): AttemptRow {
+  updateAttempt(id: string, patch: Partial<Pick<AttemptRow, "status" | "result" | "error" | "acpSessionId" | "updatedAt" | "endedAt">>): void {
     const values: Record<string, string | null> = {};
     if (patch.status !== undefined) values.status = patch.status;
     if (Object.hasOwn(patch, "result")) values.result = encode(patch.result ?? null);
@@ -113,9 +110,6 @@ export class Store {
     if (patch.updatedAt !== undefined) values.updatedAt = patch.updatedAt;
     if (Object.hasOwn(patch, "endedAt")) values.endedAt = patch.endedAt ?? null;
     update(this.db, "task_runs", id, values, { status: "status", result: "result_json", error: "error_json", acpSessionId: "acp_session_id", updatedAt: "updated_at", endedAt: "ended_at" });
-    const value = this.attempt(id);
-    if (!value) throw new DagmarError("task_run_not_found", `Task run ${id} was not found`);
-    return value;
   }
 }
 
