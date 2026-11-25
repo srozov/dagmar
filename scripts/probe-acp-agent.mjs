@@ -5,7 +5,7 @@
 // `category: "model"` config option dagmar selects models from; then kills the agent.
 //
 // Usage (from the repo root):
-//   node scratchpad/probe-acp-agent.mjs --agent /absolute/path/to/claude-agent-acp/dist/index.js
+//   node scripts/probe-acp-agent.mjs --agent /absolute/path/to/claude-agent-acp/dist/index.js
 
 import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
@@ -14,7 +14,7 @@ import { client, methods, ndJsonStream, PROTOCOL_VERSION } from "@agentclientpro
 const argv = process.argv.slice(2);
 const flag = argv.indexOf("--agent");
 const agent = flag >= 0 ? argv[flag + 1] : process.env.AGENT;
-if (!agent) throw new Error("Usage: node scratchpad/probe-acp-agent.mjs --agent <path/to/claude-agent-acp>");
+if (!agent) throw new Error("Usage: node scripts/probe-acp-agent.mjs --agent <path/to/claude-agent-acp>");
 
 const run = agent.endsWith(".js") ? [process.execPath, agent] : [agent];
 const child = spawn(run[0], run.slice(1), { stdio: ["pipe", "pipe", "inherit"] });
