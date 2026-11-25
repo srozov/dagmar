@@ -92,6 +92,7 @@ node dist/cli.js --config config.yaml status <workflowRunId>
 - [Executors](docs/executors.md): the process and ACP executors, the task result, and the ACP retry.
 - [Running Dagmar](docs/cli.md): configuration, the daemon, the CLI, and cancelling and resuming runs.
 - [Design](docs/design.md): contracts, persistence, the scheduler, recovery and the JSON-RPC API.
+- [Releasing](docs/releasing.md): versioning and the release procedure; [CHANGELOG.md](CHANGELOG.md) lists every version.
 - [Examples](examples/README.md), including a review loop with a builder agent, a reviewer agent and a human gate, and [its runbook](docs/mvp-acceptance.md).
 
 ## Development
