@@ -2204,7 +2204,8 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
 
 // Missing path -> skip, never throws: decide.output lacks `flavor`; b's guard references
 // $tasks.decide.output.flavor. walk() returns undefined for the missing path, the clause is
-// false, b skips. Run completes (not blocked).
+// false, b skips. Run completes (not blocked). A path that only exists on what every object
+// inherits is missing too: c's guard would hold if `__proto__` read Object.prototype.
 test("a guard referencing a missing path causes the task to skip (not fail)", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-missing-"));
   const script = join(root, "task.mjs");
@@ -2224,6 +2225,10 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
         executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
         when: [{ ref: "$tasks.decide.output.flavor", equals: "x" }],
       },
+      c: {
+        executor: "local", dependsOn: ["decide"], inputs: {}, run: [process.execPath, script],
+        when: [{ ref: "$tasks.decide.output.__proto__", equals: {} }],
+      },
     },
   };
   const app = await fixture(root, workflow);
@@ -2231,6 +2236,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   const view = await waitFor(app.scheduler, started.workflowRunId, "completed");
   assert.equal(view.tasks.decide!.state, "completed");
   assert.equal(view.tasks.b!.state, "skipped");
+  assert.equal(view.tasks.c!.state, "skipped");
   assert.equal(view.status, "completed");
   app.store.close();
 });
