@@ -585,8 +585,8 @@ test("a completed run resumes from a task: that task and its downstream run agai
   app.store.close();
 });
 
-// T1 (session continuation): validateWorkflow accepts a continue task whose 'from' is a
-// same-agent ACP dependency, and rejects every variant the plan enumerates. Profiles are
+// Session continuation: validateWorkflow accepts a continue task whose 'from' is a
+// same-agent ACP dependency, and rejects every invalid variant. Profiles are
 // passed in directly so each rejection can pin a specific failure mode without disk I/O.
 test("validateWorkflow accepts continue with a same-agent ACP dependency and rejects variants", () => {
   const profiles: Record<string, ExecutorProfile> = {
@@ -665,7 +665,7 @@ test("validateWorkflow accepts continue with a same-agent ACP dependency and rej
   );
 });
 
-// T1 (scheduler resolution): the scheduler forwards the source task's persisted
+// Scheduler resolution: the scheduler forwards the source task's persisted
 // acp_session_id on the continuing task's request as loadSessionId. The fake ACP executor
 // captures B's request after A completes with hooks.session("sid-A"); assert the forwarded
 // id matches and the run completes.
@@ -723,7 +723,7 @@ test("scheduler forwards the executor's loadSettleMs only to a continuing task",
   app.store.close();
 });
 
-// T1 (ACP load branch): when loadSessionId is set and the agent advertises loadSession,
+// ACP load branch: when loadSessionId is set and the agent advertises loadSession,
 // AcpExecutor calls session/load (not session/new) and then one session/prompt, settling
 // with the parsed TaskResult. Inspect the captured transcript for both the load method
 // (and the absence of session/new) and the resulting completion.
@@ -807,7 +807,7 @@ test("AcpExecutor cancel interrupts the loadSettleMs wait without prompting", as
   assert.ok(!records.some((r) => (r as { type?: string; message?: { method?: string } }).type === "acp" && (r as { message: { method?: string } }).message.method === "session/prompt"));
 });
 
-// T1 (acp_load_unsupported): when loadSessionId is set but the agent does not advertise
+// Acp_load_unsupported: when loadSessionId is set but the agent does not advertise
 // loadSession, AcpExecutor must fail fast with a clear code rather than calling
 // session/load and crashing the runtime.
 test("AcpExecutor fails with acp_load_unsupported when loadSessionId is set but the agent does not advertise loadSession", async () => {
@@ -1132,7 +1132,7 @@ test("AcpExecutor fails with acp_thought_level_not_applied when the agent does n
   assert.ok(!sent.some((m) => m.method === "session/prompt"));
 });
 
-// T1 (continuation_unavailable): when the source task completes without persisting an
+// Continuation_unavailable: when the source task completes without persisting an
 // acp_session_id (e.g. an interactive executor that doesn't call hooks.session), the
 // continuing task's attempt must fail-fast with continuation_unavailable — never silently
 // fall back to a fresh session.
@@ -1159,9 +1159,9 @@ test("scheduler fails the continuing task with continuation_unavailable when the
   app.store.close();
 });
 
-// T2 (workflow validation): validateWorkflow accepts an ACP task with interactive:true
+// Workflow validation: validateWorkflow accepts an ACP task with interactive:true
 // (and normalizes it onto the TaskDef) but rejects it on a process task — interactive
-// is an ACP-only flag. Mirrors the T1 validateWorkflow test (lines 348-426): profiles
+// is an ACP-only flag. Like the session-continuation validateWorkflow test, profiles
 // are passed directly so each case pins a specific failure mode without disk I/O.
 test("validateWorkflow accepts interactive on ACP tasks and rejects it on process tasks", () => {
   const profiles: Record<string, ExecutorProfile> = {
@@ -1406,7 +1406,7 @@ test("retry max 0 turns the ACP retry off", async () => {
   app.store.close();
 });
 
-// T2 (executor multi-turn): the AcpExecutor loops session/prompt on one live session
+// Executor multi-turn: the AcpExecutor loops session/prompt on one live session
 // when request.interactive === true. Turn 1 is conversational ("need input"); turn 2
 // emits the envelope. The same agent connection takes both turns (two session/prompt
 // sends on one sessionId) and the attempt settles `completed` with the envelope output.
@@ -1461,11 +1461,11 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.ok(events.includes("acp_turn_completed"), "expected an acp_turn_completed lifecycle event");
 });
 
-// T2 (scheduler park→turn→complete): an ACP task with interactive:true whose fake
+// Scheduler park→turn→complete: an ACP task with interactive:true whose fake
 // executor issues one `turn` interaction via hooks.interact then completes after the
 // user answers. The scheduler must park the attempt as awaiting_input with kind="turn",
 // surface the interaction, and resume on answer(). Mirrors the existing ACP-interaction
-// park/answer test (lines 162-173) but with a `turn` interaction instead of `permission`.
+// park/answer test but with a `turn` interaction instead of `permission`.
 test("scheduler parks an interactive task awaiting a turn and completes on answer", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-turn-park-"));
   const workflow = { id: "turn", tasks: { talk: { executor: "agent", inputs: {}, prompt: "converse", interactive: true } } };
@@ -1482,10 +1482,10 @@ test("scheduler parks an interactive task awaiting a turn and completes on answe
   app.store.close();
 });
 
-// T2 (regression): the non-interactive single-shot path must be unchanged — a mock
+// Regression: the non-interactive single-shot path must be unchanged — a mock
 // agent emitting non-envelope prose ("hello") + end_turn must settle the attempt as
 // `failed` (the existing "ACP response must be exactly one JSON value" throw), and
-// must NOT park a `turn` interaction. Guards AC5: no silent behavior change.
+// must NOT park a `turn` interaction. No silent behavior change.
 test("non-interactive ACP task with non-envelope prose fails fast without suspending", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-acp-nonenv-")), script = join(root, "agent.mjs");
   await writeFile(script, `
@@ -1514,9 +1514,9 @@ if(m.method==='session/close')send({jsonrpc:'2.0',id:m.id,result:{}});
   assert.equal(interactCalls, 0);
 });
 
-// T3 (workflow validation): gate tasks are accepted (with normalized gate block) and every reject
-// variant the plan enumerates is surfaced as a clear invalid_task. Mirrors the T1 validateWorkflow
-// test (lines 348-426): profiles are passed in directly so each case pins a specific failure mode
+// Workflow validation: gate tasks are accepted (with normalized gate block) and every reject
+// variant is surfaced as a clear invalid_task. Like the session-continuation validateWorkflow
+// test, profiles are passed in directly so each case pins a specific failure mode
 // without disk I/O.
 test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
   const profiles: Record<string, ExecutorProfile> = { agent: { type: "acp", cwd: "/tmp", env: {}, run: ["agent"] } };
@@ -1599,7 +1599,7 @@ test("validateWorkflow accepts gate tasks and rejects invalid variants", () => {
   );
 });
 
-// T3 (gate park/answer/complete): a gate task after a dependency parks the attempt as
+// Gate park/answer/complete: a gate task after a dependency parks the attempt as
 // awaiting_input with kind:"gate", surfaces the interaction, and completes when the human
 // answers via interaction.answer. Mirrors the ACP interaction park/answer test at lines 162-173
 // but with a `gate` interaction instead of `permission`.
@@ -1640,7 +1640,7 @@ test("scheduler parks a gate task awaiting input and completes on answer", async
   app.store.close();
 });
 
-// T3 (gate with schema): a gate with a JSON Schema validates the answer. A valid answer
+// Gate with schema: a gate with a JSON Schema validates the answer. A valid answer
 // completes the gate, an invalid one raises invalid_interaction_response (same shape as other
 // interactions). Mirrors the ACP-interaction park/answer pattern.
 test("scheduler validates a gate answer against its schema", async () => {
@@ -1679,7 +1679,7 @@ test("scheduler validates a gate answer against its schema", async () => {
   app2.store.close();
 });
 
-// T3 (root gate): a gate task with no dependencies parks immediately on run start, then
+// Root gate: a gate task with no dependencies parks immediately on run start, then
 // completes when answered. Validates that the gate branch fires for the first ready task too.
 test("a root gate with no dependencies parks immediately on run start", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-gate-root-"));
@@ -1697,7 +1697,7 @@ test("a root gate with no dependencies parks immediately on run start", async ()
   app.store.close();
 });
 
-// T3 (recovery carve-out): a gate attempt inserted into the store with awaiting_input +
+// Recovery carve-out: a gate attempt inserted into the store with awaiting_input +
 // executorType:"gate" must survive a daemon restart. recover() does NOT mark it executor_lost —
 // it reconstructs the Pending entry from the persisted row + workflow definition. The answer
 // remains valid (the gate is answerable after recovery). Mirrors the recovery test at 211-217.
@@ -1726,7 +1726,7 @@ test("recover() preserves a gate attempt and reconstructs its interaction", asyn
   app.store.close();
 });
 
-// T3 (mixed recovery): a run with both a gate attempt (awaiting_input, executorType:"gate") and
+// Mixed recovery: a run with both a gate attempt (awaiting_input, executorType:"gate") and
 // a non-gate attempt (running, executorType:"process") recovers the gate and fails the non-gate.
 // The run's final state is waiting because the surviving gate is still active.
 test("recover() fails non-gate attempts but preserves gate attempts in the same run", async () => {
@@ -1759,7 +1759,7 @@ test("recover() fails non-gate attempts but preserves gate attempts in the same 
   app.store.close();
 });
 
-// T3 (gate input-resolution failure): a gate task whose `inputs` reference a path that does not
+// Gate input-resolution failure: a gate task whose `inputs` reference a path that does not
 // resolve against a completed dep's output fails synchronously at prepare() time. The attempt
 // is inserted with status: "failed" and error.code "input_resolution_failed", no Pending entry
 // is registered, and the run reaches "blocked" without ever producing a gate interaction.
@@ -1785,7 +1785,7 @@ test("a gate with an unresolvable input fails at prepare() rather than parking",
   app.store.close();
 });
 
-// T3 (recover() clears stale endedAt on non-terminal restoration): when a run arrives at recover()
+// Recover() clears stale endedAt on non-terminal restoration: when a run arrives at recover()
 // with endedAt set (because a prior shutdown() wrote it via failActiveLocked + skipGates:true),
 // and the recomputed run status is non-terminal ("waiting", because a gate survived), the run's
 // endedAt must be cleared — mirroring the symmetric advance() pattern. Without this, run.list /
@@ -1818,7 +1818,7 @@ test("recover() clears endedAt when restoring a mixed gate+non-gate run to waiti
   app.store.close();
 });
 
-// T3 (shutdown preserves gates): shutdown() does NOT mark gate attempts as daemon_shutdown —
+// Shutdown preserves gates: shutdown() does NOT mark gate attempts as daemon_shutdown —
 // the skipGates:true flag keeps them alive across a graceful shutdown. A fresh scheduler on
 // the same store recovers them and the human can still answer.
 test("shutdown() preserves gate attempts across restart", async () => {
@@ -1858,7 +1858,7 @@ test("shutdown() preserves gate attempts across restart", async () => {
   store2.close();
 });
 
-// T3 (gate output feeds downstream tasks): $tasks.<gate>.output resolves to the human's answer
+// Gate output feeds downstream tasks: $tasks.<gate>.output resolves to the human's answer
 // in a downstream task. Mirrors the diamond test's input-reference wiring but with a gate source.
 test("gate output is available as $tasks.<gate>.output to downstream tasks", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-gate-output-"));
@@ -1889,9 +1889,9 @@ test("gate output is available as $tasks.<gate>.output to downstream tasks", asy
 });
 
 
-// T4 (when validation matrix): validateWorkflow accepts well-formed when clauses (ref/equals/in/dep
-// checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the variants the
-// plan enumerates. Profiles are passed directly so each rejection pins a specific failure mode.
+// When validation matrix: validateWorkflow accepts well-formed when clauses (ref/equals/in/dep
+// checks, run-input ref with no deps, multi-clause AND, gate+when), and rejects the malformed
+// variants. Profiles are passed directly so each rejection pins a specific failure mode.
 test("validateWorkflow accepts when guards and rejects malformed variants", () => {
   const profiles: Record<string, ExecutorProfile> = {
     local: { type: "process", cwd: "/tmp", env: {} },
@@ -2007,7 +2007,7 @@ test("validateWorkflow accepts when guards and rejects malformed variants", () =
   );
 });
 
-// T4 (N-way decider): an upstream decide task picks a route; three branches each gate on a different
+// N-way decider: an upstream decide task picks a route; three branches each gate on a different
 // value. Exactly one branch runs, the other two skip, and the run completes (not blocked).
 // Uses the local process executor with an echo script that emits {outcome,output:<inputs>}.
 test("scheduler runs only the matching branch of an N-way decider and skips the rest", async () => {
@@ -2069,7 +2069,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{lane:data.r
   app.store.close();
 });
 
-// T4 (cascade via guard referencing a skipped output): a1's guard references decide.output.route;
+// Cascade via guard referencing a skipped output: a1's guard references decide.output.route;
 // a2's guard references a1.output. If decide.output.route != "a", a1 skips; a2's guard then
 // references a skipped dep, so the cascade short-circuits and a2 also skips.
 test("scheduler cascades a skip through a guard referencing a skipped output", async () => {
@@ -2108,7 +2108,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{x:1,route:d
   app.store.close();
 });
 
-// T4 (no-guard join past a skipped sibling): a1 has a guard and skips; keep has NO guard and
+// No-guard join past a skipped sibling: a1 has a guard and skips; keep has NO guard and
 // references decide (not a1) so it runs past the skip and completes.
 test("a no-guard task runs past a skipped sibling it does not reference", async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-noguard-join-"));
@@ -2145,7 +2145,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   app.store.close();
 });
 
-// T4 (no-guard task referencing a skipped output fails): convention violation surface. a1 skips;
+// No-guard task referencing a skipped output fails: convention violation surface. a1 skips;
 // join has no guard and references a1.output -> input_resolution_failed at prepare() time. Run
 // reaches blocked, not completed.
 test("a no-guard task referencing a skipped output fails with input_resolution_failed", async () => {
@@ -2184,7 +2184,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   app.store.close();
 });
 
-// T4 (missing path -> skip, never throws): decide.output lacks `flavor`; b's guard references
+// Missing path -> skip, never throws: decide.output lacks `flavor`; b's guard references
 // $tasks.decide.output.flavor. walk() returns undefined for the missing path, the clause is
 // false, b skips. Run completes (not blocked).
 test("a guard referencing a missing path causes the task to skip (not fail)", async () => {
@@ -2217,7 +2217,7 @@ console.log(JSON.stringify({outcome:'completed',message:'ok',output:{route:data.
   app.store.close();
 });
 
-// T4 (run-input guard): a single task with no deps and a guard on $run.input. Two separate runs
+// Run-input guard: a single task with no deps and a guard on $run.input. Two separate runs
 // (different workflow ids because one active run per workflow), one with mode:slow -> skip, one
 // with mode:fast -> complete.
 test("a run-input guard decides on the run input and skips or completes accordingly", async () => {
@@ -3184,7 +3184,7 @@ class InteractiveExecutor implements Executor<AcpRequest> {
   }
 }
 
-// T2 helper: like InteractiveExecutor but emits a `turn` interaction instead of a
+// Like InteractiveExecutor but emits a `turn` interaction instead of a
 // `permission` interaction. The validate function passes the answer through as-is so
 // the scheduler sees the user's next-turn text in the resulting TaskResult.output.
 class TurnInteractionExecutor implements Executor<AcpRequest> {
