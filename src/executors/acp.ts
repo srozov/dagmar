@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { existsSync } from "node:fs";
 import { Readable, Writable } from "node:stream";
 import { setTimeout as delay } from "node:timers/promises";
 import { client, CreateElicitationRequest, methods, ndJsonStream, PROTOCOL_VERSION, RequestError, type ClientConnection, type ClientContext, type CreateElicitationResponse, type PromptResponse, type RequestPermissionRequest, type RequestPermissionResponse, type SessionConfigOption, type SessionNotification } from "@agentclientprotocol/sdk";
@@ -83,11 +84,15 @@ class Attempt {
 
   private async run(): Promise<Settlement> {
     try {
-      // A command that cannot be started (not found, not executable) says so with an 'error' event,
-      // not by throwing from spawn(); unheard, that event would take the daemon down.
+      // A command that cannot be started (not found, not executable, or its cwd missing) says so with an
+      // 'error' event, not by throwing from spawn(); unheard, that event would take the daemon down.
       try {
         await this.spawned;
       } catch (error) {
+        // A missing cwd is also ENOENT, and Node's message names only the command.
+        if ((error as NodeJS.ErrnoException).code === "ENOENT" && !existsSync(this.request.cwd)) {
+          return { error: { code: "acp_spawn_failed", message: `ACP agent cwd ${this.request.cwd} does not exist` } };
+        }
         return errorValue("acp_spawn_failed", error);
       }
       await this.hooks.transcript({
@@ -400,6 +405,8 @@ class Attempt {
       this.child.stdin.end();
       await terminate(this.child, this.closed);
       await this.stderrDone.catch(() => undefined);
+      // A process that never started has no exit to record.
+      if (this.child.pid === undefined) return;
       try {
         await this.hooks.transcript({
           type: "lifecycle",
