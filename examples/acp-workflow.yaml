@@ -36,7 +36,7 @@ executors:
     #   envFile: /absolute/path/to/provider.env
     #   (ANTHROPIC_BASE_URL=https://provider.example/anthropic and ANTHROPIC_AUTH_TOKEN=<key>)
     # An `env` block in a Claude settings file overrides this environment. Check the model values
-    # the agent offers under that provider (scratchpad/probe-acp-agent.mjs) before setting `model`.
+    # the agent offers under that provider (scripts/probe-acp-agent.mjs) before setting `model`.
 
 tasks:
   identify:

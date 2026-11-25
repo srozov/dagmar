@@ -1,5 +1,8 @@
 # Dagmar
 
+[![CI](https://github.com/srozov/dagmar/actions/workflows/ci.yml/badge.svg)](https://github.com/srozov/dagmar/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Dagmar** /ˈdɑːɡ.mɑːr/ — from Old Norse *dag* (day) and *mær* (maiden): the orchestrator of purposeful flow.
 
 **D A G M A R** stands for **Directed Acyclic Graph Manager And Runner**.
@@ -12,46 +15,16 @@ Dagmar coordinates work; agents retain their own models, tools, skills, sessions
 
 Use Dagmar when you need durable task state, explicit handoffs, and operator control around a small set of agent or process steps.
 
-## What Dagmar provides
+## Features
 
-- A small YAML language for static task graphs, with guards, human gates, and bounded reruns.
-- ACP and local-process executors, declared in each workflow.
-- Concurrent execution of independent ready tasks.
-- A CLI and loopback API for run control, live observation, and ACP interactions.
-- A SQLite run ledger and an append-only JSONL transcript for each task attempt.
+- **Task graphs in YAML:** dependencies, `when` guards, human gates, bounded reruns, and map tasks that run once per item of a list.
+- **Two executors:** [Agent Client Protocol](https://agentclientprotocol.com) agents and local processes, declared in each workflow, with the model, mode, effort and tool set chosen per ACP executor.
+- **Agent sessions:** a task can continue an earlier task's session, and interactive tasks hold a conversation with a person.
+- **Concurrency:** independent ready tasks run at the same time.
+- **Operator control:** a CLI and a loopback JSON-RPC API to start, watch, cancel and resume runs, and to answer agent permission and input requests.
+- **Durable state:** a SQLite ledger of runs and attempts, an append-only JSONL transcript per attempt, and gates that survive a restart.
 
-## Requirements
-
-- Node.js 24 (the supported range is `>=24 <25`)
-- pnpm 12
-
-## Install and build
-
-```sh
-pnpm install --frozen-lockfile
-pnpm build
-```
-
-For development, run `pnpm check` for type checking and `pnpm test` for the test suite.
-
-## Configure Dagmar
-
-The daemon reads `~/.config/dagmar/config.yaml` by default. Pass `--config <path>` to `dagmard` or `dagmar` to use another file.
-
-```yaml
-workflowDir: /absolute/path/to/workflows
-storageDir: /absolute/path/to/dagmar-state
-
-listen:
-  host: 127.0.0.1
-  port: 7331
-```
-
-Both directory paths must be absolute. The server accepts only the loopback hosts `127.0.0.1` and `::1`. The daemon reads the config once at start. Executors are not configured here: each workflow declares its own.
-
-## Define a workflow
-
-Place YAML files in `workflowDir`. A workflow has a unique ID, the executors its tasks use, and a non-empty mapping of task IDs to tasks:
+## Example
 
 ```yaml
 id: process-example
@@ -78,137 +51,57 @@ tasks:
       collected: $tasks.collect.output
     prompt: |
       Assess the collected information.
-    session:
-      mode: fresh
 ```
 
-An executor has a `type`, `process` or `acp`, and may set:
+`collect` runs a local script on the run's input. Once it completes, `assess` sends its output to an ACP agent with a prompt. Each task ends with a JSON result (`outcome`, `message`, `output`) that later tasks read through `$tasks.<id>.output`.
 
-- `cwd`, an absolute path where its tasks run. Without one, they run in the run's directory, given when the run starts (`--cwd`). A workflow that leaves `cwd` out can serve any repository of its kind; one that always works in one place sets it.
-- `env`, string values added to the daemon's environment.
-- `envFile`, the absolute path of a `KEY=VALUE` file read each time one of the executor's tasks starts. Its values go between the daemon's environment and `env`, so a secret stays out of the workflow file and reaches only the executors that name the file. An unreadable file fails the task with `env_file_unreadable`.
+## Quick start
 
-An ACP executor also requires `run`, the command that starts its agent, and may set `model`. Dagmar applies the model through the agent's ACP model selector (`session/set_config_option`) on every new or loaded session, and fails the attempt if the agent has no model selector (`acp_model_unsupported`), does not offer that exact value (`acp_model_unknown`, the error lists the offered values), or does not switch (`acp_model_not_applied`).
-
-An ACP executor may likewise set `mode`, applied the same way through the agent's ACP mode selector (the config option with category `mode`), failing with `acp_mode_unsupported`, `acp_mode_unknown` or `acp_mode_not_applied`. For `claude-agent-acp` the mode is its permission mode (for example `acceptEdits` accepts file edits without asking).
-
-An ACP executor may also set `effort`, applied the same way through the agent's config option with category `thought_level`, after the model, because the levels the agent offers depend on the model. It fails with `acp_thought_level_unsupported`, `acp_thought_level_unknown` or `acp_thought_level_not_applied`. Dagmar sets the effort even when the agent already shows that value, since an agent may show an effort it does not apply. For `claude-agent-acp` the levels are those of the selected model, for example `low`, `medium` and `high`; its `default` level removes the pin and leaves the effort to the agent again. Without `effort`, the agent picks its own.
-
-An ACP executor may also set `tools`, the tools its agent is offered, by name: built-in tools such as `Read` or `Grep`, and MCP tools as `mcp__<server>__<tool>`. Every listed tool runs without a permission request. Dagmar passes the list on every new or loaded session through `claude-agent-acp`'s session options (`_meta.claudeCode.options`), so it needs that agent: any other agent, which would ignore the options and offer every tool, fails the attempt before the session with `acp_tools_unsupported`. The session is recorded with an `acp_tools_selected` transcript event. No unlisted built-in tool is offered. Claude Code narrows MCP tools only by server, so the list keeps the MCP servers it names, from the user's or the project's settings, and drops every other server and the tools a Claude Code plugin registers; a kept server offers all its tools, and its unlisted ones ask for permission as before. A list with no MCP tool drops every MCP server. `tools: []` offers no tool at all. Dagmar keeps the named servers through Claude Code's policy-tier `allowedMcpServers` setting, which Claude Code ignores on a machine whose administrator manages Claude Code settings, so there the other servers stay offered. Without `tools`, the agent offers the tools its settings give it, as before. Two executors with different lists can share a working directory, each with its own tool set.
-
-Executors that differ only in `model`, `mode`, `effort` or `tools` are the same agent, so one can `continue` the other's session.
-
-To run the same tasks with other executors, for example another provider for the agents that share a session, write a second workflow file. Dagmar reads workflows from disk on every step, so a new or edited workflow needs no restart; an edit also applies to the workflow's active runs from their next task, so do not change a workflow's executors while it has active runs. Reading a run (`run.get`, `status`) does not depend on the file: a task the file no longer has, renamed or removed, still shows with its stored attempts, with no dependencies and the state of its latest attempt, and the run's other tasks keep the state of theirs. A step that would run or settle tasks against such a workflow does not go on: `resume`, `answer` and `cancel-task` fail, and an active run's next step blocks the run, with `workflow_definition_unavailable` naming the tasks the file lacks.
-
-A task's `executor` names one of its workflow's executors. A process task requires `run` and cannot use `prompt`, `session` or `interactive`; an ACP task requires `prompt` and cannot use `run`. Dependencies must exist and form an acyclic graph. Independent dependency-ready tasks run concurrently.
-
-Input values may be literals or references:
-
-- `$run.input` and `$run.input.key` read the input supplied when the run starts.
-- `$run.id` reads the run's id, as `runs` and `status` show it; it is the same in every task of the run and in every item of a map task. Any other `$run.<name>` fails validation with `invalid_input_reference`.
-- `$tasks.<task-id>.output` and `$tasks.<task-id>.output.key` read a dependency's output.
-- `$item` and `$item.key` read the item of a map task (see `map` below).
-
-A reference must be the whole value of a top-level input. A reference string anywhere inside an object or array value (for example `gaps: { a: $tasks.collect-a.output.gaps }`) fails validation with `invalid_input_reference`, naming the input and the path; lift each such value to its own top-level input instead. Objects and arrays of literals pass through unchanged.
-
-A task may also declare `outputSchema`, a JSON Schema applied to its `output`. An output that does not match fails with `output_validation_failed`, whose message names each violation by path, such as `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
-
-An ACP task starts a new agent session unless it sets `session: { mode: continue, from: <task-id> }`, which loads that task's session through ACP `session/load`. The source must be a dependency (`invalid_dependency`) and an ACP task whose executor has a byte-identical `run` (`invalid_task`); `model`, `mode`, `effort` and `tools` may differ. The attempt fails with `acp_load_unsupported` if the agent cannot load sessions, or `continuation_unavailable` if the source has no recorded session (for example, it was skipped). `session: { mode: fork }` is rejected (`unsupported_session_mode`).
-
-An agent may answer `session/load` before its own MCP servers have connected. `claude-agent-acp` connects the stdio servers of a project `.mcp.json` in the background, and a first prompt sent in that window can tell the model that those servers' tools were removed. ACP offers no readiness signal, so an ACP executor may set `loadSettleMs` (an integer from 1 to 120000): a continuing task on that executor waits that long after `session/load`, recorded as an `acp_load_settle` transcript event, before its first prompt. New sessions do not wait, and cancelling the task interrupts the wait. Set it above the slowest server's connection time.
-
-An agent can fail a task with a transient error before it has done anything, for example when it cannot confirm the selected model with its API. Dagmar runs such a task again, by default up to 2 times, 300 seconds apart. An ACP executor may set its own `retry: { max, delaySeconds }` (non-negative integers); `retry: { max: 0, delaySeconds: 0 }` turns retries off. A retry applies only when the agent answered one of Dagmar's requests (session setup, model, mode or effort selection, or the prompt) with an error before its first tool call, output (message, thought or plan), permission request or elicitation, so no work is left to undo; the error's text does not matter. The failed attempt stays `failed` in the task's attempt history, and a new attempt starts after `delaySeconds`, recorded as an `attempt_retry` transcript event. After `max` retries the task fails as before. A failure after any work, a lost connection, or `acp_authentication_required` is never retried. Cancelling the task interrupts the wait. A daemon restart during the wait fails the new attempt with `executor_lost`, and a `resume` starts the retry count again.
-
-An ACP task with `interactive: true` is a human-driven conversation. Each agent reply that is not a result parks the task as `awaiting_input` with a `turn` interaction carrying the reply in `request.message`; answer with the next message as a non-empty JSON string, for example `dagmar answer <interaction-id> --json '"Add a test"'`. The task ends when the agent replies with a result. Interactive tasks are live-only: a daemon restart fails the attempt with `executor_lost`, and `resume` starts a new attempt.
-
-A task with `gate: { prompt, schema? }` instead of `executor` waits for a human decision; it cannot use `prompt`, `run`, `session`, `interactive`, `outputSchema`, `rerun` or `map`. When it becomes ready it parks as `awaiting_input` with a `gate` interaction showing its prompt and schema. `dagmar answer <interaction-id> --json <value>` completes it with that value as its `output`; a value that does not match `schema` is rejected and the gate stays pending. A pending gate is persisted and survives a daemon restart, after which `dagmar pending` lists it under a new interaction ID.
-
-`when` guards a task with a list of clauses, all of which must hold. Each clause has a `ref` to `$run.input…` or `$tasks.<dependency>.output…` and exactly one of `equals` (a JSON value) or `in` (a non-empty array of JSON values), compared by JSON equality; other shapes fail validation with `invalid_guard`. If a clause is false when the task's dependencies settle, the task is `skipped` instead of run. A missing path, or a reference to a skipped task, makes a clause false. A skipped task counts as settled for its dependants, but an unguarded input reference to its output fails with `input_resolution_failed`. A run completes when every task is `completed` or `skipped`.
-
-`rerun: { from, max, atMax?, when? }` makes a task (the source) rerun the run from `from`, a task upstream of it (`invalid_rerun` otherwise). The rerun is not a dependency edge, so the graph stays acyclic. Each time the source completes and asks for a rerun, `from` runs again, and every task downstream of it that was already decided is decided again, in dependency order, on the new outputs, the source included. Nothing waits for a rerun: a task is decided as soon as its dependencies are, and decided again after each rerun, so guard the tasks after `from` that must not run on an intermediate result (for example `passed = true` after a `verify` that `fixup` reruns from). Several tasks may rerun from the same task.
-
-Without `rerun.when`, every completion asks for a rerun. `rerun.when` is a list of clauses like `when`'s, read from the source's own output once it has completed (`$tasks.<source>.output…` only, `invalid_rerun` otherwise); the source asks for a rerun only when all of them hold, and otherwise the run goes on to the tasks after it.
-
-A source asks for at most `max` reruns per run; only completed attempts that asked count, and `resume` continues the count. A rerun asked for beyond `max` is not done. By default the source's attempt then ends `blocked` with `rerun_exhausted`, and so does the run; with `atMax: proceed` the run goes on to the tasks after the source instead. Without `rerun.when`, Dagmar knows before the source runs that it would ask, so a source that has used up `max` is not run again: its attempt is `blocked`, or `skipped` with `atMax: proceed`, and a `resume` blocks the run again at once. With `rerun.when`, the source runs and its completed attempt is `blocked`, keeping its output, or stays `completed` with `atMax: proceed`.
-
-In a review workflow, `fixup` reruns from `verify` while verification fails; `changed`, a check after the reviews, reruns from `verify` when they changed something (`rerun.when` on its `changed` output, and `atMax: proceed`, so the gate gets the change at the max); and `revise` after the gate reruns from `verify` too. Each new commit goes through verification and the reviews again.
-
-In `examples/review-iteration-loop.yaml`, `fixup` continues `implement`'s session and reruns from `verify` while verification fails, at most three times:
-
-```yaml
-  fixup:
-    executor: builder
-    dependsOn: [verify, implement]
-    inputs: { report: $tasks.verify.output }
-    prompt: |
-      Verification failed; the report is in the inputs. Fix the change so the checks pass.
-    session: { mode: continue, from: implement }
-    when: [{ ref: $tasks.verify.output.passed, equals: false }]
-    rerun: { from: verify, max: 3 }
-```
-
-The same workflow also uses a gate and an interactive task. `docs/mvp-acceptance.md` is its runbook, including its sharp edges.
-
-`map: { over, key, concurrency }` runs a task once per item of a list known only at run time, for example one review per document:
-
-```yaml
-  review:
-    executor: reviewer
-    dependsOn: [list]
-    map: { over: $tasks.list.output.docs, key: id, concurrency: 3 }
-    inputs: { doc: $item }
-    prompt: |
-      Review the document in your inputs.
-```
-
-All three fields are required. `over` reads `$tasks.<dependency>.output…` or `$run.input…` and must resolve to a list of objects whose `key` field is a non-empty string, unique in the list; otherwise the task fails before any item starts, with `map_items_invalid`. `$item` and `$item.<path>` read the item, in a map task's `inputs` only. Each item runs as an attempt of its own, with its own session, transcript and status, and `outputSchema` applies to each item's output. At most `concurrency` items are active at once, those waiting for an answer included; they start in list order, the next one whenever one ends. The task's output is `{ "<key>": <item output> }`, so a later task reads every item's result from `$tasks.review.output`. An empty list completes the task at once with `{}`. `when` guards the whole task.
-
-An item that fails, blocks or is cancelled (`cancel-task` on its attempt) leaves the others running. Once every item has ended, the task completes, or ends `blocked` with `map_items_incomplete` if any item did not complete. The task keeps one attempt of its own per round, with `item: null`; its items' attempts are listed with it in the task's `attempts`, each with its `item` key and the round's `roundId`, and take the task's next attempt numbers. `resume` continues the round and runs only the items that did not complete, also after a daemon restart or a cancelled run; `resume --from <map task>`, or a rerun from upstream of it, starts a new round with every item. The task's own attempt cannot be cancelled (`invalid_task_state`): cancel its items or the run. While a map runs, its run is `running`, even when its active items wait for answers; an item's interactions and `task.status_changed` events carry its `item`. A map task cannot `rerun` or `continue` a session, and no task can continue a map task's session (`invalid_map`). Maps do not nest.
-
-## Process task contract
-
-Dagmar writes the resolved task inputs as one JSON value to the process's standard input. The process must write exactly one JSON result to standard output and exit with status 0:
-
-```json
-{
-  "outcome": "completed",
-  "message": "Human-readable summary",
-  "output": {}
-}
-```
-
-`outcome` may be `completed` or `blocked`; all three fields are required. Standard error is captured in the task transcript; when the process exits non-zero or its standard output is missing or not one JSON value, the attempt's error message also ends with the last non-empty lines of standard error (at most 500 characters, cut from the front). A process killed by a signal fails with `Process was killed by <signal>`.
-
-An ACP task's agent returns the same JSON result as its final message; earlier messages in the turn (progress notes between tool calls) are ignored. If that final message is not a valid result, Dagmar sends one repair prompt on the same session asking for only the corrected result (transcript event `acp_result_repair`). A second invalid result fails the attempt. Interactive tasks treat a non-result reply as conversation instead.
-
-The repository includes a runnable process example at `examples/process-workflow.yaml`. Its helper program is `examples/process-result.mjs`.
-
-## Run the daemon and CLI
-
-Start the daemon in one terminal:
+Dagmar needs Node.js 24 and pnpm 12.
 
 ```sh
-pnpm dev:daemon -- --config /absolute/path/to/config.yaml
+git clone https://github.com/srozov/dagmar.git
+cd dagmar
+pnpm install --frozen-lockfile
+pnpm build
 ```
 
-Then use the CLI from another terminal:
+Write a config that serves the repository's examples, with absolute paths:
+
+```yaml
+# config.yaml
+workflowDir: /absolute/path/to/dagmar/examples
+storageDir: /absolute/path/to/dagmar-state
+listen: { host: 127.0.0.1, port: 7331 }
+```
+
+Start the daemon, then run the process example from another terminal in the checkout:
 
 ```sh
-pnpm dev:cli -- --config /absolute/path/to/config.yaml ping
-pnpm dev:cli -- --config /absolute/path/to/config.yaml workflows
-pnpm dev:cli -- --config /absolute/path/to/config.yaml run process-example --cwd . --input-json '{"request":"hello"}'
+node dist/daemon.js --config config.yaml
 ```
 
-`run <workflow-id> [--cwd <dir>] [--input <text> | --input-json <json>]` starts a run. `--cwd` gives the run's directory for every executor without its own `cwd`; a relative path resolves in the shell's current directory, and the daemon receives an absolute path (`run.start`'s `cwd` param). Starting fails with `cwd_required` if an executor needs a directory and none is given, with `cwd_unused` if every executor has its own, and with `invalid_params` if the path is not an existing directory. A workflow has at most one active run per directory (`active_run_exists`), so it can run on several repositories at once; runs without a directory count as one. `runs` and `status` show each run's `cwd`.
+```sh
+node dist/cli.js --config config.yaml run process-example --cwd . --input-json '{"hello":"world"}'
+node dist/cli.js --config config.yaml status <workflowRunId>
+```
 
-The CLI also supports `workflow <id>`, `runs`, `status <run-id>`, `watch <run-id>`, `resume <run-id> [--from <task>]`, `cancel <run-id>`, `cancel-task <task-run-id>`, `pending`, `answer <interaction-id> --json <value>`, and `transcript <task-run-id> [--after-line <number>]`.
+## Documentation
 
-`cancel <run-id>` ends a `running`, `waiting` or `blocked` run as `cancelled`, for example a run blocked at a rerun's max. It stops the run's active attempts, keeps its other attempts as they are, and shows the tasks that never started as `cancelled`. A completed run cannot be cancelled.
+- [Workflows](docs/workflows.md): the workflow language, from executors and inputs to guards, gates, reruns and map tasks.
+- [Executors](docs/executors.md): the process and ACP executors, the task result, and the ACP retry.
+- [Running Dagmar](docs/cli.md): configuration, the daemon, the CLI, and cancelling and resuming runs.
+- [Design](docs/design.md): contracts, persistence, the scheduler, recovery and the JSON-RPC API.
+- [Examples](examples/README.md), including a review loop with a builder agent, a reviewer agent and a human gate, and [its runbook](docs/mvp-acceptance.md).
 
-`resume <run-id>` continues a `blocked` or `cancelled` run where it stopped: its blocked, failed and cancelled tasks get a new attempt, the tasks that never started start, and completed tasks keep their results. `resume <run-id> --from <task>` also runs `<task>` again, whatever its state, and then every task downstream of it, as after a rerun; the other tasks keep their results. It works on a `completed`, `blocked` or `cancelled` run whose `<task>` has all its dependencies completed or skipped (`run.resume`'s `from` param), so a finished run can redo its last steps without repeating the ones before. The new attempts join each task's attempt history, `when` guards read the run's own input, and rerun sources keep their counts. Resuming fails with `active_run_exists` if the workflow already has another active run in the same directory.
+## Development
 
-The daemon persists a SQLite ledger and JSONL task-attempt transcripts under `storageDir`.
+```sh
+pnpm check   # type-check src and tests
+pnpm test    # run the test suite
+pnpm build   # compile to dist/
+```
 
-## v0 scope
+## License
 
-Dagmar supports static task graphs with `when` guards, human gates, interactive ACP tasks, bounded reruns and map tasks; local-process and ACP execution, including continuing an earlier task's ACP session; manual cancellation and resume; and ACP permission/input interactions. It intentionally does not include scheduling, task timeouts, automatic retries other than the ACP retry of an attempt that failed before doing any work, concurrency limits across tasks, nested maps or other dynamic tasks, session forking, distributed workers, or automatic redaction of child-process output.
+[MIT](LICENSE)

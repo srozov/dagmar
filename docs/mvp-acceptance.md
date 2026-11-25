@@ -70,7 +70,7 @@ dagmar dependency); it reuses the host's Claude login (`~/.claude`):
 mkdir -p ~/.local/share/dagmar-agents && cd ~/.local/share/dagmar-agents
 echo '{"private":true,"dependencies":{"@agentclientprotocol/claude-agent-acp":"0.84.0"}}' > package.json
 pnpm install
-node "$DAGMAR/scratchpad/probe-acp-agent.mjs" --agent "$PWD/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+node "$DAGMAR/scripts/probe-acp-agent.mjs" --agent "$PWD/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
 ```
 
 The probe prints the protocol version (must match dagmar's), `loadSession: true`, and the offered
@@ -80,7 +80,7 @@ model values.
 starting (a red baseline makes verify meaningless):
 
 ```bash
-git -C "$DAGMAR" worktree add "$TARGET" -b claude/t6-acceptance-target main
+git -C "$DAGMAR" worktree add "$TARGET" -b acceptance-target main
 (cd "$TARGET" && pnpm install --frozen-lockfile && pnpm test)
 ```
 

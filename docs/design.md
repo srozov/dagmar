@@ -1,12 +1,14 @@
-# Dagmar v0 — Implementation Plan
+# Design
 
-This plan is kept in step with the code: it describes Dagmar v0 as it is built,
-and it is the specification for run and task lifecycle, recovery and shutdown.
-`README.md` is the reference for the workflow language and the CLI.
+This document specifies how Dagmar works: its contracts, persistence,
+scheduler, run and task lifecycle, recovery and shutdown, and API. It is kept in
+step with the code. The workflow language, the executors and the CLI are
+documented in [workflows.md](workflows.md), [executors.md](executors.md) and
+[cli.md](cli.md).
 
-## Objective
+## Overview
 
-Build the smallest useful headless DAG runtime in TypeScript.
+Dagmar is a small headless DAG runtime in TypeScript.
 
 Dagmar loads static YAML workflows, runs dependency-ready tasks concurrently,
 executes tasks through either ACP or a direct local process, validates a
@@ -14,9 +16,9 @@ universal task result, and persists run and attempt state in SQLite. A
 JSON-RPC 2.0 API over one loopback WebSocket exposes everything needed by the
 CLI and a future dashboard's DAG view.
 
-## v0 boundaries
+## Scope
 
-Implement:
+Dagmar provides:
 
 - static dependency DAGs, with `when` guards, human gates, bounded reruns and
   map tasks;
@@ -31,7 +33,7 @@ Implement:
 - ACP permission/input handling through the CLI;
 - a manually started daemon, WebSocket JSON-RPC API, and thin CLI.
 
-Do not implement:
+It deliberately leaves out:
 
 - cron or scheduling;
 - task timeouts, or automatic retries of an attempt that did any work;
@@ -46,9 +48,9 @@ Do not implement:
 - an OpenClaw plugin, dashboard UI, or domain-specific integration;
 - automatic secret redaction of child-process output.
 
-## 1. Create the package
+## 1. Package
 
-Create one package:
+One package:
 
 ```text
 dagmar/
@@ -88,15 +90,15 @@ Development dependencies:
 - required Node and WebSocket type packages only
 
 Use Node built-ins for SQLite, child processes, files, UUIDs, signals, and the
-test runner. Add scripts for `tsc` compilation, type checking of `src` and
-`test`, and `tsx` development execution. Do not add a bundler, web framework,
+test runner. Scripts cover `tsc` compilation, type checking of `src` and
+`test`, and `tsx` development execution. There is no bundler, web framework,
 ORM, CLI framework, or executor framework.
 
-## 2. Define and validate the contracts
+## 2. Contracts
 
 ### Universal task result
 
-Create `result.schema.json` for exactly:
+`result.schema.json` defines exactly:
 
 ```json
 {
@@ -205,7 +207,7 @@ Validate a file whenever it is read:
 
 Multiple root tasks and multiple terminal tasks are valid.
 
-## 3. Load machine-local configuration
+## 3. Configuration
 
 Read `~/.config/dagmar/config.yaml`, overridable with
 `dagmard --config <path>` and `dagmar --config <path>`:
@@ -225,14 +227,14 @@ start. Executors are not configured here: each workflow declares its own, so a
 workflow file is complete in itself.
 
 The API and ledger expose the executor name, not environment values or the
-merged environment object. v0 does not inspect or redact secrets that a child
+merged environment object. Dagmar does not inspect or redact secrets that a child
 itself writes to stdout or stderr.
 
-## 4. Implement persistence and transcripts
+## 4. Persistence and transcripts
 
 ### SQLite ledger
 
-Implement this schema in `store.ts`:
+`store.ts` holds this schema:
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -308,7 +310,7 @@ transactions.
 
 ### JSONL transcripts
 
-Implement transcript ownership separately in `transcript.ts`. Every attempt
+`transcript.ts` owns transcripts, apart from the store. Every attempt
 gets:
 
 ```text
@@ -328,7 +330,7 @@ Requirements:
 
 SQLite stores validated results and scheduler state, not transcript events.
 
-## 5. Implement input resolution
+## 5. Input resolution
 
 Every task has an explicit `inputs` mapping. Support literal JSON values and
 only these exact reference forms:
@@ -356,7 +358,7 @@ For ACP, append the resolved input object as JSON after the authored prompt.
 For a process, serialize the same object to stdin and close stdin. Do not
 interpolate values into prompts or command arguments.
 
-## 6. Implement the executor interface
+## 6. Executors
 
 Define one small internal adapter contract that can start an attempt, report
 completion or failure, surface ACP interactions, cancel the concrete
@@ -448,7 +450,7 @@ failure as retryable; every other failure is final.
 On cancellation, send ACP `session/cancel`, close the protocol connection,
 then use the same two-second `SIGTERM`/`SIGKILL` process-group fallback.
 
-## 7. Implement the scheduler
+## 7. Scheduler
 
 Use an event-driven scheduler with per-workflow-run in-memory serialization.
 Advance a run after:
@@ -540,7 +542,7 @@ only the items whose latest attempt in the round did not complete. With `from`
 on the map task, or after a rerun upstream of it, a new round runs every item.
 
 Resume reads the current workflow YAML. Exact historical workflow definitions
-are not retained in v0.
+are not retained.
 
 ### Cancellation
 
@@ -554,7 +556,7 @@ dependants cannot start; the workflow eventually becomes `blocked` and can be
 resumed. A map task's own attempt cannot be cancelled: cancel its items or the
 run.
 
-## 8. Implement startup recovery and shutdown
+## 8. Recovery and shutdown
 
 On daemon startup, find attempts left in `running`, `awaiting_permission`, or
 `awaiting_input`.
@@ -579,15 +581,15 @@ On `SIGINT` or `SIGTERM`:
 5. Close SQLite and the WebSocket server.
 
 A hard crash may leave child processes behind. Do not add PID persistence or
-orphan adoption in v0.
+orphan adoption.
 
-## 9. Implement RunView, events, and JSON-RPC
+## 9. RunView, events and JSON-RPC
 
 Run `dagmard` on the configured loopback WebSocket. Implement JSON-RPC 2.0
 request/response correlation and server notifications over the same
 connection.
 
-Implement exactly these methods:
+The API has exactly these methods:
 
 ```text
 system.ping
@@ -731,7 +733,7 @@ the cursor is unavailable after a restart or buffer rollover, return
 `cursor_unavailable`. The client then rebuilds from `run.get` and
 `transcript.read`. Do not persist an events table.
 
-## 10. Implement the CLI as an API client
+## 10. CLI
 
 The CLI contains no scheduler or executor logic. It connects to `dagmard` and
 uses the same JSON-RPC methods as future dashboard clients.
@@ -802,7 +804,7 @@ ACP servers:
 Confirm each creates a fresh native ACP session, returns a validated TaskResult,
 records the ACP transcript, and terminates its ACP server process. If supported
 by the server, trigger one permission or input request and answer it through
-`dagmar pending` / `dagmar answer`. `docs/mvp-acceptance.md` is the runbook for
+`dagmar pending` / `dagmar answer`. [mvp-acceptance.md](mvp-acceptance.md) is the runbook for
 a full review loop on real agents.
 
 ### Recovery/API smoke
@@ -819,17 +821,3 @@ Confirm:
   pending gates, and allows explicit resume;
 - `watch`, transcript reads, event subscription/unsubscription, and
   `cursor_unavailable` behave as specified.
-
-## Definition of done
-
-Dagmar v0 is complete when:
-
-- the package builds with `tsc` and runs in development with `tsx`;
-- both schemas and workflow validation are active;
-- the exact two-table SQLite ledger and per-attempt JSONL transcripts work;
-- dependency-ready process and ACP tasks execute concurrently;
-- results, failure, waiting, cancellation, resume, startup recovery, and
-  graceful shutdown follow this plan;
-- the complete JSON-RPC surface and thin CLI work;
-- both target ACP servers and the local-process smokes pass;
-- no deferred v0 features or domain-specific behavior were added.

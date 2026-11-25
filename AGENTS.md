@@ -20,7 +20,7 @@ These are implementation constraints, not slogans. Apply them by default.
 - **DRY, after the rule of three:** Keep small local duplication when it is clearer. Extract a shared utility only after the pattern has appeared at least three times and stabilized.
 - **Focused boundaries:** Keep modules responsible for one concern. Use narrow interfaces; do not create god modules that mix scheduling policy, transport, persistence, and executor behavior.
 - **Fail fast and explicitly:** Surface unsupported or unsafe states with clear errors. Never silently swallow failures, broaden permissions, or introduce an undocumented fallback.
-- **Lifecycle safety:** Never mutate non-terminal persisted run or task state solely because it appears stale or its owner is ambiguous. Follow the explicit recovery and lifecycle rules in the repository specification instead.
+- **Lifecycle safety:** Never mutate non-terminal persisted run or task state solely because it appears stale or its owner is ambiguous. Follow the explicit recovery and lifecycle rules in the repository specification (`docs/design.md`) instead.
 - **Determinism and reversibility:** Keep validation reproducible, avoid unguarded timing or network-dependent tests, and make changes small enough to review and roll back safely.
 - **Surgical scope:** Change only what the task requires. Do not refactor, reformat, or remove unrelated code; remove only imports, variables, or functions made unused by the current change.
 - **Think before coding:** State material assumptions and tradeoffs. Do not silently choose between interpretations that would materially change the design; surface the ambiguity and ask.
@@ -43,7 +43,7 @@ These are implementation constraints, not slogans. Apply them by default.
 
   ```text
   Worktree: <worktrees dir>/dagmar/<feature>
-  Branch: codex/<feature>
+  Branch: <feature>
   ```
 
 - Before editing, run `git status --short` in the relevant worktree. Preserve any changes that do not belong to the current task.
@@ -53,7 +53,7 @@ These are implementation constraints, not slogans. Apply them by default.
 - Use "Conventional Commits" style for commit messages. Each commit should have a clear, imperative subject line and a body that explains the reasoning behind the change.
 - Work in small, cohesive commits. Each commit should implement one logical change and have an imperative, descriptive subject.
 - Stage only files relevant to the current task. Do not commit credentials, local configuration, generated artifacts, or unrelated changes.
-- Commit completed feature work only to its `codex/<feature>` branch. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.
+- Commit completed feature work only to its feature branch, named for the change in a few words (for example `readme-docs`) with no `claude/`, `codex/` or other prefix; rename a branch the app created before pushing it. Do not merge, rebase, force-push, reset shared branches, delete worktrees, or update `main` unless the user explicitly asks.
 - Before asking to integrate a feature, provide its branch name, commit list, and test results for review.
 
 ### Pull requests
