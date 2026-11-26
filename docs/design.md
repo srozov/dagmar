@@ -27,6 +27,7 @@ Dagmar provides:
 - interactive (multi-turn) ACP tasks and continuing an earlier task's ACP
   session;
 - one automatic retry policy: an ACP attempt that failed before doing any work;
+- per-task time limits on an attempt;
 - a two-table SQLite ledger;
 - one append-only JSONL transcript per task attempt;
 - manual cancellation and resume;
@@ -36,7 +37,7 @@ Dagmar provides:
 It deliberately leaves out:
 
 - cron or scheduling;
-- task timeouts, or automatic retries of an attempt that did any work;
+- a time limit on a whole run, or automatic retries of an attempt that did any work;
 - dynamic tasks, unbounded loops, nested maps, or fan-out other than a map
   task's items;
 - concurrency limits other than a map task's own `concurrency`;
@@ -179,6 +180,7 @@ Allowed task fields are only:
 - `when`
 - `rerun`
 - `map`
+- `timeoutSeconds`
 
 Validate a file whenever it is read:
 
@@ -189,7 +191,8 @@ Validate a file whenever it is read:
   `interactive`;
 - ACP tasks have a non-empty `prompt` and no `run`;
 - a gate task has `gate: { prompt, schema? }` and none of `executor`, `prompt`,
-  `run`, `session`, `interactive`, `outputSchema`, `rerun` or `map`;
+  `run`, `session`, `interactive`, `outputSchema`, `rerun`, `map` or
+  `timeoutSeconds`;
 - dependencies exist, are not self-references, and form an acyclic graph;
 - `$tasks.*` references point only to declared dependencies;
 - a reference is the whole value of a top-level input, never nested in one;
@@ -482,6 +485,8 @@ Attempt settlement:
 - valid `outcome: completed` -> `completed`;
 - valid `outcome: blocked` -> `blocked`;
 - executor, protocol, input-resolution, or result-validation error -> `failed`;
+- an attempt still running `timeoutSeconds` after its executor started ->
+  cancelled through its executor, then `failed` with `task_timeout`;
 - explicit task/run cancellation -> `cancelled`;
 - a false `when` guard -> `skipped`, without running;
 - a gate answer that matches the gate's schema -> `completed`, with the answer

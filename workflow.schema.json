@@ -190,6 +190,11 @@
         "interactive": {
           "type": "boolean"
         },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483
+        },
         "gate": {
           "type": "object",
           "additionalProperties": false,
