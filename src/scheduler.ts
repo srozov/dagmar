@@ -393,7 +393,7 @@ export class Scheduler {
         }
         // Clear the timer before settling: settle waits behind the run's other work, and a timer firing meanwhile would cancel a finished attempt.
         await live.handle.done.then((value) => { clearTimeout(timer); return this.serial(row.workflowRunId, () => this.settle(row.id, timedOut ? timeout : value, request, retries)); });
-      } catch (error) { failed(error); await this.serial(row.workflowRunId, () => this.settle(row.id, timedOut ? timeout : { error: taskError("executor_failed", error) })); }
+      } catch (error) { clearTimeout(timer); failed(error); await this.serial(row.workflowRunId, () => this.settle(row.id, timedOut ? timeout : { error: taskError("executor_failed", error) })); }
       finally { clearTimeout(timer); }
     })();
     this.background(live.finished);
