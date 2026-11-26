@@ -3297,6 +3297,23 @@ if(m.method==='session/prompt')setInterval(()=>send({jsonrpc:'2.0',method:'sessi
   app.store.close();
 });
 
+test("a timed-out attempt is cancelled even when its task_timeout event cannot be written, and the failure is reported", { timeout: 20_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-write-")), { script, pidFile } = await sleeper(root);
+  const app = await fixture(root, { id: "limit", tasks: { slow: { executor: "local", inputs: {}, run: [process.execPath, script], timeoutSeconds: 1 } } });
+  const append = app.transcripts.append.bind(app.transcripts);
+  app.transcripts.append = (runId, taskRunId, record) => "event" in record && record.event === "task_timeout" ? Promise.reject(new Error("disk full")) : append(runId, taskRunId, record);
+  const warnings: string[] = [], onWarning = (warning: Error) => warnings.push(warning.message);
+  process.on("warning", onWarning);
+  try {
+    const started = await app.scheduler.start("limit", {});
+    const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+    assert.equal(view.tasks.slow!.attempts[0]!.error!.code, "task_timeout");
+    assert.equal(alive(Number(await readFile(pidFile("task"), "utf8"))), false);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(warnings.includes("disk full"), `warnings: ${JSON.stringify(warnings)}`);
+  } finally { process.off("warning", onWarning); app.store.close(); }
+});
+
 test("the time limit counts a wait for a permission answer", { timeout: 20_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "dagmar-timeout-wait-"));
   const app = await fixture(root, { id: "limit", tasks: { ask: { executor: "agent", inputs: {}, prompt: "ask", timeoutSeconds: 1 } } }, new InteractiveExecutor());

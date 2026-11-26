@@ -387,7 +387,8 @@ export class Scheduler {
           const handle = live.handle;
           timer = setTimeout(() => {
             timedOut = true; this.dropInteraction(row.id);
-            this.background(this.append(row, { type: "lifecycle", direction: "internal", event: "task_timeout", data: { timeoutSeconds } }).then(() => undefined, () => undefined).then(() => handle.cancel()));
+            // Cancel even when the event cannot be written; background() reports the write's failure.
+            this.background(this.append(row, { type: "lifecycle", direction: "internal", event: "task_timeout", data: { timeoutSeconds } }).finally(() => handle.cancel()));
           }, timeoutSeconds * 1000);
         }
         // Clear the timer before settling: settle waits behind the run's other work, and a timer firing meanwhile would cancel a finished attempt.
