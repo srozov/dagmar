@@ -10,7 +10,7 @@ Notable changes to Dagmar, by version. The format follows [Keep a Changelog](htt
 
 ### Fixed
 
-- A task's `outputSchema` applies to `completed` results only: a `blocked` result keeps its outcome and message instead of failing with `output_validation_failed` ([#55](https://github.com/srozov/dagmar/issues/55)).
+- A task's `outputSchema` applies to `completed` results only: a `blocked` result keeps its outcome and message instead of failing with `output_validation_failed` ([#62](https://github.com/srozov/dagmar/pull/62)).
 
 ## [0.9.1] - 2026-11-25
 
