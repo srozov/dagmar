@@ -1333,6 +1333,15 @@ test("AcpExecutor's attempt error names each schema violation when the repair al
   assert.deepEqual(settled, { error: { code: "acp_failed", message: `Task output does not match outputSchema: ${TWO_RULE_VIOLATIONS}` } });
 });
 
+test("AcpExecutor keeps a blocked answer as given, without checking its output or a repair turn", async () => {
+  const blocked = { outcome: "blocked", message: "upstream is down", output: {} };
+  const { root, script } = await repairAgent("dagmar-acp-blocked-schema-", [JSON.stringify(blocked)]);
+  const { settled, prompts, events } = await runRepairAgent(root, script, { type: "object", required: ["ok"] });
+  assert.deepEqual(settled, { result: blocked });
+  assert.equal(prompts.length, 1);
+  assert.ok(!events.includes("acp_result_repair"));
+});
+
 test("AcpExecutor does not repair a task whose own outputSchema is invalid", async () => {
   const { root, script } = await repairAgent("dagmar-acp-repair-schema-", [VALID_RESULT]);
   const { settled, prompts } = await runRepairAgent(root, script, { type: 123 });
