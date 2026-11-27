@@ -114,7 +114,9 @@ only `completed` or `blocked` as `outcome`, require a non-empty `message`, and
 accept any JSON value for `output`.
 
 Compile the base schema once with Ajv. When a task declares `outputSchema`,
-validate `output` against it in addition to the universal envelope. Workflows
+validate the `output` of a `completed` result against it in addition to the
+universal envelope; a `blocked` result hands its dependents nothing, so its
+`output` is not checked. Workflows
 are read again on every step, so compile each distinct task schema once and
 find it again by its text.
 
@@ -385,7 +387,8 @@ For each attempt:
 4. Collect stdout and record it in the transcript.
 5. After exit, require stdout to contain exactly one JSON value with only
    surrounding whitespace.
-6. Validate it as the TaskResult and against the optional `outputSchema`.
+6. Validate it as the TaskResult and, when it is `completed`, against the
+   optional `outputSchema`.
 
 Operational logs belong on stderr. Non-JSON stdout, multiple JSON values,
 trailing content, missing output, schema failure, or a non-zero exit code makes

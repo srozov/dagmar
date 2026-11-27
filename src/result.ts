@@ -12,7 +12,9 @@ const SCHEMA_ERRORS_MAX = 500;
 export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskResult {
   if (!envelope(value) || !json(value)) throw new DagmarError("result_validation_failed", "Executor did not return a valid TaskResult");
   const result = value as TaskResult;
-  if (outputSchema !== undefined) {
+  // outputSchema describes what a completed task hands its dependents; a blocked task hands them
+  // nothing, so its output is not checked and its message reaches the run's record.
+  if (outputSchema !== undefined && result.outcome === "completed") {
     let validate;
     try { validate = compile(outputSchema); }
     catch { throw new DagmarError("invalid_output_schema", "Task outputSchema is invalid"); }

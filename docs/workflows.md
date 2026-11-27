@@ -62,7 +62,7 @@ A reference must be the whole value of a top-level input. A reference inside an 
 
 ## Output schema
 
-`outputSchema` is a JSON Schema for the task's `output`. An output that does not match fails with `output_validation_failed`, whose message names each violation by path, for example `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
+`outputSchema` is a JSON Schema for the `output` of a `completed` result; a `blocked` result's `output` is not checked, so the attempt ends `blocked` with the task's message. A completed output that does not match fails with `output_validation_failed`, whose message names each violation by path, for example `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
 
 ## Sessions
 

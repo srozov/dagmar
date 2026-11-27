@@ -371,6 +371,22 @@ test("a process whose output fails outputSchema names each violation by path", a
   assert.deepEqual(await execution.done, { error: { code: "output_validation_failed", message: "Task output does not match outputSchema: output/items/0/evidence must NOT have fewer than 1 items; output/note must be string" } });
 });
 
+test("a blocked result's output is not checked against outputSchema, so its message is kept", async () => {
+  const root = await mkdtemp(join(tmpdir(), "dagmar-blocked-schema-")), script = join(root, "task.mjs");
+  await writeFile(script, `for await(const _ of process.stdin){};process.stdout.write(${JSON.stringify(JSON.stringify({ outcome: "blocked", message: "upstream is down", output: {} }))});`);
+  const app = await fixture(root, {
+    id: "blocked-schema",
+    tasks: { step: { executor: "local", inputs: {}, run: [process.execPath, script], outputSchema: { type: "object", required: ["ok"] } } },
+  });
+  const started = await app.scheduler.start("blocked-schema", {});
+  const view = await waitFor(app.scheduler, started.workflowRunId, "blocked");
+  const attempt = view.tasks.step!.attempts[0]!;
+  assert.equal(attempt.status, "blocked");
+  assert.equal(attempt.error, null);
+  assert.deepEqual(attempt.result, { outcome: "blocked", message: "upstream is down", output: {} });
+  app.store.close();
+});
+
 test("the schema-violation detail is cut to its bound", () => {
   const outputSchema = { type: "array", items: { type: "string" } };
   const error = (() => { try { validateResult({ outcome: "completed", message: "ok", output: Array.from({ length: 100 }, (_, i) => i) }, outputSchema); } catch (e) { return e as DagmarError; } })();
