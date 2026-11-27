@@ -32,8 +32,8 @@ export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskR
 // Shape-only check: is this value structurally a TaskResult envelope (without applying
 // outputSchema and without throwing)? Used by the ACP executor to distinguish a
 // conversational reply from a final answer. A positive shape check is still followed by
-// validateResult(parsed, outputSchema), so a *final* answer whose `output` violates the
-// schema still fails the task — we do not collapse shape and schema validation, which
+// validateResult(parsed, outputSchema), so a *completed* final answer whose `output` violates
+// the schema still fails the task — we do not collapse shape and schema validation, which
 // would silently swallow a real schema violation as "just more chat".
 export function isEnvelope(value: unknown): boolean {
   return envelope(value) === true && json(value);

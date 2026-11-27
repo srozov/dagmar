@@ -248,8 +248,8 @@ class Attempt {
         // Interactive: shape check decides conversation vs final. A JSON.parse failure
         // here means the agent spoke to the user — that is exactly the conversational
         // case we are designed for — so we swallow the parse error and treat the reply
-        // as a message. A positive shape check is followed by validateResult so a final
-        // answer whose output violates outputSchema still fails the task (not suspended).
+        // as a message. A positive shape check is followed by validateResult so a completed
+        // final answer whose output violates outputSchema still fails the task (not suspended).
         let parsed: unknown;
         try { parsed = JSON.parse(this.text); } catch { parsed = undefined; }
         if (parsed !== undefined && isEnvelope(parsed)) {
