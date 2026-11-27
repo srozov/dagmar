@@ -14,7 +14,7 @@ Every task ends with one JSON result:
 }
 ```
 
-`outcome` is `completed` or `blocked`, and all three fields are required. `output` is any JSON value, checked against the task's `outputSchema` if it has one. `result.schema.json` is the schema of the result.
+`outcome` is `completed` or `blocked`, and all three fields are required. `output` is any JSON value, checked against the task's `outputSchema`, if it has one, when `outcome` is `completed`. `result.schema.json` is the schema of the result.
 
 ## Process executors
 

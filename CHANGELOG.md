@@ -8,6 +8,10 @@ Notable changes to Dagmar, by version. The format follows [Keep a Changelog](htt
 
 - `timeoutSeconds` on a task, at most 2147483 (about 24 days), limits how long one attempt may run; an attempt past it is cancelled and fails with `task_timeout` ([#52](https://github.com/srozov/dagmar/pull/52)).
 
+### Fixed
+
+- A task's `outputSchema` applies to `completed` results only: a `blocked` result keeps its outcome and message instead of failing with `output_validation_failed` ([#62](https://github.com/srozov/dagmar/pull/62)).
+
 ## [0.9.1] - 2026-11-25
 
 ### Changed

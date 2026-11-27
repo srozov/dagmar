@@ -62,7 +62,7 @@ A reference must be the whole value of a top-level input. A reference inside an 
 
 ## Output schema
 
-`outputSchema` is a JSON Schema for the task's `output`. An output that does not match fails with `output_validation_failed`, whose message names each violation by path, for example `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
+`outputSchema` is a JSON Schema for the `output` of a `completed` result; a `blocked` result's `output` is not checked, so the attempt ends `blocked` with the task's message. A completed output that does not match fails with `output_validation_failed`, whose message names each violation by path, for example `output/items/2/evidence must NOT have fewer than 1 items; output/note must be string` (cut to 500 characters).
 
 ## Sessions
 
@@ -132,7 +132,7 @@ The same workflow uses a gate and an interactive task; [mvp-acceptance.md](mvp-a
 
 All three fields are required. `over` reads `$tasks.<dependency>.output…` or `$run.input…` and must resolve to a list of objects whose `key` field is a non-empty string, unique in the list; otherwise the task fails before any item starts, with `map_items_invalid`. `$item` and `$item.<path>` read the item, in a map task's `inputs` only.
 
-Each item runs as an attempt of its own, with its own session, transcript and status, and `outputSchema` applies to each item's output. At most `concurrency` items are active at once, including those waiting for an answer; they start in list order, the next one whenever one ends. The task's output is `{ "<key>": <item output> }`, so a later task reads every item's result from `$tasks.review.output`. An empty list completes the task at once with `{}`. `when` guards the whole task.
+Each item runs as an attempt of its own, with its own session, transcript and status, and `outputSchema` applies to each completed item's output. At most `concurrency` items are active at once, including those waiting for an answer; they start in list order, the next one whenever one ends. The task's output is `{ "<key>": <item output> }`, so a later task reads every item's result from `$tasks.review.output`. An empty list completes the task at once with `{}`. `when` guards the whole task.
 
 An item that fails, blocks or is cancelled (`cancel-task` on its attempt) leaves the others running. Once every item has ended, the task completes, or ends `blocked` with `map_items_incomplete` if any item did not complete. The task keeps one attempt of its own per round, with `item: null`; its items' attempts are listed with it, each with its `item` key and the round's `roundId`, and take the task's next attempt numbers. `resume` continues the round and runs only the items that did not complete, also after a daemon restart or a cancelled run; `resume --from <map task>`, or a rerun from upstream of it, starts a new round with every item. The task's own attempt cannot be cancelled (`invalid_task_state`): cancel its items or the run. While a map runs, its run is `running`, even when its active items wait for answers; an item's interactions and `task.status_changed` events carry its `item`.
 

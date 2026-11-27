@@ -12,7 +12,9 @@ const SCHEMA_ERRORS_MAX = 500;
 export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskResult {
   if (!envelope(value) || !json(value)) throw new DagmarError("result_validation_failed", "Executor did not return a valid TaskResult");
   const result = value as TaskResult;
-  if (outputSchema !== undefined) {
+  // outputSchema describes what a completed task hands its dependents; a blocked task hands them
+  // nothing, so its output is not checked and its message reaches the run's record.
+  if (outputSchema !== undefined && result.outcome === "completed") {
     let validate;
     try { validate = compile(outputSchema); }
     catch { throw new DagmarError("invalid_output_schema", "Task outputSchema is invalid"); }
@@ -30,8 +32,8 @@ export function validateResult(value: unknown, outputSchema?: JsonSchema): TaskR
 // Shape-only check: is this value structurally a TaskResult envelope (without applying
 // outputSchema and without throwing)? Used by the ACP executor to distinguish a
 // conversational reply from a final answer. A positive shape check is still followed by
-// validateResult(parsed, outputSchema), so a *final* answer whose `output` violates the
-// schema still fails the task — we do not collapse shape and schema validation, which
+// validateResult(parsed, outputSchema), so a *completed* final answer whose `output` violates
+// the schema still fails the task — we do not collapse shape and schema validation, which
 // would silently swallow a real schema violation as "just more chat".
 export function isEnvelope(value: unknown): boolean {
   return envelope(value) === true && json(value);
